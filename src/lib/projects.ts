@@ -98,12 +98,35 @@ export function getRegisteredClaudeSlugs(): Set<string> {
   return new Set(loadProjects().map((p) => p.claudeSlug));
 }
 
+/**
+ * Find the best matching registered project for a Cursor session slug.
+ *
+ * Exact match is tried first. If none, falls back to prefix matching to handle
+ * the common monorepo case where the Cursor workspace root is a parent of the
+ * registered project directory — e.g. workspace slug
+ * "Users-foo-Desktop-myrepo" should match registered project
+ * "Users-foo-Desktop-myrepo-frontend".
+ *
+ * When multiple projects share the same prefix, the most specific one
+ * (longest cursorSlug) wins.
+ */
+export function getBestProjectForCursorSlug(slug: string): Project | undefined {
+  const projects = loadProjects();
+  const exact = projects.find((p) => p.cursorSlug === slug);
+  if (exact) return exact;
+  const matches = projects.filter((p) => p.cursorSlug.startsWith(slug + "-"));
+  if (matches.length === 0) return undefined;
+  return matches.reduce((best, p) =>
+    p.cursorSlug.length > best.cursorSlug.length ? p : best
+  );
+}
+
 export function getProjectIdForCursorSlug(slug: string): string | undefined {
-  return loadProjects().find((p) => p.cursorSlug === slug)?.projectId;
+  return getBestProjectForCursorSlug(slug)?.projectId;
 }
 
 export function getProjectPathForCursorSlug(slug: string): string | undefined {
-  return loadProjects().find((p) => p.cursorSlug === slug)?.path;
+  return getBestProjectForCursorSlug(slug)?.path;
 }
 
 export function getProjectIdForClaudeSlug(slug: string): string | undefined {

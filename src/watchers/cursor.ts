@@ -13,7 +13,7 @@ import { basename, dirname, join } from "path";
 import { homedir } from "os";
 import { parseCursorTranscript } from "./cursor-parser.js";
 import { insertPromptsBatch, upsertCursorSession, PromptRecord } from "../lib/supabase.js";
-import { getRegisteredCursorSlugs, getProjectIdForCursorSlug } from "../lib/projects.js";
+import { getBestProjectForCursorSlug, getRegisteredCursorSlugs, getProjectIdForCursorSlug } from "../lib/projects.js";
 import { PCR_DIR } from "../lib/constants.js";
 import { getSessionMeta, getFullSessionData } from "./cursor-db.js";
 import { getProjectPathForCursorSlug } from "../lib/projects.js";
@@ -101,8 +101,8 @@ async function processFile(
     const meta = parseTranscriptPath(filePath);
     if (!meta) return 0;
 
-    // Only process files from registered projects
-    if (allowedSlugs.size > 0 && !allowedSlugs.has(meta.projectSlug)) return 0;
+    // Only process files from registered projects (exact match or parent workspace prefix)
+    if (allowedSlugs.size > 0 && !getBestProjectForCursorSlug(meta.projectSlug)) return 0;
 
     const content = readFileSync(filePath, "utf-8");
     const lines = content.trim().split("\n").filter((l) => l.trim());
