@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. Publish to npm
+  # ─────────────────────────────────────────────
+  npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - run: npm ci
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # 2. Build standalone binaries (Node SEA)
+  #    macOS arm64, macOS x64, Linux x64
+  # ─────────────────────────────────────────────
+  binaries:
+    name: Build binaries
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+            target: pcr-macos-arm64
+          - os: macos-13
+            arch: x64
+            target: pcr-macos-x64
+          - os: ubuntu-latest
+            arch: x64
+            target: pcr-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Create SEA config
+        run: |
+          cat > sea-config.json << 'EOF'
+          {
+            "main": "dist/cli.js",
+            "output": "sea-prep.blob",
+            "disableExperimentalSEAWarning": true
+          }
+          EOF
+
+      - name: Build standalone binary
+        run: |
+          node --experimental-sea-config sea-config.json
+          cp $(which node) ${{ matrix.target }}
+          npx postject ${{ matrix.target }} NODE_SEA_BLOB sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+          chmod +x ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.target }}
+
+  # ─────────────────────────────────────────────
+  # 3. Create GitHub Release with binaries
+  # ─────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Compute checksums
+        run: |
+          cd artifacts
+          for dir in */; do
+            binary="${dir%/}"
+            sha256sum "$dir/$binary" | awk '{print $1}' > "$dir/$binary.sha256"
+          done
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/pcr-macos-arm64/pcr-macos-arm64
+            artifacts/pcr-macos-arm64/pcr-macos-arm64.sha256
+            artifacts/pcr-macos-x64/pcr-macos-x64
+            artifacts/pcr-macos-x64/pcr-macos-x64.sha256
+            artifacts/pcr-linux-x64/pcr-linux-x64
+            artifacts/pcr-linux-x64/pcr-linux-x64.sha256
+          generate_release_notes: true
+
+  # ─────────────────────────────────────────────
+  # 4. Update Homebrew tap
+  # ─────────────────────────────────────────────
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Homebrew tap update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: pcr-dev/homebrew-pcr
+          event-type: new-release
+          client-payload: |
+            {
+              "version": "${{ github.ref_name }}",
+              "tag": "${{ github.ref_name }}"
+            }

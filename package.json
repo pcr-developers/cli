@@ -1,0 +1,40 @@
+{
+  "name": "pcr-dev",
+  "version": "0.1.0",
+  "description": "PCR.dev CLI — capture AI coding prompts for peer review",
+  "bin": {
+    "pcr": "dist/cli.js"
+  },
+  "main": "./dist/cli.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "tsc"
+  },
+  "keywords": [
+    "ai",
+    "code-review",
+    "cursor",
+    "claude",
+    "mcp",
+    "prompts"
+  ],
+  "author": "PCR.dev",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "@supabase/supabase-js": "latest",
+    "better-sqlite3": "^12.8.0",
+    "chokidar": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}

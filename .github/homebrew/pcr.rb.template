@@ -1,0 +1,44 @@
+# This file is the Homebrew formula template.
+# The actual formula lives in the homebrew-pcr tap repo:
+#   https://github.com/pcr-dev/homebrew-pcr
+#
+# On each release, the release.yml workflow dispatches an event to that repo,
+# which updates the version and checksums automatically.
+#
+# To install from the tap:
+#   brew tap pcr-dev/pcr
+#   brew install pcr
+
+class Pcr < Formula
+  desc "PCR.dev CLI — capture AI coding prompts for peer review"
+  homepage "https://pcr.dev"
+  version "{{VERSION}}"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/pcr-dev/pcr-dev/releases/download/{{VERSION}}/pcr-macos-arm64"
+      sha256 "{{SHA256_MACOS_ARM64}}"
+    else
+      url "https://github.com/pcr-dev/pcr-dev/releases/download/{{VERSION}}/pcr-macos-x64"
+      sha256 "{{SHA256_MACOS_X64}}"
+    end
+  end
+
+  on_linux do
+    url "https://github.com/pcr-dev/pcr-dev/releases/download/{{VERSION}}/pcr-linux-x64"
+    sha256 "{{SHA256_LINUX_X64}}"
+  end
+
+  def install
+    if OS.mac?
+      bin.install "pcr-macos-arm64" => "pcr" if Hardware::CPU.arm?
+      bin.install "pcr-macos-x64" => "pcr" unless Hardware::CPU.arm?
+    else
+      bin.install "pcr-linux-x64" => "pcr"
+    end
+  end
+
+  test do
+    assert_match "PCR.dev", shell_output("#{bin}/pcr help")
+  end
+end
