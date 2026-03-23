@@ -163,7 +163,7 @@ async function setup(): Promise<void> {
     if (functionsDir) {
       console.log("\n  Deploying Edge Function...");
       try {
-        execSync(`supabase functions deploy github-webhook --project-ref ${projectRef}`, {
+        execSync(`supabase functions deploy github-webhook --project-ref ${projectRef} --no-verify-jwt`, {
           cwd: functionsDir,
           stdio: "inherit",
           timeout: 60000,
@@ -175,7 +175,7 @@ async function setup(): Promise<void> {
     } else {
       console.log("\n  Could not locate function source — skipping deploy.");
       console.log(`  To deploy manually, run from the functions/ directory:`);
-      console.log(`  supabase functions deploy github-webhook --project-ref ${projectRef}`);
+      console.log(`  supabase functions deploy github-webhook --project-ref ${projectRef} --no-verify-jwt`);
     }
 
     // Step 3: set the secret in Supabase Vault
@@ -193,7 +193,7 @@ async function setup(): Promise<void> {
   } else {
     console.log("\n  Supabase CLI not found — skipping deploy and secret set.");
     console.log(`  Run these manually from the functions/ directory:`);
-    console.log(`  supabase functions deploy github-webhook --project-ref ${projectRef}`);
+    console.log(`  supabase functions deploy github-webhook --project-ref ${projectRef} --no-verify-jwt`);
     console.log(`  supabase secrets set GITHUB_WEBHOOK_SECRET=${secret} --project-ref ${projectRef}`);
   }
 
