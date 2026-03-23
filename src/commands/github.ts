@@ -3,15 +3,15 @@
  *
  * Usage:
  *   pcr github setup    — generates webhook secret, deploys Edge Function,
- *                         sets the secret, and prints the webhook URL
+ *                         sets the secret, and creates the webhook on GitHub
  *   pcr github status   — shows whether GitHub is connected and the webhook URL
  */
 
-import { createHash, randomBytes } from "crypto";
+import { randomBytes } from "crypto";
 import { execSync, spawnSync } from "child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
-import { homedir } from "os";
+import { homedir, platform } from "os";
 import { PCR_DIR, PCR_APP_URL, PCR_SUPABASE_URL } from "../lib/constants.js";
 
 const GITHUB_CONFIG_FILE = join(homedir(), PCR_DIR, "github.json");
@@ -36,33 +36,102 @@ function saveGithubConfig(config: GithubConfig): void {
   writeFileSync(GITHUB_CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
+function getProjectRef(): string {
+  return PCR_SUPABASE_URL.replace("https://", "").replace(".supabase.co", "");
+}
+
 function getWebhookUrl(): string {
-  // Derive Edge Function URL from Supabase project URL
-  const projectRef = PCR_SUPABASE_URL.replace("https://", "").replace(".supabase.co", "");
-  return `https://${projectRef}.supabase.co/functions/v1/github-webhook`;
+  return `https://${getProjectRef()}.supabase.co/functions/v1/github-webhook`;
 }
 
 function supabaseAvailable(): boolean {
-  const result = spawnSync("supabase", ["--version"], { stdio: "pipe" });
-  return result.status === 0;
+  return spawnSync("supabase", ["--version"], { stdio: "pipe" }).status === 0;
+}
+
+function ghAvailable(): boolean {
+  return spawnSync("gh", ["--version"], { stdio: "pipe" }).status === 0;
+}
+
+/** Parse owner/repo from any GitHub remote URL format. */
+function getRepoFullName(): string | null {
+  try {
+    const remote = execSync("git remote get-url origin", {
+      encoding: "utf-8",
+      cwd: process.cwd(),
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    const match = remote.match(/github\.com[:/]([^/]+\/[^/.]+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find the supabase project root that contains the github-webhook function.
+ * The Supabase CLI expects source at supabase/functions/<name>/index.ts.
+ * Searches the current directory and sibling/parent directories so this works
+ * regardless of which repo the user runs `pcr github setup` from.
+ */
+function findFunctionsDir(): string | null {
+  const cwd = process.cwd();
+  const candidates = [
+    cwd,
+    join(cwd, ".."),
+    join(cwd, "..", "functions"),
+    join(cwd, "functions"),
+  ];
+  for (const dir of candidates) {
+    if (existsSync(join(dir, "supabase", "functions", "github-webhook", "index.ts"))) {
+      return dir;
+    }
+  }
+  return null;
+}
+
+/** Create the webhook on GitHub via the `gh` CLI. Returns true on success. */
+function createWebhookViaGh(repoFullName: string, webhookUrl: string, secret: string): boolean {
+  try {
+    const payload = JSON.stringify({
+      name: "web",
+      active: true,
+      events: ["pull_request"],
+      config: { url: webhookUrl, content_type: "json", secret, insecure_ssl: "0" },
+    });
+    execSync(`gh api repos/${repoFullName}/hooks --method POST --input -`, {
+      input: payload,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return true;
+  } catch (err: unknown) {
+    const stderr = err instanceof Error ? (err as NodeJS.ErrnoException & { stderr?: Buffer }).stderr?.toString() ?? err.message : String(err);
+    // 422 = webhook with this URL already exists
+    if (stderr.includes("422") || stderr.includes("already exists")) {
+      return true;
+    }
+    console.error(`  gh error: ${stderr.trim()}`);
+    return false;
+  }
+}
+
+/** Open a URL in the default browser (macOS / Linux / Windows). */
+function openBrowser(url: string): void {
+  const cmd = platform() === "darwin" ? "open" : platform() === "win32" ? "start" : "xdg-open";
+  try { spawnSync(cmd, [url], { stdio: "pipe" }); } catch { /* ignore */ }
 }
 
 export async function runGithub(subcommand?: string): Promise<void> {
   const cmd = subcommand ?? "status";
-
   switch (cmd) {
-    case "setup":
-      await setup();
-      break;
-    case "status":
-      await status();
-      break;
+    case "setup":  await setup();  break;
+    case "status": await status(); break;
     default:
       console.log(`
 pcr github — GitHub PR integration
 
 Usage:
-  pcr github setup    Set up the webhook (deploys Edge Function, generates secret)
+  pcr github setup    Set up the webhook (deploys Edge Function, creates webhook)
   pcr github status   Show current configuration and webhook URL
 `);
   }
@@ -85,61 +154,78 @@ async function setup(): Promise<void> {
     console.log("  Generated webhook secret.");
   }
 
-  // Step 2: deploy the Edge Function (requires supabase CLI)
-  const hasSupa = supabaseAvailable();
-  if (hasSupa) {
-    console.log("\n  Deploying Edge Function...");
-    try {
-      execSync("supabase functions deploy github-webhook", {
-        cwd: process.cwd().includes("pcr-dev") ? process.cwd().replace(/pcr-dev.*/, "PCR.dev") : process.cwd(),
-        stdio: "inherit",
-        timeout: 60000,
-      });
-      console.log("  Edge Function deployed.");
-    } catch {
-      console.error("  Edge Function deploy failed. Run manually:");
-      console.error("  cd /path/to/PCR.dev && supabase functions deploy github-webhook");
+  const webhookUrl = getWebhookUrl();
+  const projectRef = getProjectRef();
+
+  // Step 2: deploy the Edge Function
+  if (supabaseAvailable()) {
+    const functionsDir = findFunctionsDir();
+    if (functionsDir) {
+      console.log("\n  Deploying Edge Function...");
+      try {
+        execSync(`supabase functions deploy github-webhook --project-ref ${projectRef}`, {
+          cwd: functionsDir,
+          stdio: "inherit",
+          timeout: 60000,
+        });
+        console.log("  Edge Function deployed.");
+      } catch {
+        console.error("  Deploy failed — the function may already be up to date.");
+      }
+    } else {
+      console.log("\n  Could not locate function source — skipping deploy.");
+      console.log(`  To deploy manually, run from the functions/ directory:`);
+      console.log(`  supabase functions deploy github-webhook --project-ref ${projectRef}`);
     }
 
-    // Step 3: set the secret in Supabase
+    // Step 3: set the secret in Supabase Vault
     console.log("\n  Setting webhook secret in Supabase...");
     try {
-      execSync(`supabase secrets set GITHUB_WEBHOOK_SECRET=${secret}`, {
+      execSync(`supabase secrets set GITHUB_WEBHOOK_SECRET=${secret} --project-ref ${projectRef}`, {
         stdio: "inherit",
         timeout: 30000,
       });
       console.log("  Secret set.");
     } catch {
       console.error("  Failed to set secret. Run manually:");
-      console.error(`  supabase secrets set GITHUB_WEBHOOK_SECRET=${secret}`);
+      console.error(`  supabase secrets set GITHUB_WEBHOOK_SECRET=${secret} --project-ref ${projectRef}`);
     }
   } else {
-    console.log("\n  Supabase CLI not found — run these manually:");
-    console.log("  1. cd /path/to/PCR.dev && supabase functions deploy github-webhook");
-    console.log(`  2. supabase secrets set GITHUB_WEBHOOK_SECRET=${secret}`);
+    console.log("\n  Supabase CLI not found — skipping deploy and secret set.");
+    console.log(`  Run these manually from the functions/ directory:`);
+    console.log(`  supabase functions deploy github-webhook --project-ref ${projectRef}`);
+    console.log(`  supabase secrets set GITHUB_WEBHOOK_SECRET=${secret} --project-ref ${projectRef}`);
   }
 
-  // Step 4: print the webhook URL and next steps
-  const webhookUrl = getWebhookUrl();
-  const settingsUrl = `${PCR_APP_URL}/settings`;
+  // Step 4: create the webhook on GitHub automatically
+  const repoFullName = getRepoFullName();
+  console.log("\n  Setting up GitHub webhook...");
+
+  if (!repoFullName) {
+    console.log("  Could not detect GitHub repo from git remote.");
+  } else if (ghAvailable()) {
+    console.log(`  Creating webhook on ${repoFullName}...`);
+    const ok = createWebhookViaGh(repoFullName, webhookUrl, secret);
+    if (ok) {
+      console.log(`  Webhook created on github.com/${repoFullName}`);
+    } else {
+      console.log("  gh API call failed — opening GitHub in your browser instead.");
+      openBrowser(`https://github.com/${repoFullName}/settings/hooks/new`);
+    }
+  } else {
+    console.log("  gh CLI not found — opening GitHub in your browser.");
+    if (repoFullName) openBrowser(`https://github.com/${repoFullName}/settings/hooks/new`);
+  }
 
   console.log(`
   ─────────────────────────────────────────────────────
 
-  Webhook URL (add this to your GitHub repo):
-  ${webhookUrl}
-
-  Webhook secret (paste this in GitHub's Secret field):
-  ${secret}
+  Webhook URL:    ${webhookUrl}
+  Webhook secret: ${secret}
 
   ─────────────────────────────────────────────────────
 
-  Next steps:
-    1. Go to your GitHub repo → Settings → Webhooks → Add webhook
-    2. Paste the URL and secret above
-    3. Content type: application/json
-    4. Events: select "Pull requests"
-    5. Connect GitHub at: ${settingsUrl}
+  Last step: connect your GitHub account at ${PCR_APP_URL}/settings
 `);
 }
 
