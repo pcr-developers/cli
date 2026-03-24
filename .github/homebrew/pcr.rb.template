@@ -16,16 +16,16 @@ class Pcr < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/pcr-dev/pcr-dev/releases/download/{{VERSION}}/pcr-macos-arm64"
+      url "https://github.com/pcr-developers/pcr-dev/releases/download/{{VERSION}}/pcr-macos-arm64"
       sha256 "{{SHA256_MACOS_ARM64}}"
     else
-      url "https://github.com/pcr-dev/pcr-dev/releases/download/{{VERSION}}/pcr-macos-x64"
+      url "https://github.com/pcr-developers/pcr-dev/releases/download/{{VERSION}}/pcr-macos-x64"
       sha256 "{{SHA256_MACOS_X64}}"
     end
   end
 
   on_linux do
-    url "https://github.com/pcr-dev/pcr-dev/releases/download/{{VERSION}}/pcr-linux-x64"
+    url "https://github.com/pcr-developers/pcr-dev/releases/download/{{VERSION}}/pcr-linux-x64"
     sha256 "{{SHA256_LINUX_X64}}"
   end
 
