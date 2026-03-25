@@ -135,7 +135,7 @@ jobs:
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          repository: pcr-dev/homebrew-pcr
+          repository: pcr-developers/homebrew-pcr
           event-type: new-release
           client-payload: |
             {
