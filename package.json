@@ -22,6 +22,14 @@
   ],
   "author": "PCR.dev",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pcr-developers/cli.git"
+  },
+  "homepage": "https://pcr.dev",
+  "bugs": {
+    "url": "https://github.com/pcr-developers/cli/issues"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
