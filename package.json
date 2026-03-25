@@ -1,6 +1,6 @@
 {
   "name": "pcr-dev",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "PCR.dev CLI — capture AI coding prompts for peer review",
   "bin": {
     "pcr": "dist/cli.js"
