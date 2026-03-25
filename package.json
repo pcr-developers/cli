@@ -10,7 +10,10 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "prepublishOnly": "tsc"
+    "prepublishOnly": "tsc",
+    "release:patch": "npm version patch && git push && git push origin $(git describe --tags --abbrev=0)",
+    "release:minor": "npm version minor && git push && git push origin $(git describe --tags --abbrev=0)",
+    "release:major": "npm version major && git push && git push origin $(git describe --tags --abbrev=0)"
   },
   "keywords": [
     "ai",

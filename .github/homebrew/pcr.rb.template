@@ -15,24 +15,22 @@ class Pcr < Formula
   version "{{VERSION}}"
 
   on_macos do
-    if Hardware::CPU.arm?
-      url "https://github.com/pcr-developers/pcr-dev/releases/download/{{VERSION}}/pcr-macos-arm64"
+    on_arm do
+      url "https://github.com/pcr-developers/cli/releases/download/{{VERSION}}/pcr-macos-arm64"
       sha256 "{{SHA256_MACOS_ARM64}}"
-    else
-      url "https://github.com/pcr-developers/pcr-dev/releases/download/{{VERSION}}/pcr-macos-x64"
-      sha256 "{{SHA256_MACOS_X64}}"
     end
   end
 
   on_linux do
-    url "https://github.com/pcr-developers/pcr-dev/releases/download/{{VERSION}}/pcr-linux-x64"
-    sha256 "{{SHA256_LINUX_X64}}"
+    on_intel do
+      url "https://github.com/pcr-developers/cli/releases/download/{{VERSION}}/pcr-linux-x64"
+      sha256 "{{SHA256_LINUX_X64}}"
+    end
   end
 
   def install
     if OS.mac?
-      bin.install "pcr-macos-arm64" => "pcr" if Hardware::CPU.arm?
-      bin.install "pcr-macos-x64" => "pcr" unless Hardware::CPU.arm?
+      bin.install "pcr-macos-arm64" => "pcr"
     else
       bin.install "pcr-linux-x64" => "pcr"
     end
