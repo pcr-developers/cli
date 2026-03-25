@@ -43,9 +43,6 @@ jobs:
           - os: macos-latest
             arch: arm64
             target: pcr-macos-arm64
-          - os: macos-13-large
-            arch: x64
-            target: pcr-macos-x64
           - os: ubuntu-latest
             arch: x64
             target: pcr-linux-x64
@@ -122,8 +119,6 @@ jobs:
           files: |
             artifacts/pcr-macos-arm64/pcr-macos-arm64
             artifacts/pcr-macos-arm64/pcr-macos-arm64.sha256
-            artifacts/pcr-macos-x64/pcr-macos-x64
-            artifacts/pcr-macos-x64/pcr-macos-x64.sha256
             artifacts/pcr-linux-x64/pcr-linux-x64
             artifacts/pcr-linux-x64/pcr-linux-x64.sha256
           generate_release_notes: true
