@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/pcr-developers/cli/internal/config"
@@ -37,7 +38,37 @@ func Open() *sql.DB {
 }
 
 func migrate(db *sql.DB) {
-	_, err := db.Exec(`
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`)
+
+	var version int
+	_ = db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version)
+
+	steps := []func(*sql.Tx) error{migrateV1, migrateV2}
+
+	for i, step := range steps {
+		if i < version {
+			continue
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			panic("pcr: failed to begin migration v" + strconv.Itoa(i+1) + ": " + err.Error())
+		}
+		if err := step(tx); err != nil {
+			_ = tx.Rollback()
+			panic("pcr: failed to apply migration v" + strconv.Itoa(i+1) + ": " + err.Error())
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_version (version) VALUES (?)`, i+1); err != nil {
+			_ = tx.Rollback()
+			panic("pcr: failed to record schema version: " + err.Error())
+		}
+		if err := tx.Commit(); err != nil {
+			panic("pcr: failed to commit migration v" + strconv.Itoa(i+1) + ": " + err.Error())
+		}
+	}
+}
+
+func migrateV1(tx *sql.Tx) error {
+	_, err := tx.Exec(`
 		CREATE TABLE IF NOT EXISTS drafts (
 		  id              TEXT PRIMARY KEY,
 		  content_hash    TEXT UNIQUE NOT NULL,
@@ -81,7 +112,14 @@ func migrate(db *sql.DB) {
 		  PRIMARY KEY (prompt_commit_id, draft_id)
 		);
 	`)
-	if err != nil {
-		panic("pcr: failed to migrate draft store: " + err.Error())
-	}
+	return err
+}
+
+func migrateV2(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		ALTER TABLE drafts ADD COLUMN git_diff TEXT;
+		ALTER TABLE prompt_commits ADD COLUMN bundle_status TEXT NOT NULL DEFAULT 'open';
+		CREATE INDEX IF NOT EXISTS idx_commits_bundle_status ON prompt_commits(bundle_status);
+	`)
+	return err
 }

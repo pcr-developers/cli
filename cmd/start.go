@@ -20,7 +20,7 @@ import (
 
 var startCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start the file watcher",
+	Short: "Watch for new Claude Code and Cursor prompts and save them as drafts",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		pidFile := pidFilePath()
 

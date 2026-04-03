@@ -37,10 +37,11 @@ type DraftRecord struct {
 	SessionCommitShas []string         `json:"session_commit_shas,omitempty"`
 	Status            DraftStatus      `json:"status"`
 	CreatedAt         string           `json:"created_at"`
+	GitDiff           string           `json:"git_diff,omitempty"`
 }
 
 // SaveDraft inserts or updates a draft. Idempotent via content_hash.
-func SaveDraft(record supabase.PromptRecord, sessionShas []string) error {
+func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff string) error {
 	db := Open()
 
 	id := supabase.PromptID(record.SessionID, record.PromptText, "")
@@ -72,13 +73,14 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string) error {
 		INSERT INTO drafts (
 		  id, content_hash, session_id, project_id, project_name, branch_name,
 		  prompt_text, response_text, model, source, capture_method,
-		  tool_calls, file_context, captured_at, session_commit_shas, status
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')
+		  tool_calls, file_context, captured_at, session_commit_shas, status, git_diff
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
 		ON CONFLICT(content_hash) DO UPDATE SET
 		  response_text = COALESCE(excluded.response_text, drafts.response_text),
 		  tool_calls    = COALESCE(excluded.tool_calls,    drafts.tool_calls),
 		  file_context  = COALESCE(excluded.file_context,  drafts.file_context),
-		  model         = COALESCE(excluded.model,          drafts.model)
+		  model         = COALESCE(excluded.model,          drafts.model),
+		  git_diff      = COALESCE(excluded.git_diff,       drafts.git_diff)
 		WHERE drafts.status = 'draft'
 	`,
 		id, hash,
@@ -95,6 +97,7 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string) error {
 		fileContextJSON,
 		capturedAt,
 		sessionShasJSON,
+		nullableStr(gitDiff),
 	)
 	return err
 }
@@ -250,6 +253,23 @@ func GetCandidatesForCommit(projectIDs, projectNames []string, changedFiles []st
 	return relevant, unrelated, nil
 }
 
+// DeleteDrafts permanently removes drafts by ID. Only deletes drafts with
+// status 'draft' or 'staged' — committed/pushed drafts are left untouched.
+func DeleteDrafts(ids []string) error {
+	db := Open()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, id := range ids {
+		if _, err := tx.Exec("DELETE FROM drafts WHERE id = ? AND status IN ('draft', 'staged')", id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // StageDrafts marks the given draft IDs as "staged" for manual bundling.
 func StageDrafts(ids []string) error {
 	db := Open()
@@ -319,6 +339,7 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 		toolCallsJSON         *string
 		fileContextJSON       *string
 		sessionCommitShasJSON *string
+		gitDiff               *string
 	)
 	err := row.Scan(
 		&d.ID, &d.ContentHash, &d.SessionID,
@@ -328,6 +349,7 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 		&toolCallsJSON, &fileContextJSON,
 		&d.CapturedAt, &sessionCommitShasJSON,
 		&d.Status, &d.CreatedAt,
+		&gitDiff,
 	)
 	if err != nil {
 		return d, err
@@ -352,6 +374,9 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 	}
 	if sessionCommitShasJSON != nil {
 		_ = json.Unmarshal([]byte(*sessionCommitShasJSON), &d.SessionCommitShas)
+	}
+	if gitDiff != nil {
+		d.GitDiff = *gitDiff
 	}
 	return d, nil
 }

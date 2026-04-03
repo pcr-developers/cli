@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -15,13 +16,49 @@ import (
 var pullCmd = &cobra.Command{
 	Use:   "pull [remote-id]",
 	Short: "Restore a pushed bundle to local drafts",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		remoteID := args[0]
-
 		a := auth.Load()
 		if a == nil {
 			return fmt.Errorf("not logged in — run `pcr login`")
+		}
+
+		remoteID := ""
+		if len(args) == 1 {
+			remoteID = strings.TrimSpace(args[0])
+		}
+
+		// If no remote ID, list pushed bundles and let user pick
+		if remoteID == "" {
+			pushed, err := store.ListPushedCommits()
+			if err != nil {
+				return err
+			}
+			if len(pushed) == 0 {
+				fmt.Fprintln(os.Stderr, "PCR: No pushed bundles found.")
+				return nil
+			}
+
+			fmt.Fprintf(os.Stderr, "Pushed bundles:\n\n")
+			for i, b := range pushed {
+				fmt.Fprintf(os.Stderr, "  [%d] %q  remote: %s\n", i+1, b.Message, b.RemoteID)
+			}
+			fmt.Fprintln(os.Stderr)
+
+			tty := openTTY()
+			defer tty.Close()
+
+			resp := strings.TrimSpace(ttyPrompt(tty, "Select bundle to pull [number]: "))
+			idx := parseFirstIndex(resp, len(pushed))
+			if idx < 0 {
+				fmt.Fprintln(os.Stderr, "PCR: Nothing pulled.")
+				return nil
+			}
+			remoteID = pushed[idx].RemoteID
+		}
+
+		if remoteID == "" {
+			return fmt.Errorf("no remote ID")
 		}
 
 		bundle, err := supabase.PullBundle(a.Token, remoteID)
@@ -29,7 +66,6 @@ var pullCmd = &cobra.Command{
 			return fmt.Errorf("failed to fetch bundle: %w", err)
 		}
 
-		// The bundle contains an items array of PromptRecords
 		itemsRaw, _ := bundle["items"]
 		itemsJSON, _ := json.Marshal(itemsRaw)
 		var items []supabase.PromptRecord
@@ -39,7 +75,7 @@ var pullCmd = &cobra.Command{
 
 		restored := 0
 		for _, item := range items {
-			if err := store.SaveDraft(item, nil); err == nil {
+			if err := store.SaveDraft(item, nil, ""); err == nil {
 				restored++
 			}
 		}

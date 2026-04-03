@@ -10,24 +10,29 @@ import (
 )
 
 type PromptCommit struct {
-	ID          string        `json:"id"`
-	Message     string        `json:"message"`
-	ProjectID   string        `json:"project_id,omitempty"`
-	ProjectName string        `json:"project_name,omitempty"`
-	BranchName  string        `json:"branch_name,omitempty"`
-	SessionShas []string      `json:"session_shas,omitempty"`
-	HeadSha     string        `json:"head_sha"`
-	PushedAt    string        `json:"pushed_at,omitempty"`
-	RemoteID    string        `json:"remote_id,omitempty"`
-	CommittedAt string        `json:"committed_at"`
-	Items       []DraftRecord `json:"items,omitempty"`
+	ID           string        `json:"id"`
+	Message      string        `json:"message"`
+	ProjectID    string        `json:"project_id,omitempty"`
+	ProjectName  string        `json:"project_name,omitempty"`
+	BranchName   string        `json:"branch_name,omitempty"`
+	SessionShas  []string      `json:"session_shas,omitempty"`
+	HeadSha      string        `json:"head_sha"`
+	PushedAt     string        `json:"pushed_at,omitempty"`
+	RemoteID     string        `json:"remote_id,omitempty"`
+	CommittedAt  string        `json:"committed_at"`
+	BundleStatus string        `json:"bundle_status"` // "open" | "closed"
+	Items        []DraftRecord `json:"items,omitempty"`
 }
 
 // CreateCommit bundles drafts into a commit record atomically.
-func CreateCommit(message, headSha string, draftIDs []string, projectID, projectName, branchName string) (*PromptCommit, error) {
+// bundleStatus should be "open" or "closed".
+func CreateCommit(message, headSha string, draftIDs []string, projectID, projectName, branchName, bundleStatus string) (*PromptCommit, error) {
 	db := Open()
 	id := newUUID()
 	now := time.Now().UTC().Format(time.RFC3339)
+	if bundleStatus == "" {
+		bundleStatus = "open"
+	}
 
 	// Collect union of session_commit_shas from all included drafts
 	shaSet := map[string]bool{}
@@ -61,11 +66,11 @@ func CreateCommit(message, headSha string, draftIDs []string, projectID, project
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec(`
-		INSERT INTO prompt_commits (id, message, project_id, project_name, branch_name, session_shas, head_sha, committed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO prompt_commits (id, message, project_id, project_name, branch_name, session_shas, head_sha, committed_at, bundle_status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, id, message,
 		nullableStr(projectID), nullableStr(projectName), nullableStr(branchName),
-		sessionShasJSON, headSha, now)
+		sessionShasJSON, headSha, now, bundleStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -84,15 +89,156 @@ func CreateCommit(message, headSha string, draftIDs []string, projectID, project
 	}
 
 	return &PromptCommit{
-		ID:          id,
-		Message:     message,
-		ProjectID:   projectID,
-		ProjectName: projectName,
-		BranchName:  branchName,
-		SessionShas: sessionShas,
-		HeadSha:     headSha,
-		CommittedAt: now,
+		ID:           id,
+		Message:      message,
+		ProjectID:    projectID,
+		ProjectName:  projectName,
+		BranchName:   branchName,
+		SessionShas:  sessionShas,
+		HeadSha:      headSha,
+		CommittedAt:  now,
+		BundleStatus: bundleStatus,
 	}, nil
+}
+
+// GetOpenBundles returns all bundles with bundle_status = 'open'.
+func GetOpenBundles() ([]PromptCommit, error) {
+	db := Open()
+	rows, err := db.Query("SELECT * FROM prompt_commits WHERE bundle_status = 'open' ORDER BY committed_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCommitRows(rows)
+}
+
+// GetBundleByName finds any unpushed bundle (open or closed) by name, case-insensitive.
+func GetBundleByName(name string) (*PromptCommit, error) {
+	db := Open()
+	rows, err := db.Query(
+		"SELECT * FROM prompt_commits WHERE pushed_at IS NULL AND lower(message) = lower(?) ORDER BY committed_at DESC LIMIT 1",
+		name,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	commits, err := scanCommitRows(rows)
+	if err != nil || len(commits) == 0 {
+		return nil, err
+	}
+	return &commits[0], nil
+}
+
+// RenameBundle updates a bundle's message.
+func RenameBundle(bundleID, newName string) error {
+	db := Open()
+	_, err := db.Exec("UPDATE prompt_commits SET message = ? WHERE id = ?", newName, bundleID)
+	return err
+}
+
+// GetOpenBundleByName finds the first open bundle whose message matches name (case-insensitive).
+func GetOpenBundleByName(name string) (*PromptCommit, error) {
+	db := Open()
+	rows, err := db.Query(
+		"SELECT * FROM prompt_commits WHERE bundle_status = 'open' AND lower(message) = lower(?) ORDER BY committed_at DESC LIMIT 1",
+		name,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	commits, err := scanCommitRows(rows)
+	if err != nil || len(commits) == 0 {
+		return nil, err
+	}
+	return &commits[0], nil
+}
+
+// RemoveDraftsFromBundle removes drafts from an open bundle and restores them to draft status.
+func RemoveDraftsFromBundle(bundleID string, draftIDs []string) error {
+	db := Open()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, draftID := range draftIDs {
+		if _, err := tx.Exec("DELETE FROM prompt_commit_items WHERE prompt_commit_id = ? AND draft_id = ?", bundleID, draftID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE drafts SET status = 'draft' WHERE id = ?", draftID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// AddDraftsToBundle appends drafts to a bundle, reopening it if sealed.
+func AddDraftsToBundle(bundleID string, draftIDs []string) error {
+	db := Open()
+	// Reopen sealed bundles so edits are allowed
+	if _, err := db.Exec("UPDATE prompt_commits SET bundle_status = 'open' WHERE id = ? AND bundle_status = 'closed'", bundleID); err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, draftID := range draftIDs {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO prompt_commit_items (prompt_commit_id, draft_id) VALUES (?, ?)", bundleID, draftID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE drafts SET status = 'committed' WHERE id = ?", draftID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// DeleteBundle removes a bundle and restores its drafts to 'draft' status.
+// Only works on unpushed bundles.
+func DeleteBundle(bundleID string) error {
+	db := Open()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Restore contained drafts back to unbundled state.
+	if _, err := tx.Exec(`
+		UPDATE drafts SET status = 'draft'
+		WHERE id IN (SELECT draft_id FROM prompt_commit_items WHERE prompt_commit_id = ?)
+		AND status = 'committed'
+	`, bundleID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM prompt_commit_items WHERE prompt_commit_id = ?", bundleID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM prompt_commits WHERE id = ? AND pushed_at IS NULL", bundleID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CloseBundle seals a bundle so it can be pushed.
+func CloseBundle(bundleID string) error {
+	db := Open()
+	_, err := db.Exec("UPDATE prompt_commits SET bundle_status = 'closed' WHERE id = ?", bundleID)
+	return err
+}
+
+// CountUnbundledDrafts returns the number of drafts not yet in any bundle.
+func CountUnbundledDrafts() (int, error) {
+	db := Open()
+	var n int
+	err := db.QueryRow("SELECT COUNT(*) FROM drafts WHERE status IN ('draft', 'staged')").Scan(&n)
+	return n, err
 }
 
 // ListCommits returns commits with optional filters.
@@ -139,6 +285,12 @@ func ListCommits(pushed *bool, projectIDs, projectNames []string) ([]PromptCommi
 func GetUnpushedCommits() ([]PromptCommit, error) {
 	f := false
 	return ListCommits(&f, nil, nil)
+}
+
+// ListPushedCommits returns all commits that have been pushed, ordered newest first.
+func ListPushedCommits() ([]PromptCommit, error) {
+	t := true
+	return ListCommits(&t, nil, nil)
 }
 
 // GetCommitBySha finds a commit by its git HEAD SHA.
@@ -230,19 +382,21 @@ func scanCommitRows(rows sqlRows) ([]PromptCommit, error) {
 	var commits []PromptCommit
 	for rows.Next() {
 		var (
-			c                PromptCommit
-			projectID        *string
-			projectName      *string
-			branchName       *string
-			sessionShasJSON  *string
-			pushedAt         *string
-			remoteID         *string
+			c               PromptCommit
+			projectID       *string
+			projectName     *string
+			branchName      *string
+			sessionShasJSON *string
+			pushedAt        *string
+			remoteID        *string
+			bundleStatus    *string
 		)
 		err := rows.Scan(
 			&c.ID, &c.Message,
 			&projectID, &projectName, &branchName,
 			&sessionShasJSON, &c.HeadSha,
 			&pushedAt, &remoteID, &c.CommittedAt,
+			&bundleStatus,
 		)
 		if err != nil {
 			return nil, err
@@ -264,6 +418,10 @@ func scanCommitRows(rows sqlRows) ([]PromptCommit, error) {
 		}
 		if remoteID != nil {
 			c.RemoteID = *remoteID
+		}
+		c.BundleStatus = "open"
+		if bundleStatus != nil {
+			c.BundleStatus = *bundleStatus
 		}
 		commits = append(commits, c)
 	}

@@ -54,7 +54,9 @@ func (w *Watcher) Start() {
 	}
 	defer watcher.Close()
 
-	// Initial scan + recursive dir registration
+	// Initial walk: register directories for watching and record current line
+	// counts as baselines — do NOT process existing content. Only prompts
+	// written after pcr start is running will be captured.
 	_ = filepath.WalkDir(w.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -62,7 +64,12 @@ func (w *Watcher) Start() {
 		if d.IsDir() {
 			_ = watcher.Add(path)
 		} else if strings.HasSuffix(path, ".jsonl") {
-			w.processFile(path, true)
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			lines := filterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
+			w.state.Set(path, len(lines))
 		}
 		return nil
 	})
@@ -186,8 +193,11 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		commitShas = getCommitsSince(project.Path, session.SessionCreatedAt)
 	}
 
+	// Capture git diff at the moment of capture (capped at 50KB)
+	gitDiff := getGitDiff(project.Path)
+
 	for _, p := range newPrompts {
-		if err := store.SaveDraft(p, commitShas); err != nil {
+		if err := store.SaveDraft(p, commitShas, gitDiff); err != nil {
 			display.PrintError("claude-code", "Failed to save draft: "+err.Error())
 		}
 	}
@@ -210,21 +220,23 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		})
 	}
 
-	// Upsert session metadata (non-fatal)
-	if w.userID != "" {
-		_ = supabase.UpsertClaudeSession(w.userID, supabase.ClaudeSessionData{
-			SessionID:         session.SessionID,
-			ProjectName:       projectName,
-			Branch:            session.Branch,
-			Model:             session.Model,
-			TotalInputTokens:  session.TotalInputTokens,
-			TotalOutputTokens: session.TotalOutputTokens,
-			ExchangeCount:     session.ExchangeCount,
-			SessionCreatedAt:  session.SessionCreatedAt,
-			SessionUpdatedAt:  session.SessionUpdatedAt,
-			CommitShas:        commitShas,
-		}, project.ProjectID, w.userID)
+}
+
+func getGitDiff(projectPath string) string {
+	if projectPath == "" {
+		return ""
 	}
+	cmd := exec.Command("git", "diff", "HEAD")
+	cmd.Dir = projectPath
+	out, err := cmd.Output()
+	if err != nil || len(out) == 0 {
+		return ""
+	}
+	const maxBytes = 50_000
+	if len(out) > maxBytes {
+		return string(out[:maxBytes]) + "\n[truncated]"
+	}
+	return string(out)
 }
 
 func getCommitsSince(projectPath, sinceISO string) []string {
