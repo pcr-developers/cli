@@ -7,89 +7,47 @@ on:
 
 jobs:
   # ─────────────────────────────────────────────
-  # 1. Publish to npm
-  # ─────────────────────────────────────────────
-  npm:
-    name: Publish to npm
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 8
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-          cache: "pnpm"
-
-      - run: pnpm install --frozen-lockfile
-      - run: npm publish --provenance --access public
-
-  # ─────────────────────────────────────────────
-  # 2. Build standalone binaries (Node SEA)
-  #    macOS arm64, Linux x64
+  # 1. Build Go binaries (all targets, one runner)
   # ─────────────────────────────────────────────
   binaries:
     name: Build binaries
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - os: macos-latest
-            arch: arm64
+          - goos: darwin
+            goarch: arm64
             target: pcr-macos-arm64
-          - os: ubuntu-latest
-            arch: x64
+          - goos: darwin
+            goarch: amd64
+            target: pcr-macos-x64
+          - goos: linux
+            goarch: amd64
             target: pcr-linux-x64
-    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-go@v5
         with:
-          version: 8
+          go-version: "1.22"
+          cache: true
 
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          cache: "pnpm"
-
-      - name: Install and build
+      - name: Build
         run: |
-          pnpm install --frozen-lockfile
-          pnpm run build
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          go build \
+            -ldflags="-s -w -X main.Version=${GITHUB_REF_NAME#v}" \
+            -o ${{ matrix.target }} \
+            .
 
-      - name: Create SEA config
-        run: |
-          cat > sea-config.json << 'EOF'
-          {
-            "main": "dist/cli.js",
-            "output": "sea-prep.blob",
-            "disableExperimentalSEAWarning": true
-          }
-          EOF
-
-      - name: Build standalone binary
-        run: |
-          node --experimental-sea-config sea-config.json
-          cp $(which node) ${{ matrix.target }}
-          npx postject ${{ matrix.target }} NODE_SEA_BLOB sea-prep.blob \
-            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
-          chmod +x ${{ matrix.target }}
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: ${{ matrix.target }}
 
   # ─────────────────────────────────────────────
-  # 3. Create GitHub Release with binaries
+  # 2. Create GitHub Release with binaries
   # ─────────────────────────────────────────────
   release:
     name: Create GitHub Release
@@ -98,10 +56,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
@@ -119,9 +77,42 @@ jobs:
           files: |
             artifacts/pcr-macos-arm64/pcr-macos-arm64
             artifacts/pcr-macos-arm64/pcr-macos-arm64.sha256
+            artifacts/pcr-macos-x64/pcr-macos-x64
+            artifacts/pcr-macos-x64/pcr-macos-x64.sha256
             artifacts/pcr-linux-x64/pcr-linux-x64
             artifacts/pcr-linux-x64/pcr-linux-x64.sha256
           generate_release_notes: true
+
+  # ─────────────────────────────────────────────
+  # 3. Publish npm wrapper (after release — needs binaries uploaded)
+  # ─────────────────────────────────────────────
+  npm:
+    name: Publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version
+
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ─────────────────────────────────────────────
   # 4. Update Homebrew tap

@@ -1,6 +1,0 @@
-src/
-*.ts
-!dist/
-tsconfig.json
-.github/
-*.map
