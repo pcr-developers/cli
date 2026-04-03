@@ -55,17 +55,15 @@ type CursorSessionData struct {
 	Meta               map[string]any
 }
 
-type ClaudeSessionData struct {
-	SessionID          string
-	ProjectName        string
-	Branch             string
-	Model              string
-	TotalInputTokens   int
-	TotalOutputTokens  int
-	ExchangeCount      int
-	SessionCreatedAt   string
-	SessionUpdatedAt   string
-	CommitShas         []string
+type ClaudeBundleData struct {
+	BundleID      string
+	Message       string
+	ProjectName   string
+	BranchName    string
+	SessionShas   []string
+	HeadSha       string
+	ExchangeCount int
+	CommittedAt   string
 }
 
 // ─── Hashing ──────────────────────────────────────────────────────────────────
@@ -145,8 +143,9 @@ func UpsertPrompt(token string, record PromptRecord) (bool, error) {
 }
 
 // ValidateCLIToken validates a CLI token and returns the userId.
+// Uses anon auth (no bearer) because the user is not yet logged in.
 func ValidateCLIToken(token string) (string, error) {
-	data, err := rpc(token, "validate_cli_token", map[string]any{"p_token": token})
+	data, err := rpc("", "validate_cli_token", map[string]any{"p_token": token})
 	if err != nil {
 		return "", err
 	}
@@ -203,48 +202,78 @@ func UpsertCursorSession(token string, data CursorSessionData, projectID, userID
 	return err
 }
 
-// UpsertClaudeSession upserts Claude Code session metadata.
-func UpsertClaudeSession(token string, data ClaudeSessionData, projectID, userID string) error {
+// UpsertClaudeBundle upserts bundle metadata to claude_bundles (no prompt data).
+func UpsertClaudeBundle(token string, data ClaudeBundleData, projectID, userID string) (string, error) {
 	payload := map[string]any{
-		"session_id":          data.SessionID,
-		"project_id":          nullableStr(projectID),
-		"user_id":             nullableStr(userID),
-		"project_name":        data.ProjectName,
-		"branch":              nullableStr(data.Branch),
-		"model_name":          nullableStr(data.Model),
-		"total_input_tokens":  data.TotalInputTokens,
-		"total_output_tokens": data.TotalOutputTokens,
-		"exchange_count":      data.ExchangeCount,
-		"session_created_at":  nullableStr(data.SessionCreatedAt),
-		"session_updated_at":  nullableStr(data.SessionUpdatedAt),
-		"commit_shas":         data.CommitShas,
+		"bundle_id":      data.BundleID,
+		"message":        data.Message,
+		"project_id":     nullableStr(projectID),
+		"project_name":   nullableStr(data.ProjectName),
+		"branch_name":    nullableStr(data.BranchName),
+		"session_shas":   data.SessionShas,
+		"head_sha":       nullableStr(data.HeadSha),
+		"exchange_count": data.ExchangeCount,
+		"committed_at":   nullableStr(data.CommittedAt),
 	}
-	_, err := rpc(token, "upsert_claude_session", map[string]any{"p_session": payload})
-	return err
-}
-
-// UpsertPromptBundle uploads a committed bundle to Supabase.
-func UpsertPromptBundle(token string, payload map[string]any) (string, error) {
-	data, err := rpc(token, "upsert_prompt_bundle", payload)
+	resp, err := rpc(token, "upsert_claude_bundle", map[string]any{
+		"p_bundle":  payload,
+		"p_user_id": nullableStr(userID),
+	})
 	if err != nil {
 		return "", err
 	}
 	var remoteID string
-	_ = json.Unmarshal(data, &remoteID)
+	_ = json.Unmarshal(resp, &remoteID)
 	return remoteID, nil
 }
 
-// PullBundle fetches a bundle from Supabase by remote ID.
+// UpsertBundlePrompts upserts prompt rows and their git diffs for a pushed bundle.
+func UpsertBundlePrompts(token string, items []map[string]any, diffs []map[string]any, userID string) error {
+	if len(items) > 0 {
+		if _, err := rpc(token, "upsert_prompts", map[string]any{
+			"p_records": items,
+			"p_user_id": nullableStr(userID),
+		}); err != nil {
+			return err
+		}
+	}
+	if len(diffs) > 0 {
+		if _, err := rpc(token, "upsert_git_diffs", map[string]any{
+			"p_diffs": diffs,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+
+// PullBundle fetches a bundle from claude_bundles by bundle_id or remote id.
 func PullBundle(token, remoteID string) (map[string]any, error) {
-	data, err := rpc(token, "get_prompt_bundle", map[string]any{"p_bundle_id": remoteID})
+	url := config.SupabaseURL + "/rest/v1/claude_bundles?bundle_id=eq." + remoteID + "&select=*&limit=1"
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	var result map[string]any
-	if err := json.Unmarshal(data, &result); err != nil {
+	req.Header.Set("apikey", config.SupabaseKey)
+	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
 		return nil, err
 	}
-	return result, nil
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("pull bundle: %s — %s", resp.Status, string(body))
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil || len(rows) == 0 {
+		return nil, fmt.Errorf("bundle %q not found", remoteID)
+	}
+	return rows[0], nil
 }
 
 func nullableStr(s string) any {

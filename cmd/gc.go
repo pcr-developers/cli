@@ -13,7 +13,7 @@ import (
 
 var gcCmd = &cobra.Command{
 	Use:   "gc",
-	Short: "Garbage collect old pushed records",
+	Short: "Clean up old pushed records or orphaned bundles",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		allPushed, _ := cmd.Flags().GetBool("all-pushed")
 		olderThan, _ := cmd.Flags().GetString("older-than")

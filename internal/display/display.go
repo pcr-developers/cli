@@ -158,7 +158,7 @@ func PrintDrafted(opts DraftDisplayOptions) {
 	if opts.ExchangeCount != 1 {
 		count = fmt.Sprintf("%d exchanges", opts.ExchangeCount)
 	}
-	draftLine := fmt.Sprintf("  %s %s\n", c(yellow, "◎"), c(gray, count+" saved locally — will surface on next git commit"))
+	draftLine := fmt.Sprintf("  %s %s\n", c(yellow, "◎"), c(gray, count+` saved locally — run 'pcr add "bundle-name"' to bundle`))
 
 	fmt.Fprintf(os.Stderr, "%s\n%s%s\n", header, promptLine, draftLine)
 }
