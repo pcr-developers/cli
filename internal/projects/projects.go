@@ -145,9 +145,24 @@ func GetBestProjectForCursorSlug(slug string) *Project {
 
 func GetProjectForClaudeSlug(slug string) *Project {
 	projects := Load()
+	// Exact match first
 	for i, p := range projects {
 		if p.ClaudeSlug == slug {
 			return &projects[i]
+		}
+	}
+	// Ancestor match: slug may represent a parent directory of a registered project
+	// e.g. Claude Code open at /Users/foo/pcr-developers captures sessions for cli sub-project
+	for i, p := range projects {
+		parent := p.Path
+		for {
+			parent = filepath.Dir(parent)
+			if parent == "." || parent == "/" {
+				break
+			}
+			if PathToClaudeSlug(parent) == slug {
+				return &projects[i]
+			}
 		}
 	}
 	return nil

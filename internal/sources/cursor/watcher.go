@@ -54,7 +54,9 @@ func (w *Watcher) Start() {
 	}
 	defer watcher.Close()
 
-	// Initial scan + recursive dir registration
+	// Initial walk: register directories and record current line counts as
+	// baselines — do NOT process existing content. Only new prompts written
+	// after pcr start is running will be captured.
 	_ = filepath.WalkDir(w.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -62,7 +64,12 @@ func (w *Watcher) Start() {
 		if d.IsDir() {
 			_ = watcher.Add(path)
 		} else if isAgentTranscript(path) {
-			w.processFile(path, true)
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			lines := filterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
+			w.state.Set(path, len(lines))
 		}
 		return nil
 	})
@@ -268,8 +275,11 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		}
 	}
 
+	// Capture git diff at the moment of capture (capped at 50KB)
+	gitDiff := getGitDiff(project.Path)
+
 	for _, p := range newPrompts {
-		if err := store.SaveDraft(p, commitShas); err != nil {
+		if err := store.SaveDraft(p, commitShas, gitDiff); err != nil {
 			display.PrintError("cursor", "Failed to save draft: "+err.Error())
 		}
 	}
@@ -294,6 +304,23 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			ExchangeCount: len(newPrompts),
 		})
 	}
+}
+
+func getGitDiff(projectPath string) string {
+	if projectPath == "" {
+		return ""
+	}
+	cmd := exec.Command("git", "diff", "HEAD")
+	cmd.Dir = projectPath
+	out, err := cmd.Output()
+	if err != nil || len(out) == 0 {
+		return ""
+	}
+	const maxBytes = 50_000
+	if len(out) > maxBytes {
+		return string(out[:maxBytes]) + "\n[truncated]"
+	}
+	return string(out)
 }
 
 func getCommitRange(projectPath string, since, until *int64) []string {

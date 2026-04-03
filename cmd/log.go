@@ -12,9 +12,8 @@ import (
 )
 
 var logCmd = &cobra.Command{
-	Use:     "log",
-	Aliases: []string{"review"},
-	Short:   "Show local prompt state (pushed/committed/draft)",
+	Use:   "log",
+	Short: "Show captured prompts and bundles for the current repo",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		const (
 			grn  = "\x1b[32m"
@@ -26,30 +25,35 @@ var logCmd = &cobra.Command{
 			rst  = "\x1b[0m"
 		)
 
-		// Detect current project context (current dir + ancestor projects)
 		ctx := resolveProjectContext()
 
-		// Pushed commits
 		pushed := true
 		pushedCommits, err := store.ListCommits(&pushed, ctx.ids, ctx.names)
 		if err != nil {
 			return err
 		}
 
-		// Unpushed committed
 		unpushed := false
 		unpushedCommits, err := store.ListCommits(&unpushed, ctx.ids, ctx.names)
 		if err != nil {
 			return err
 		}
 
-		// Drafts
+		// Split unpushed into open vs sealed.
+		var openBundles, sealedBundles []store.PromptCommit
+		for _, c := range unpushedCommits {
+			if c.BundleStatus == "open" {
+				openBundles = append(openBundles, c)
+			} else {
+				sealedBundles = append(sealedBundles, c)
+			}
+		}
+
 		drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
 		if err != nil {
 			return err
 		}
 
-		// Show project context header
 		branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
 		if ctx.name != "" {
 			if branch != "" && branch != "HEAD" {
@@ -83,9 +87,26 @@ var logCmd = &cobra.Command{
 			}
 		}
 
-		if len(unpushedCommits) > 0 {
-			fmt.Fprintf(os.Stderr, "\n%s%s  COMMITTED — not yet pushed%s  (%d)\n", ylw, bold, rst, len(unpushedCommits))
-			for _, c := range unpushedCommits {
+		if len(openBundles) > 0 {
+			fmt.Fprintf(os.Stderr, "\n%s%s  OPEN BUNDLES%s  (%d)\n", cyan, bold, rst, len(openBundles))
+			for _, c := range openBundles {
+				items, _ := store.GetCommitWithItems(c.ID)
+				count := 0
+				if items != nil {
+					count = len(items.Items)
+				}
+				fmt.Fprintf(os.Stderr, "  %s~%s %s  %s%s%s  %s(%d prompt%s)%s\n",
+					cyan, rst,
+					shortSha(c.HeadSha),
+					bold, c.Message, rst,
+					gry, count, plural(count), rst)
+			}
+			fmt.Fprintf(os.Stderr, "\n  %sRun `pcr add \"name\"` to add more · `pcr commit \"name\"` to seal%s\n", gry, rst)
+		}
+
+		if len(sealedBundles) > 0 {
+			fmt.Fprintf(os.Stderr, "\n%s%s  SEALED — ready to push%s  (%d)\n", ylw, bold, rst, len(sealedBundles))
+			for _, c := range sealedBundles {
 				items, _ := store.GetCommitWithItems(c.ID)
 				count := 0
 				if items != nil {
@@ -109,7 +130,7 @@ var logCmd = &cobra.Command{
 					bold, preview, rst,
 					dim, strings.Split(d.CapturedAt, "T")[0], rst)
 			}
-			fmt.Fprintf(os.Stderr, "\n  %sRun `pcr add` then `pcr commit -m \"message\"` to bundle%s\n", gry, rst)
+			fmt.Fprintf(os.Stderr, "\n  %sRun `pcr add \"bundle-name\"` to bundle%s\n", gry, rst)
 		}
 
 		fmt.Fprintln(os.Stderr)
