@@ -1,0 +1,37 @@
+{
+  "name": "pcr-dev",
+  "version": "0.1.5",
+  "description": "PCR.dev CLI — capture AI coding prompts for peer review",
+  "bin": {
+    "pcr": "bin/pcr"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "keywords": [
+    "ai",
+    "code-review",
+    "cursor",
+    "claude",
+    "mcp",
+    "prompts"
+  ],
+  "author": "PCR.dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pcr-developers/cli.git"
+  },
+  "homepage": "https://pcr.dev",
+  "bugs": {
+    "url": "https://github.com/pcr-developers/cli/issues"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/"
+  ]
+}
