@@ -77,6 +77,11 @@ func pushBundle(localID, currentBranch, userID string) int {
 	}
 
 	source := dominantSource(c.Items)
+	touchedIDs := collectTouchedProjectIDs(c.Items)
+
+	// bundle_projects (written via touched_project_ids in upsert_bundle) is the
+	// authoritative source for project links. bundles.project_id is kept as a
+	// nullable hint but should not be relied on for filtering.
 	remoteID, err := supabase.UpsertBundle("", supabase.BundleData{
 		BundleID:          c.ID,
 		Message:           c.Message,
@@ -87,7 +92,7 @@ func pushBundle(localID, currentBranch, userID string) int {
 		HeadSha:           c.HeadSha,
 		ExchangeCount:     len(c.Items),
 		CommittedAt:       c.CommittedAt,
-		TouchedProjectIDs: collectTouchedProjectIDs(c.Items),
+		TouchedProjectIDs: touchedIDs,
 	}, c.ProjectID, userID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "PCR: Failed to push prompt bundle %q: %v\n", c.Message, err)
@@ -97,6 +102,13 @@ func pushBundle(localID, currentBranch, userID string) int {
 	var promptRecords []map[string]any
 	var diffRecords []map[string]any
 	for _, item := range c.Items {
+		// project_ids: all repos this specific prompt touched (from DiffTracker).
+		// This is the per-prompt attribution — independent of the bundle's bundle_projects.
+		promptProjectIDs := item.TouchedProjectIDs()
+		if len(promptProjectIDs) == 0 && item.ProjectID != "" {
+			promptProjectIDs = []string{item.ProjectID}
+		}
+
 		rec := map[string]any{
 			"id":             item.ID,
 			"content_hash":   item.ContentHash,
@@ -109,6 +121,7 @@ func pushBundle(localID, currentBranch, userID string) int {
 			"branch_name":    item.BranchName,
 			"captured_at":    item.CapturedAt,
 			"capture_method": item.CaptureMethod,
+			"project_ids":    promptProjectIDs,
 		}
 		if item.ProjectID != "" {
 			rec["project_id"] = item.ProjectID
@@ -116,8 +129,6 @@ func pushBundle(localID, currentBranch, userID string) int {
 		if item.ResponseText != "" {
 			rec["response_text"] = item.ResponseText
 		}
-		// file_context carries touched_project_ids, relevant_files, cursor_mode,
-		// is_agentic, capture_schema — all needed for per-prompt repo display in the UI.
 		if len(item.FileContext) > 0 {
 			rec["file_context"] = item.FileContext
 		}

@@ -241,7 +241,6 @@ func UpsertBundle(token string, data BundleData, projectID, userID string) (stri
 		"bundle_id":           data.BundleID,
 		"message":             data.Message,
 		"source":              data.Source,
-		"project_id":          nullableStr(projectID),
 		"project_name":        nullableStr(data.ProjectName),
 		"branch_name":         nullableStr(data.BranchName),
 		"session_shas":        sessionShas,
