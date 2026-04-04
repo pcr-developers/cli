@@ -345,12 +345,34 @@ func runBundleCreate(name, selectArg, repoFilter string) error {
 	}
 	branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
 	// If the current dir isn't a git repo (e.g. pcr-developers/ org folder),
-	// try to get the branch from the primary project's path.
-	if branch == "" && projectID != "" {
-		for _, p := range projects.Load() {
-			if p.ProjectID == projectID && p.Path != "" {
-				branch = gitOutputIn(p.Path, "git", "rev-parse", "--abbrev-ref", "HEAD")
-				break
+	// find the branch from the primary touched project among the selected drafts.
+	if branch == "" {
+		projByID := loadProjByID()
+		// Collect all touched project IDs across selected drafts
+		touchedSet := map[string]int{}
+		for _, d := range selected {
+			if d.ProjectID != "" {
+				touchedSet[d.ProjectID]++
+			}
+			for _, id := range d.TouchedProjectIDs() {
+				touchedSet[id]++
+			}
+		}
+		// Pick the project with the most hits as primary for branch lookup
+		bestID, bestCount := "", 0
+		for id, count := range touchedSet {
+			if count > bestCount {
+				bestID, bestCount = id, count
+			}
+		}
+		if bestID != "" {
+			if name, ok := projByID[bestID]; ok {
+				for _, p := range projects.Load() {
+					if p.Name == name && p.Path != "" {
+						branch = gitOutputIn(p.Path, "git", "rev-parse", "--abbrev-ref", "HEAD")
+						break
+					}
+				}
 			}
 		}
 	}

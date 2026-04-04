@@ -66,21 +66,24 @@ type ClaudeBundleData struct {
 	CommittedAt   string
 }
 
+// TouchedProject represents one repo a bundle touched, with its branch at push time.
+type TouchedProject struct {
+	ProjectID string `json:"project_id"`
+	Branch    string `json:"branch"`
+	IsPrimary bool   `json:"is_primary"`
+}
+
 // BundleData is the source-agnostic bundle descriptor used by UpsertBundle.
 type BundleData struct {
-	BundleID           string
-	Message            string
-	Source             string   // "cursor", "claude-code", etc.
-	ProjectName        string
-	BranchName         string
-	SessionShas        []string
-	HeadSha            string
-	ExchangeCount      int
-	CommittedAt        string
-	// TouchedProjectIDs is the full set of project IDs whose files appeared
-	// in this bundle's prompts. Includes the primary project_id and any
-	// additional repos touched by cross-repo prompts.
-	TouchedProjectIDs  []string
+	BundleID        string
+	Message         string
+	Source          string // "cursor", "claude-code", etc.
+	ProjectName     string
+	SessionShas     []string
+	HeadSha         string
+	ExchangeCount   int
+	CommittedAt     string
+	TouchedProjects []TouchedProject // per-repo attribution with branch
 }
 
 // ─── Hashing ──────────────────────────────────────────────────────────────────
@@ -225,29 +228,24 @@ func UpsertCursorSession(token string, data CursorSessionData, projectID, userID
 // UpsertBundle upserts bundle metadata to the unified bundles table.
 // Source should be "cursor", "claude-code", or any future source identifier.
 func UpsertBundle(token string, data BundleData, projectID, userID string) (string, error) {
-	// session_shas must be a JSON array (never null) because the SQL uses
-	// jsonb_array_elements_text() which throws on a JSON null scalar.
 	sessionShas := data.SessionShas
 	if sessionShas == nil {
 		sessionShas = []string{}
 	}
-	// touched_project_ids is embedded in p_bundle as a JSON string array
-	// (same approach as session_shas) to avoid PostgREST uuid[] cast issues.
-	touchedProjectIDs := data.TouchedProjectIDs
-	if touchedProjectIDs == nil {
-		touchedProjectIDs = []string{}
+	touchedProjects := data.TouchedProjects
+	if touchedProjects == nil {
+		touchedProjects = []TouchedProject{}
 	}
 	payload := map[string]any{
-		"bundle_id":           data.BundleID,
-		"message":             data.Message,
-		"source":              data.Source,
-		"project_name":        nullableStr(data.ProjectName),
-		"branch_name":         nullableStr(data.BranchName),
-		"session_shas":        sessionShas,
-		"head_sha":            nullableStr(data.HeadSha),
-		"exchange_count":      data.ExchangeCount,
-		"committed_at":        nullableStr(data.CommittedAt),
-		"touched_project_ids": touchedProjectIDs,
+		"bundle_id":        data.BundleID,
+		"message":          data.Message,
+		"source":           data.Source,
+		"project_name":     nullableStr(data.ProjectName),
+		"session_shas":     sessionShas,
+		"head_sha":         nullableStr(data.HeadSha),
+		"exchange_count":   data.ExchangeCount,
+		"committed_at":     nullableStr(data.CommittedAt),
+		"touched_projects": touchedProjects, // array of {project_id, branch, is_primary}
 	}
 	resp, err := rpc(token, "upsert_bundle", map[string]any{
 		"p_bundle":  payload,
