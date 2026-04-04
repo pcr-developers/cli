@@ -111,6 +111,77 @@ func IsDraftSaved(sessionID, promptText string) bool {
 	return exists == 1
 }
 
+// UpdateDraftResponse fills in response_text for an existing draft that has none.
+// Uses exact content hash match.
+func UpdateDraftResponse(sessionID, promptText, responseText string) error {
+	if responseText == "" {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+	_, err := db.Exec(
+		"UPDATE drafts SET response_text = ? WHERE content_hash = ? AND (response_text IS NULL OR response_text = '')",
+		responseText, hash,
+	)
+	return err
+}
+
+// UpdateDraftResponseFuzzy fills in response_text by matching session_id + prompt prefix
+// in Go (not SQL). Handles cases where the prompt was captured from a partially-written
+// JSONL line, meaning the stored prompt_text is a prefix of the full parsed prompt.
+// Returns the number of rows updated.
+func UpdateDraftResponseFuzzy(sessionID string, prompts map[string]string) (int, error) {
+	if len(prompts) == 0 {
+		return 0, nil
+	}
+	db := Open()
+
+	// Fetch all drafts for the session with missing response_text
+	rows, err := db.Query(
+		"SELECT id, prompt_text FROM drafts WHERE session_id = ? AND (response_text IS NULL OR response_text = '')",
+		sessionID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	type row struct{ id, text string }
+	var drafts []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.text); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		drafts = append(drafts, r)
+	}
+	rows.Close()
+
+	// For each draft, find the JSONL prompt that starts with (or equals) the stored text.
+	updated := 0
+	for _, d := range drafts {
+		for promptText, responseText := range prompts {
+			if responseText == "" {
+				continue
+			}
+			// Match: JSONL prompt starts with stored text, or exact match.
+			if strings.HasPrefix(promptText, d.text) || promptText == d.text {
+				res, err := db.Exec(
+					"UPDATE drafts SET response_text = ? WHERE id = ? AND (response_text IS NULL OR response_text = '')",
+					responseText, d.id,
+				)
+				if err != nil {
+					return updated, err
+				}
+				if n, _ := res.RowsAffected(); n > 0 {
+					updated++
+				}
+				break
+			}
+		}
+	}
+	return updated, nil
+}
+
 // GetDraftsByStatus returns drafts filtered by status and optionally by project.
 // projectIDs and projectNames are OR-combined; pass nil slices to return all.
 func GetDraftsByStatus(status DraftStatus, projectIDs, projectNames []string) ([]DraftRecord, error) {

@@ -308,6 +308,27 @@ func GetCommitBySha(headSha string) (*PromptCommit, error) {
 	return &commits[0], nil
 }
 
+// UnmarkPushed resets a pushed commit back to unpushed so it can be re-pushed.
+func UnmarkPushed(commitID string) error {
+	db := Open()
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec("UPDATE prompt_commits SET pushed_at = NULL, remote_id = NULL WHERE id = ?", commitID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		UPDATE drafts SET status = 'committed'
+		WHERE id IN (SELECT draft_id FROM prompt_commit_items WHERE prompt_commit_id = ?)
+		AND status = 'pushed'
+	`, commitID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // RelinkCommit updates a commit's HEAD SHA (for git amend).
 func RelinkCommit(commitID, newHeadSha string) error {
 	db := Open()

@@ -162,10 +162,12 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 	for _, p := range session.Prompts {
 		hash := supabase.PromptContentHash(p.SessionID, p.PromptText, "")
 		if w.dedup.IsDuplicate(p.SessionID, hash) {
+			_ = store.UpdateDraftResponse(p.SessionID, p.PromptText, p.ResponseText)
 			continue
 		}
 		if store.IsDraftSaved(p.SessionID, p.PromptText) {
 			w.dedup.Mark(p.SessionID, hash)
+			_ = store.UpdateDraftResponse(p.SessionID, p.PromptText, p.ResponseText)
 			continue
 		}
 		w.dedup.Mark(p.SessionID, hash)
