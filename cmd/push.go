@@ -10,6 +10,7 @@ import (
 
 	"github.com/pcr-developers/cli/internal/auth"
 	"github.com/pcr-developers/cli/internal/config"
+	"github.com/pcr-developers/cli/internal/projects"
 	"github.com/pcr-developers/cli/internal/store"
 	"github.com/pcr-developers/cli/internal/supabase"
 )
@@ -77,17 +78,18 @@ func pushBundle(localID, currentBranch, userID string) int {
 	}
 
 	source := dominantSource(c.Items)
+	touchedProjects := collectTouchedProjects(c.Items)
+
 	remoteID, err := supabase.UpsertBundle("", supabase.BundleData{
-		BundleID:          c.ID,
-		Message:           c.Message,
-		Source:            source,
-		ProjectName:       c.ProjectName,
-		BranchName:        c.BranchName,
-		SessionShas:       c.SessionShas,
-		HeadSha:           c.HeadSha,
-		ExchangeCount:     len(c.Items),
-		CommittedAt:       c.CommittedAt,
-		TouchedProjectIDs: collectTouchedProjectIDs(c.Items),
+		BundleID:        c.ID,
+		Message:         c.Message,
+		Source:          source,
+		ProjectName:     c.ProjectName,
+		SessionShas:     c.SessionShas,
+		HeadSha:         c.HeadSha,
+		ExchangeCount:   len(c.Items),
+		CommittedAt:     c.CommittedAt,
+		TouchedProjects: touchedProjects,
 	}, c.ProjectID, userID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "PCR: Failed to push prompt bundle %q: %v\n", c.Message, err)
@@ -97,6 +99,13 @@ func pushBundle(localID, currentBranch, userID string) int {
 	var promptRecords []map[string]any
 	var diffRecords []map[string]any
 	for _, item := range c.Items {
+		// project_ids: all repos this specific prompt touched (from DiffTracker).
+		// This is the per-prompt attribution — independent of the bundle's bundle_projects.
+		promptProjectIDs := item.TouchedProjectIDs()
+		if len(promptProjectIDs) == 0 && item.ProjectID != "" {
+			promptProjectIDs = []string{item.ProjectID}
+		}
+
 		rec := map[string]any{
 			"id":             item.ID,
 			"content_hash":   item.ContentHash,
@@ -109,6 +118,7 @@ func pushBundle(localID, currentBranch, userID string) int {
 			"branch_name":    item.BranchName,
 			"captured_at":    item.CapturedAt,
 			"capture_method": item.CaptureMethod,
+			"project_ids":    promptProjectIDs,
 		}
 		if item.ProjectID != "" {
 			rec["project_id"] = item.ProjectID
@@ -116,8 +126,6 @@ func pushBundle(localID, currentBranch, userID string) int {
 		if item.ResponseText != "" {
 			rec["response_text"] = item.ResponseText
 		}
-		// file_context carries touched_project_ids, relevant_files, cursor_mode,
-		// is_agentic, capture_schema — all needed for per-prompt repo display in the UI.
 		if len(item.FileContext) > 0 {
 			rec["file_context"] = item.FileContext
 		}
@@ -157,24 +165,57 @@ func pushBundle(localID, currentBranch, userID string) int {
 }
 
 
-// collectTouchedProjectIDs gathers every project ID mentioned across a bundle's
-// prompts — the primary project_id of each prompt plus any additional IDs
-// stored in file_context.touched_project_ids for cross-repo prompts.
-// The result is deduplicated and safe to send as p_touched_project_ids.
-func collectTouchedProjectIDs(items []store.DraftRecord) []string {
-	seen := map[string]bool{}
-	var result []string
-	add := func(id string) {
-		if id != "" && !seen[id] {
-			seen[id] = true
-			result = append(result, id)
+// collectTouchedProjects gathers every project a bundle touched, with the
+// current branch for each repo looked up from the local git working tree.
+// The first project is marked is_primary=true.
+func collectTouchedProjects(items []store.DraftRecord) []supabase.TouchedProject {
+	// Count hits per project to determine primary
+	hits := map[string]int{}
+	for _, item := range items {
+		if item.ProjectID != "" {
+			hits[item.ProjectID]++
+		}
+		for _, id := range item.TouchedProjectIDs() {
+			hits[id]++
 		}
 	}
-	for _, item := range items {
-		add(item.ProjectID)
-		for _, id := range item.TouchedProjectIDs() {
-			add(id)
+	if len(hits) == 0 {
+		return nil
+	}
+
+	// Build project registry for branch lookup
+	projByID := map[string]string{} // id → path
+	for _, p := range projects.Load() {
+		if p.ProjectID != "" {
+			projByID[p.ProjectID] = p.Path
 		}
+	}
+
+	// Sort by hit count desc to identify primary
+	type entry struct{ id string; count int }
+	var sorted []entry
+	for id, count := range hits {
+		sorted = append(sorted, entry{id, count})
+	}
+	for i := 0; i < len(sorted)-1; i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j].count > sorted[i].count {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+
+	var result []supabase.TouchedProject
+	for i, e := range sorted {
+		branch := ""
+		if path, ok := projByID[e.id]; ok && path != "" {
+			branch = gitOutputIn(path, "git", "rev-parse", "--abbrev-ref", "HEAD")
+		}
+		result = append(result, supabase.TouchedProject{
+			ProjectID: e.id,
+			Branch:    branch,
+			IsPrimary: i == 0,
+		})
 	}
 	return result
 }

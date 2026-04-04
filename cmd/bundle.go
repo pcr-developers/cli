@@ -290,10 +290,22 @@ Examples:
 }
 
 // forced poll test - final cli
+// genericBundleNames are rejected as bundle names — they're placeholders people
+// type by accident and create useless bundles with no meaningful label.
+var genericBundleNames = map[string]bool{
+	"name": true, "test": true, "bundle": true, "prompt bundle": true,
+	"my bundle": true, "untitled": true, "draft": true, "temp": true,
+}
+
 // runBundleCreate creates a new sealed bundle from selected drafts.
 // repoFilter, if set, narrows the draft pool to only prompts that touched that repo.
 // Draft numbers shown in the overview always correspond to the (possibly filtered) pool.
 func runBundleCreate(name, selectArg, repoFilter string) error {
+	if genericBundleNames[strings.ToLower(strings.TrimSpace(name))] {
+		fmt.Fprintf(os.Stderr, "PCR: %q is not a useful bundle name — describe what you actually changed.\n", name)
+		fmt.Fprintln(os.Stderr, `     Example: pcr bundle "fix interactive terminal in Cursor" --select all`)
+		return nil
+	}
 	ctx := resolveProjectContext()
 
 	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
@@ -332,6 +344,38 @@ func runBundleCreate(name, selectArg, repoFilter string) error {
 		projectID = ctx.ids[0]
 	}
 	branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
+	// If the current dir isn't a git repo (e.g. pcr-developers/ org folder),
+	// find the branch from the primary touched project among the selected drafts.
+	if branch == "" {
+		projByID := loadProjByID()
+		// Collect all touched project IDs across selected drafts
+		touchedSet := map[string]int{}
+		for _, d := range selected {
+			if d.ProjectID != "" {
+				touchedSet[d.ProjectID]++
+			}
+			for _, id := range d.TouchedProjectIDs() {
+				touchedSet[id]++
+			}
+		}
+		// Pick the project with the most hits as primary for branch lookup
+		bestID, bestCount := "", 0
+		for id, count := range touchedSet {
+			if count > bestCount {
+				bestID, bestCount = id, count
+			}
+		}
+		if bestID != "" {
+			if name, ok := projByID[bestID]; ok {
+				for _, p := range projects.Load() {
+					if p.Name == name && p.Path != "" {
+						branch = gitOutputIn(p.Path, "git", "rev-parse", "--abbrev-ref", "HEAD")
+						break
+					}
+				}
+			}
+		}
+	}
 	sha := "bundle-" + generateID()
 
 	// "closed" = auto-sealed, ready to push
