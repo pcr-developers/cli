@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -18,23 +19,33 @@ var hookCmd = &cobra.Command{
 	Short:  "Internal: called by Claude Code Stop hook",
 	Hidden: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Only nudge if pcr start is actually running.
+		// Only act if pcr start is actually running.
 		if _, alive := readExistingPID(pidFilePath()); !alive {
 			return nil
 		}
 
 		ctx := resolveProjectContext()
 
-		drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
-		if err != nil || len(drafts) == 0 {
-			return nil // nothing to do
+		// Poll up to 2s for the watcher to process new drafts — the Stop hook
+		// fires immediately after the response, but the watcher has a 1s debounce.
+		var drafts []store.DraftRecord
+		var draftsErr error
+		for i := 0; i < 4; i++ {
+			drafts, draftsErr = store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
+			if draftsErr != nil || len(drafts) > 0 {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if draftsErr != nil || len(drafts) == 0 {
+			return nil
 		}
 		n := len(drafts)
 
 		// Open /dev/tty — required because Claude Code holds stdin.
 		ttyFile, err := os.OpenFile("/dev/tty", os.O_RDWR, 0600)
 		if err != nil {
-			return nil // non-interactive context, skip silently
+			return nil
 		}
 		defer ttyFile.Close()
 
@@ -57,16 +68,34 @@ var hookCmd = &cobra.Command{
 		fd := int(ttyFile.Fd())
 		oldState, rawErr := term.MakeRaw(fd)
 
+		// Read keypresses, skipping mouse/escape sequences, until we get a
+		// real letter or Enter. A mouse click sends \x1b[M... — we drain those
+		// so the prompt doesn't vanish on an accidental click.
+		var ch byte
 		buf := make([]byte, 1)
-		_, _ = ttyFile.Read(buf)
+		drain := make([]byte, 32)
+		for {
+			if _, err := ttyFile.Read(buf); err != nil {
+				break
+			}
+			b := buf[0]
+			if b == 0x1b { // ESC — start of escape/mouse sequence, drain and retry
+				ttyFile.Read(drain) //nolint — best-effort flush
+				continue
+			}
+			if b < 0x20 && b != '\r' && b != '\n' { // other control bytes, skip
+				continue
+			}
+			ch = b
+			break
+		}
 
 		if rawErr == nil {
 			_ = term.Restore(fd, oldState)
 		}
 		_, _ = ttyFile.WriteString("\r\n")
 
-		ch := buf[0]
-		// Accept Y, y, or Enter (CR or LF) as confirmation.
+		// Accept Y, y, or Enter (CR or LF) as confirmation; anything else = no.
 		if ch != 'Y' && ch != 'y' && ch != '\r' && ch != '\n' {
 			return nil
 		}
