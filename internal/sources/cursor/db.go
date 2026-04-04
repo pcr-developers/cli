@@ -15,11 +15,15 @@ import (
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type BubbleMeta struct {
-	Type              int      `json:"type"` // 1=user, 2=assistant
-	IsAgentic         *bool    `json:"isAgentic,omitempty"`
-	SubmittedAt       *int64   `json:"submittedAt,omitempty"`
-	ResponseDurationMs *int64  `json:"responseDurationMs,omitempty"`
-	RelevantFiles     []string `json:"relevantFiles,omitempty"`
+	Type               int      `json:"type"` // 1=user, 2=assistant
+	BubbleID           string   `json:"bubbleId,omitempty"`
+	Text               string   `json:"text,omitempty"`
+	CreatedAt          string   `json:"createdAt,omitempty"` // ISO8601 from v14+
+	IsAgentic          *bool    `json:"isAgentic,omitempty"`
+	SubmittedAt        *int64   `json:"submittedAt,omitempty"` // ms, v13 and below
+	ResponseDurationMs *int64   `json:"responseDurationMs,omitempty"`
+	RelevantFiles      []string `json:"relevantFiles,omitempty"`
+	UnifiedMode        string   `json:"unifiedMode,omitempty"`
 }
 
 type SessionMeta struct {
@@ -27,6 +31,7 @@ type SessionMeta struct {
 	ModelName   string       `json:"modelName,omitempty"`
 	IsAgentic   bool         `json:"isAgentic"`
 	UnifiedMode string       `json:"unifiedMode,omitempty"`
+	ComposerID  string       `json:"composerId,omitempty"`
 }
 
 type SessionData struct {
@@ -104,8 +109,16 @@ type cacheEntry struct {
 var (
 	metaCache   = map[string]cacheEntry{}
 	metaCacheMu sync.RWMutex
-	cacheTTL    = 5 * time.Minute
+	cacheTTL    = 30 * time.Second // short TTL so active sessions stay fresh
 )
+
+// InvalidateSessionCache removes a session from the metadata cache.
+// Called by the watcher when a transcript file changes.
+func InvalidateSessionCache(sessionID string) {
+	metaCacheMu.Lock()
+	delete(metaCache, sessionID)
+	metaCacheMu.Unlock()
+}
 
 // ─── GetSessionMeta ───────────────────────────────────────────────────────────
 
@@ -169,15 +182,47 @@ func GetSessionMeta(sessionID string) *SessionMeta {
 		um = *unifiedMode
 	}
 
+	var composerID string
+	if headersOnly != nil {
+		// extract composerId from the main object too
+	}
+	_ = db.QueryRow(`SELECT json_extract(value, '$.composerId') FROM cursorDiskKV WHERE key = ?`,
+		"composerData:"+sessionID).Scan(&composerID)
+
 	var bubbles []BubbleMeta
 	if sv >= 14 {
 		if headersOnly != nil {
 			var headers []struct {
-				Type int `json:"type"`
+				BubbleID string `json:"bubbleId"`
+				Type     int    `json:"type"`
 			}
 			if json.Unmarshal([]byte(*headersOnly), &headers) == nil {
 				for _, h := range headers {
-					bubbles = append(bubbles, BubbleMeta{Type: h.Type})
+					b := BubbleMeta{Type: h.Type, BubbleID: h.BubbleID}
+					// Look up full bubble data by bubbleId:<composerId>:<bubbleId>
+					if composerID != "" && h.BubbleID != "" {
+						var bval string
+						bkey := "bubbleId:" + composerID + ":" + h.BubbleID
+						if err := db.QueryRow(`SELECT value FROM cursorDiskKV WHERE key = ?`, bkey).Scan(&bval); err == nil {
+							var bd map[string]any
+							if json.Unmarshal([]byte(bval), &bd) == nil {
+								b.Text = getString(bd, "text")
+								b.CreatedAt = getString(bd, "createdAt")
+								b.UnifiedMode = getString(bd, "unifiedMode")
+								if rf, ok := bd["relevantFiles"].([]any); ok {
+									for _, f := range rf {
+										if s, ok := f.(string); ok {
+											b.RelevantFiles = append(b.RelevantFiles, s)
+										}
+									}
+								}
+								if ag, ok := bd["isAgentic"].(bool); ok {
+									b.IsAgentic = &ag
+								}
+							}
+						}
+					}
+					bubbles = append(bubbles, b)
 				}
 			}
 		}
@@ -220,6 +265,7 @@ func GetSessionMeta(sessionID string) *SessionMeta {
 		ModelName:   modelName,
 		IsAgentic:   agentic,
 		UnifiedMode: um,
+		ComposerID:  composerID,
 	})
 }
 

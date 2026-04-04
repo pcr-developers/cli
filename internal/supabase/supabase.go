@@ -66,6 +66,23 @@ type ClaudeBundleData struct {
 	CommittedAt   string
 }
 
+// BundleData is the source-agnostic bundle descriptor used by UpsertBundle.
+type BundleData struct {
+	BundleID           string
+	Message            string
+	Source             string   // "cursor", "claude-code", etc.
+	ProjectName        string
+	BranchName         string
+	SessionShas        []string
+	HeadSha            string
+	ExchangeCount      int
+	CommittedAt        string
+	// TouchedProjectIDs is the full set of project IDs whose files appeared
+	// in this bundle's prompts. Includes the primary project_id and any
+	// additional repos touched by cross-repo prompts.
+	TouchedProjectIDs  []string
+}
+
 // ─── Hashing ──────────────────────────────────────────────────────────────────
 
 // PromptContentHash returns a SHA-256 hex digest of session_id + \x00 + prompt_text + \x00 + response_text.
@@ -155,11 +172,14 @@ func ValidateCLIToken(token string) (string, error) {
 }
 
 // RegisterProject registers a project and returns its remote UUID.
-func RegisterProject(token, name, gitRemote, localPath string) (string, error) {
+// userID is passed explicitly because CLI tokens are not Supabase JWTs,
+// so auth.uid() would be NULL inside the RPC.
+func RegisterProject(token, name, gitRemote, localPath, userID string) (string, error) {
 	data, err := rpc(token, "register_project", map[string]any{
 		"p_name":       name,
 		"p_git_remote": gitRemote,
 		"p_local_path": localPath,
+		"p_user_id":    nullableStr(userID),
 	})
 	if err != nil {
 		return "", err
@@ -202,15 +222,59 @@ func UpsertCursorSession(token string, data CursorSessionData, projectID, userID
 	return err
 }
 
+// UpsertBundle upserts bundle metadata to the unified bundles table.
+// Source should be "cursor", "claude-code", or any future source identifier.
+func UpsertBundle(token string, data BundleData, projectID, userID string) (string, error) {
+	// session_shas must be a JSON array (never null) because the SQL uses
+	// jsonb_array_elements_text() which throws on a JSON null scalar.
+	sessionShas := data.SessionShas
+	if sessionShas == nil {
+		sessionShas = []string{}
+	}
+	// touched_project_ids is embedded in p_bundle as a JSON string array
+	// (same approach as session_shas) to avoid PostgREST uuid[] cast issues.
+	touchedProjectIDs := data.TouchedProjectIDs
+	if touchedProjectIDs == nil {
+		touchedProjectIDs = []string{}
+	}
+	payload := map[string]any{
+		"bundle_id":           data.BundleID,
+		"message":             data.Message,
+		"source":              data.Source,
+		"project_id":          nullableStr(projectID),
+		"project_name":        nullableStr(data.ProjectName),
+		"branch_name":         nullableStr(data.BranchName),
+		"session_shas":        sessionShas,
+		"head_sha":            nullableStr(data.HeadSha),
+		"exchange_count":      data.ExchangeCount,
+		"committed_at":        nullableStr(data.CommittedAt),
+		"touched_project_ids": touchedProjectIDs,
+	}
+	resp, err := rpc(token, "upsert_bundle", map[string]any{
+		"p_bundle":  payload,
+		"p_user_id": nullableStr(userID),
+	})
+	if err != nil {
+		return "", err
+	}
+	var remoteID string
+	_ = json.Unmarshal(resp, &remoteID)
+	return remoteID, nil
+}
+
 // UpsertClaudeBundle upserts bundle metadata to claude_bundles (no prompt data).
 func UpsertClaudeBundle(token string, data ClaudeBundleData, projectID, userID string) (string, error) {
+	claudeSessionShas := data.SessionShas
+	if claudeSessionShas == nil {
+		claudeSessionShas = []string{}
+	}
 	payload := map[string]any{
 		"bundle_id":      data.BundleID,
 		"message":        data.Message,
 		"project_id":     nullableStr(projectID),
 		"project_name":   nullableStr(data.ProjectName),
 		"branch_name":    nullableStr(data.BranchName),
-		"session_shas":   data.SessionShas,
+		"session_shas":   claudeSessionShas,
 		"head_sha":       nullableStr(data.HeadSha),
 		"exchange_count": data.ExchangeCount,
 		"committed_at":   nullableStr(data.CommittedAt),
@@ -248,9 +312,9 @@ func UpsertBundlePrompts(token string, items []map[string]any, diffs []map[strin
 }
 
 
-// PullBundle fetches a bundle from claude_bundles by bundle_id or remote id.
+// PullBundle fetches a bundle from the unified bundles table by bundle_id.
 func PullBundle(token, remoteID string) (map[string]any, error) {
-	url := config.SupabaseURL + "/rest/v1/claude_bundles?bundle_id=eq." + remoteID + "&select=*&limit=1"
+	url := config.SupabaseURL + "/rest/v1/bundles?bundle_id=eq." + remoteID + "&select=*&limit=1"
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err

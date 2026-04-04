@@ -11,6 +11,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"time"
+
 	"github.com/pcr-developers/cli/internal/auth"
 	"github.com/pcr-developers/cli/internal/config"
 	"github.com/pcr-developers/cli/internal/display"
@@ -26,13 +28,21 @@ var startCmd = &cobra.Command{
 
 		// Check for existing watcher
 		if pid, alive := readExistingPID(pidFile); alive {
-			fmt.Fprintf(os.Stderr, "PCR: Watcher already running (PID %d). Replace it? [Y/n]: ", pid)
-			var answer string
-			fmt.Scanln(&answer)
-			if strings.ToLower(strings.TrimSpace(answer)) == "n" {
-				return nil
+			if !isInteractiveTerminal() {
+				// Non-interactive: always replace the existing watcher silently
+				fmt.Fprintf(os.Stderr, "PCR: Replacing existing watcher (PID %d).\n", pid)
+			} else {
+				fmt.Fprintf(os.Stderr, "PCR: Watcher already running (PID %d). Replace it? [Y/n]: ", pid)
+				tty := openTTY()
+				answer := ""
+				if tty != nil {
+					answer = ttyPrompt(tty, "")
+					tty.Close()
+				}
+				if strings.ToLower(strings.TrimSpace(answer)) == "n" {
+					return nil
+				}
 			}
-			// Kill existing
 			if proc, err := os.FindProcess(pid); err == nil {
 				_ = proc.Signal(syscall.SIGTERM)
 			}
@@ -56,8 +66,13 @@ var startCmd = &cobra.Command{
 		projs := projects.Load()
 		display.PrintStartupBanner(Version, len(projs))
 
+		// Start DiffTracker: polls every 3s to record timestamped file-change events.
+		// These events are queried by the watcher for per-prompt repo attribution.
+		diffTracker := sources.NewDiffTracker(3 * time.Second)
+		go diffTracker.Start()
+
 		// Start all sources in goroutines
-		allSources := sources.All()
+		allSources := sources.All(diffTracker)
 		for _, src := range allSources {
 			go src.Start(userID)
 		}

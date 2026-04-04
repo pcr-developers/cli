@@ -13,7 +13,7 @@ import (
 
 var statusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "Show auth, registered projects, and bundle state",
+	Short: "Show auth, registered projects, and prompt bundle state",
 	Run: func(cmd *cobra.Command, args []string) {
 		const bold = "\x1b[1m"
 		const dim = "\x1b[2m"
@@ -77,7 +77,7 @@ var statusCmd = &cobra.Command{
 			if len(drafts) == 0 {
 				fmt.Fprintf(os.Stderr, "%sDrafts%s  none\n", bold, rst)
 			} else {
-				fmt.Fprintf(os.Stderr, "%sDrafts%s  %d unreviewed — run `pcr add` to bundle them\n", bold, rst, len(drafts))
+				fmt.Fprintf(os.Stderr, "%sDrafts%s  %d unreviewed — run `pcr bundle` to create a prompt bundle\n", bold, rst, len(drafts))
 			}
 		}
 	},

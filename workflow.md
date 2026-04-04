@@ -19,15 +19,26 @@ pcr login
 ```bash
 pcr start
 ```
-Watches `~/.claude/projects/` and `~/.cursor/projects/` and saves every prompt as a local draft automatically. Only captures prompts written **after** `pcr start` is running — nothing retroactive.
+Watches all registered AI tool session directories and saves every prompt as a local draft automatically. Only captures prompts written **after** `pcr start` is running — nothing retroactive.
 
-### 2. Work normally in Claude Code or Cursor
+Currently supported: Cursor, Claude Code. New sources can be added by implementing the `CaptureSource` interface — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-After each Claude Code response, a Stop hook fires and asks:
+### 2. Work normally in your AI coding tool
+
+Prompts are captured automatically by the watcher — no extra steps needed.
+
+**If your tool supports a Stop hook** (currently: Claude Code), a prompt fires after each response:
 ```
-PCR: 2 new prompts — add to "auth-refactor"? [Y/n]
+PCR: 2 new prompts — add to "auth-refactor"? [Y/n/b]
 ```
-Press **Y** or **Enter** to add to the most recent open bundle, **N** to skip. Single keypress, no Enter needed. Only fires when `pcr start` is running.
+- **Y** or **Enter** — add to the current open prompt bundle
+- **n** — skip (prompts stay as drafts)
+- **b** — branch into a new prompt bundle (you've switched tasks); prompts for a name
+
+Single keypress, no Enter needed. Only fires when `pcr start` is running.
+
+**If your tool doesn't have a Stop hook** (currently: Cursor, Codex, others), prompts are
+saved as drafts automatically. Bundle them manually with `pcr add` after your session.
 
 ### 3. Check what's been captured
 ```bash
@@ -35,33 +46,24 @@ pcr status    # auth, projects, bundles, draft count at a glance
 pcr log       # full history for the current repo
 ```
 
-### 4. Manage bundles and drafts
+### 4. Create a prompt bundle
+
 ```bash
-pcr add                    # browse bundles (numbered list), pick one to edit
-pcr add "auth refactor"    # add drafts directly to a named bundle (creates if new)
-pcr add --remove "auth refactor"   # remove prompts from a bundle
-pcr add --delete           # permanently delete draft prompts
+pcr bundle                                  # see all drafts (numbered) + unpushed bundles
+pcr bundle "auth fix" --select 1-5          # bundle drafts 1-5 (auto-sealed, ready to push)
+pcr bundle "auth fix" --select all          # bundle all drafts
+pcr show 3                                  # see full text of draft #3 before bundling
 ```
 
-**Inside the bundle editor** (`pcr add` → pick a number):
-- `a` — add more prompts
-- `r` — remove prompts
-- `n` — rename the bundle
-- `d` — delete the bundle (prompts returned to drafts)
-- `s` — seal it (ready to push)
-
-**Other bundle edits:**
+**Edit a bundle before pushing:**
 ```bash
-pcr commit --rename "auth refactor" "login fix"     # rename a bundle
+pcr bundle "auth fix" --add --select 6,7    # add more prompts
+pcr bundle "auth fix" --remove --select 2   # remove a prompt (returns to drafts)
+pcr bundle "auth fix" --delete              # delete the whole bundle
+pcr bundle --list                           # see all unpushed bundles
 ```
 
-### 5. Seal the bundle
-```bash
-pcr commit "auth refactor"   # seal a specific bundle
-pcr commit                   # interactive — pick from open bundles
-```
-
-### 6. Push to PCR.dev
+### 5. Push to PCR.dev
 ```bash
 pcr push
 ```
@@ -82,17 +84,19 @@ PCR: Pushed "auth refactor" (5 prompts)
 | `pcr status` | Auth state, registered projects, bundle summary, draft count |
 | `pcr log` | Full prompt history for the current repo |
 | `pcr start` | Start the file watcher (run in background terminal) |
-| `pcr add` | Browse and edit bundles interactively |
-| `pcr add "name"` | Add drafts to a named bundle |
-| `pcr add --remove "name"` | Remove prompts from a bundle |
-| `pcr add --delete` | Permanently delete draft prompts |
-| `pcr commit "name"` | Seal a bundle |
-| `pcr commit --rename "old" "new"` | Rename a bundle |
+| `pcr bundle` | Show all drafts (numbered) and unpushed bundles |
+| `pcr bundle "name" --select 1-5` | Create prompt bundle from drafts 1-5 (auto-sealed) |
+| `pcr bundle "name" --select all` | Bundle all drafts |
+| `pcr bundle "name" --add --select 6,7` | Add more prompts to an existing bundle |
+| `pcr bundle "name" --remove --select 2` | Remove a prompt from a bundle |
+| `pcr bundle "name" --delete` | Delete a bundle (prompts return to drafts) |
+| `pcr bundle --list` | List all unpushed bundles |
+| `pcr show <number>` | Show full text of a specific draft |
 | `pcr push` | Push all sealed bundles to PCR.dev |
 | `pcr pull` | Restore a pushed bundle back to local drafts |
 | `pcr gc --orphaned` | Remove bundles whose git SHA no longer exists |
-| `pcr init` | Register current directory as a tracked project |
+| `pcr init` | Register current directory (or all sub-repos) as tracked projects |
 | `pcr init --unregister` | Unregister the current project |
 | `pcr login` | Authenticate with PCR.dev |
 | `pcr logout` | Remove saved credentials |
-| `pcr mcp` | Start the MCP server (Claude Code calls this automatically) |
+| `pcr mcp` | Start the MCP server for MCP-compatible tools (called automatically) |

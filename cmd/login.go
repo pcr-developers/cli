@@ -24,7 +24,17 @@ var loginCmd = &cobra.Command{
 		openBrowser(settingsURL)
 
 		fmt.Fprint(os.Stderr, "Paste your CLI token: ")
-		reader := bufio.NewReader(os.Stdin)
+		// In Cursor's integrated terminal, use stdin directly.
+		// Elsewhere, prefer /dev/tty so login works when stdin is redirected.
+		var reader *bufio.Reader
+		if os.Getenv("TERM_PROGRAM") == "vscode" || os.Getenv("CURSOR_AGENT") == "1" {
+			reader = sharedStdinReader()
+		} else if f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0600); err == nil {
+			reader = bufio.NewReader(f)
+			defer f.Close()
+		} else {
+			reader = bufio.NewReader(os.Stdin)
+		}
 		token, err := reader.ReadString('\n')
 		if err != nil {
 			return fmt.Errorf("failed to read token: %w", err)

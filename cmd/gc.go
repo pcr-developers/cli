@@ -13,7 +13,7 @@ import (
 
 var gcCmd = &cobra.Command{
 	Use:   "gc",
-	Short: "Clean up old pushed records or orphaned bundles",
+	Short: "Clean up old pushed records or orphaned prompt bundles",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		allPushed, _ := cmd.Flags().GetBool("all-pushed")
 		olderThan, _ := cmd.Flags().GetString("older-than")
@@ -29,9 +29,9 @@ var gcCmd = &cobra.Command{
 				return err
 			}
 			if deleted == 0 {
-				fmt.Fprintln(os.Stderr, "PCR: No orphaned bundles found.")
+				fmt.Fprintln(os.Stderr, "PCR: No orphaned prompt bundles found.")
 			} else {
-				fmt.Fprintf(os.Stderr, "PCR: Deleted %d orphaned bundle%s (drafts restored).\n",
+				fmt.Fprintf(os.Stderr, "PCR: Deleted %d orphaned prompt bundle%s (drafts restored).\n",
 					deleted, plural(deleted))
 			}
 			return nil
@@ -44,9 +44,9 @@ var gcCmd = &cobra.Command{
 				return err
 			}
 			if deleted == 0 {
-				fmt.Fprintln(os.Stderr, "PCR: No unpushed bundles to discard.")
+				fmt.Fprintln(os.Stderr, "PCR: No unpushed prompt bundles to discard.")
 			} else {
-				fmt.Fprintf(os.Stderr, "PCR: Discarded %d unpushed bundle%s.\n", deleted, plural(deleted))
+				fmt.Fprintf(os.Stderr, "PCR: Discarded %d unpushed prompt bundle%s.\n", deleted, plural(deleted))
 			}
 			return nil
 		}
