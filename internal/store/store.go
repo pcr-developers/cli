@@ -43,7 +43,7 @@ func migrate(db *sql.DB) {
 	var version int
 	_ = db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version)
 
-	steps := []func(*sql.Tx) error{migrateV1, migrateV2}
+	steps := []func(*sql.Tx) error{migrateV1, migrateV2, migrateV3}
 
 	for i, step := range steps {
 		if i < version {
@@ -120,6 +120,21 @@ func migrateV2(tx *sql.Tx) error {
 		ALTER TABLE drafts ADD COLUMN git_diff TEXT;
 		ALTER TABLE prompt_commits ADD COLUMN bundle_status TEXT NOT NULL DEFAULT 'open';
 		CREATE INDEX IF NOT EXISTS idx_commits_bundle_status ON prompt_commits(bundle_status);
+	`)
+	return err
+}
+
+func migrateV3(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS diff_events (
+		  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		  project_id   TEXT NOT NULL,
+		  project_name TEXT NOT NULL,
+		  files        TEXT NOT NULL,
+		  occurred_at  TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS diff_events_occurred_at ON diff_events(occurred_at);
+		CREATE INDEX IF NOT EXISTS diff_events_project_id  ON diff_events(project_id);
 	`)
 	return err
 }

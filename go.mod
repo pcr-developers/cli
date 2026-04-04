@@ -1,6 +1,6 @@
 module github.com/pcr-developers/cli
 
-go 1.20
+go 1.23
 
 require (
 	github.com/fsnotify/fsnotify v1.7.0

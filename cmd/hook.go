@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -11,12 +13,14 @@ import (
 	"github.com/pcr-developers/cli/internal/store"
 )
 
-// hookCmd is called by the Claude Code Stop hook after every response.
-// It opens /dev/tty directly so it works even when Claude Code holds stdin.
+
+// hookCmd is called by a tool's Stop hook after every response.
+// Currently wired to Claude Code's Stop hook mechanism.
+// It opens /dev/tty directly so it works even when the tool holds stdin.
 // Always exits 0 — never re-engages the model.
 var hookCmd = &cobra.Command{
 	Use:    "hook",
-	Short:  "Internal: called by Claude Code Stop hook",
+	Short:  "Internal: called by a tool's Stop hook after each response",
 	Hidden: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Only act if pcr start is actually running.
@@ -61,7 +65,7 @@ var hookCmd = &cobra.Command{
 			bundleName = targetBundle.Message
 		}
 
-		msg := fmt.Sprintf("\r\nPCR: %d new prompt%s — add to %q? [Y/n] ", n, plural(n), bundleName)
+		msg := fmt.Sprintf("\r\nPCR: %d new prompt%s — add to %q? [Y/n/b] ", n, plural(n), bundleName)
 		_, _ = ttyFile.WriteString(msg)
 
 		// Switch to raw mode so we get a single keypress without requiring Enter.
@@ -95,34 +99,81 @@ var hookCmd = &cobra.Command{
 		}
 		_, _ = ttyFile.WriteString("\r\n")
 
-		// Accept Y, y, or Enter (CR or LF) as confirmation; anything else = no.
+		// b/B — branch into a new bundle (switching tasks mid-session).
+		if ch == 'b' || ch == 'B' {
+			return hookCreateNewBundle(ttyFile, drafts, ctx)
+		}
+
+		// n/N — skip, leave prompts as drafts.
+		if ch == 'n' || ch == 'N' {
+			return nil
+		}
+
+		// Y, y, or Enter — add to current bundle.
 		if ch != 'Y' && ch != 'y' && ch != '\r' && ch != '\n' {
 			return nil
 		}
 
-		ids := draftIDs(drafts)
-
-		if targetBundle != nil {
-			if err := store.AddDraftsToBundle(targetBundle.ID, ids); err != nil {
-				_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
-				return nil
-			}
-			_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: Added %d prompt%s to %q\r\n", n, plural(n), bundleName))
-		} else {
-			projectID := ""
-			projectName := ctx.name
-			if len(ctx.ids) > 0 {
-				projectID = ctx.ids[0]
-			}
-			syntheticSha := "hook-" + generateID()
-			_, err := store.CreateCommit(bundleName, syntheticSha, ids, projectID, projectName, bundleName, "open")
-			if err != nil {
-				_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
-				return nil
-			}
-			_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: Created bundle %q with %d prompt%s\r\n", bundleName, n, plural(n)))
-		}
-
-		return nil
+		return hookAddToBundle(ttyFile, drafts, targetBundle, bundleName, ctx, n)
 	},
 }
+
+// hookAddToBundle adds drafts to an existing or new bundle with the given name.
+func hookAddToBundle(ttyFile *os.File, drafts []store.DraftRecord, targetBundle *store.PromptCommit, bundleName string, ctx projectContext, n int) error {
+	ids := draftIDs(drafts)
+
+	if targetBundle != nil {
+		if err := store.AddDraftsToBundle(targetBundle.ID, ids); err != nil {
+			_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
+			return nil
+		}
+		_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: Added %d prompt%s to %q\r\n", n, plural(n), bundleName))
+	} else {
+		projectID := ""
+		projectName := ctx.name
+		if len(ctx.ids) > 0 {
+			projectID = ctx.ids[0]
+		}
+		syntheticSha := "hook-" + generateID()
+		_, err := store.CreateCommit(bundleName, syntheticSha, ids, projectID, projectName, bundleName, "open")
+		if err != nil {
+			_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
+			return nil
+		}
+		_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: Created prompt bundle %q with %d prompt%s\r\n", bundleName, n, plural(n)))
+	}
+	return nil
+}
+
+// hookCreateNewBundle prompts for a bundle name and creates a new bundle.
+// Called when the user presses 'new' at the hook prompt — they're switching tasks.
+func hookCreateNewBundle(ttyFile *os.File, drafts []store.DraftRecord, ctx projectContext) error {
+	_, _ = ttyFile.WriteString("PCR: New bundle name: ")
+
+	reader := bufio.NewReader(ttyFile)
+	line, _ := reader.ReadString('\n')
+	name := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
+
+	if name == "" {
+		_, _ = ttyFile.WriteString("PCR: Cancelled — no name given.\r\n")
+		return nil
+	}
+
+	projectID := ""
+	projectName := ctx.name
+	if len(ctx.ids) > 0 {
+		projectID = ctx.ids[0]
+	}
+
+	ids := draftIDs(drafts)
+	branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
+	syntheticSha := "hook-" + generateID()
+	_, err := store.CreateCommit(name, syntheticSha, ids, projectID, projectName, branch, "open")
+	if err != nil {
+		_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
+		return nil
+	}
+	_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: Created prompt bundle %q with %d prompt%s\r\n", name, len(drafts), plural(len(drafts))))
+	return nil
+}
+

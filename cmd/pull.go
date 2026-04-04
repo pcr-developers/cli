@@ -15,7 +15,7 @@ import (
 
 var pullCmd = &cobra.Command{
 	Use:   "pull [remote-id]",
-	Short: "Restore a pushed bundle to local drafts",
+	Short: "Restore a pushed prompt bundle to local drafts",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		a := auth.Load()
@@ -35,17 +35,21 @@ var pullCmd = &cobra.Command{
 				return err
 			}
 			if len(pushed) == 0 {
-				fmt.Fprintln(os.Stderr, "PCR: No pushed bundles found.")
+				fmt.Fprintln(os.Stderr, "PCR: No pushed prompt bundles found.")
 				return nil
 			}
 
-			fmt.Fprintf(os.Stderr, "Pushed bundles:\n\n")
+			fmt.Fprintf(os.Stderr, "Pushed prompt bundles:\n\n")
 			for i, b := range pushed {
 				fmt.Fprintf(os.Stderr, "  [%d] %q  remote: %s\n", i+1, b.Message, b.RemoteID)
 			}
 			fmt.Fprintln(os.Stderr)
 
 			tty := openTTY()
+			if tty == nil {
+				nonInteractiveHint("pcr pull <bundle-id>")
+				return nil
+			}
 			defer tty.Close()
 
 			resp := strings.TrimSpace(ttyPrompt(tty, "Select bundle to pull [number]: "))
@@ -80,7 +84,7 @@ var pullCmd = &cobra.Command{
 			}
 		}
 
-		fmt.Fprintf(os.Stderr, "PCR: Restored %d prompt%s from bundle %s\n",
+		fmt.Fprintf(os.Stderr, "PCR: Restored %d prompt%s from prompt bundle %s\n",
 			restored, plural(restored), remoteID)
 		return nil
 	},

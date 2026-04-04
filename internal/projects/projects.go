@@ -124,20 +124,54 @@ func UpdateProjectID(projectPath, projectID string) {
 	}
 }
 
+// GetBestProjectForCursorSlug returns the single registered project for a
+// Cursor workspace slug, or nil when the slug maps to multiple sub-projects
+// (use GetAllProjectsForCursorSlug + GetProjectForFile in that case).
 func GetBestProjectForCursorSlug(slug string) *Project {
 	projects := Load()
+	// Exact match first — the workspace IS a registered project.
 	for i, p := range projects {
 		if p.CursorSlug == slug {
 			return &projects[i]
 		}
 	}
-	// prefix fallback for monorepos
-	var best *Project
+	// Single prefix match: only one sub-project under this workspace path.
+	var matches []*Project
 	for i, p := range projects {
 		if strings.HasPrefix(p.CursorSlug, slug+"-") {
-			if best == nil || len(p.CursorSlug) > len(best.CursorSlug) {
-				best = &projects[i]
-			}
+			matches = append(matches, &projects[i])
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	// Multiple sub-projects: caller should use GetAllProjectsForCursorSlug.
+	return nil
+}
+
+// GetAllProjectsForCursorSlug returns every project that lives under the
+// given Cursor workspace slug (exact match + all sub-projects).
+func GetAllProjectsForCursorSlug(slug string) []Project {
+	projs := Load()
+	var result []Project
+	for _, p := range projs {
+		if p.CursorSlug == slug || strings.HasPrefix(p.CursorSlug, slug+"-") {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// GetProjectForFile returns the registered project whose path is the deepest
+// (longest) prefix of filePath. candidates should come from
+// GetAllProjectsForCursorSlug so we only search relevant projects.
+func GetProjectForFile(filePath string, candidates []Project) *Project {
+	var best *Project
+	var bestLen int
+	for i, p := range candidates {
+		if (strings.HasPrefix(filePath, p.Path+"/") || filePath == p.Path) && len(p.Path) > bestLen {
+			best = &candidates[i]
+			bestLen = len(p.Path)
 		}
 	}
 	return best

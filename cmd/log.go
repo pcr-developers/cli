@@ -13,7 +13,7 @@ import (
 
 var logCmd = &cobra.Command{
 	Use:   "log",
-	Short: "Show captured prompts and bundles for the current repo",
+	Short: "Show captured prompts and prompt bundles for the current repo",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		const (
 			grn  = "\x1b[32m"
@@ -101,7 +101,7 @@ var logCmd = &cobra.Command{
 					bold, c.Message, rst,
 					gry, count, plural(count), rst)
 			}
-			fmt.Fprintf(os.Stderr, "\n  %sRun `pcr add \"name\"` to add more · `pcr commit \"name\"` to seal%s\n", gry, rst)
+			fmt.Fprintf(os.Stderr, "\n  %sRun `pcr bundle --list` to review · `pcr push` to push%s\n", gry, rst)
 		}
 
 		if len(sealedBundles) > 0 {
@@ -124,13 +124,13 @@ var logCmd = &cobra.Command{
 		if len(drafts) > 0 {
 			fmt.Fprintf(os.Stderr, "\n%s%s  DRAFTS — not yet bundled%s  (%d)\n", cyan, bold, rst, len(drafts))
 			for _, d := range drafts {
-				preview := truncate(d.PromptText, 65)
+				preview := promptPreview(d.PromptText, 65)
 				fmt.Fprintf(os.Stderr, "  %s◦%s %s%s%s  %s%s%s\n",
 					gry, rst,
 					bold, preview, rst,
 					dim, strings.Split(d.CapturedAt, "T")[0], rst)
 			}
-			fmt.Fprintf(os.Stderr, "\n  %sRun `pcr add \"bundle-name\"` to bundle%s\n", gry, rst)
+			fmt.Fprintf(os.Stderr, "\n  %sRun `pcr bundle` to create a prompt bundle%s\n", gry, rst)
 		}
 
 		fmt.Fprintln(os.Stderr)

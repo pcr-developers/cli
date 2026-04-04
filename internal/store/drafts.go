@@ -40,6 +40,33 @@ type DraftRecord struct {
 	GitDiff           string           `json:"git_diff,omitempty"`
 }
 
+// TouchedProjectIDs returns all project IDs recorded in file_context for this
+// draft — the primary project plus any additional repos whose files were in
+// context for this prompt. Safe to call on any draft; returns nil if unset.
+func (d DraftRecord) TouchedProjectIDs() []string {
+	if d.FileContext == nil {
+		return nil
+	}
+	raw, ok := d.FileContext["touched_project_ids"]
+	if !ok {
+		return nil
+	}
+	// file_context round-trips through JSON so the value comes back as []any.
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 // SaveDraft inserts or updates a draft. Idempotent via content_hash.
 func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff string) error {
 	db := Open()
@@ -80,7 +107,9 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff strin
 		  tool_calls    = COALESCE(excluded.tool_calls,    drafts.tool_calls),
 		  file_context  = COALESCE(excluded.file_context,  drafts.file_context),
 		  model         = COALESCE(excluded.model,          drafts.model),
-		  git_diff      = COALESCE(excluded.git_diff,       drafts.git_diff)
+		  git_diff      = COALESCE(excluded.git_diff,       drafts.git_diff),
+		  project_id   = COALESCE(NULLIF(drafts.project_id,   ''), excluded.project_id),
+		  project_name = COALESCE(NULLIF(drafts.project_name, ''), excluded.project_name)
 		WHERE drafts.status = 'draft'
 	`,
 		id, hash,
@@ -109,6 +138,92 @@ func IsDraftSaved(sessionID, promptText string) bool {
 	var exists int
 	_ = db.QueryRow("SELECT 1 FROM drafts WHERE content_hash = ?", hash).Scan(&exists)
 	return exists == 1
+}
+
+// UpsertDraftProject updates attribution for an existing draft:
+//   - Sets project_id/project_name if currently empty (primary attribution)
+//   - Merges allIDs into file_context.touched_project_ids (accumulated across firings)
+//
+// This handles the case where a prompt is initially saved with only one repo tagged
+// (e.g. cli), then a later watcher firing discovers an additional repo (pcr-dev)
+// was also touched in the same window.
+func UpsertDraftProject(contentHash, projectID, projectName string, allIDs []string) error {
+	if projectID == "" && len(allIDs) == 0 {
+		return nil
+	}
+	db := Open()
+
+	// Read current file_context to merge touched_project_ids.
+	var fcJSON *string
+	if err := db.QueryRow(
+		"SELECT file_context FROM drafts WHERE content_hash = ? AND status = 'draft'",
+		contentHash,
+	).Scan(&fcJSON); err != nil {
+		return nil // draft not found or already pushed
+	}
+
+	current := map[string]any{}
+	if fcJSON != nil {
+		_ = json.Unmarshal([]byte(*fcJSON), &current)
+	}
+
+	// Set touched_project_ids to exactly allIDs (replace, not union).
+	// Callers that want accumulation should read+merge before calling.
+	if len(allIDs) > 1 {
+		current["touched_project_ids"] = allIDs
+	} else {
+		delete(current, "touched_project_ids")
+	}
+
+	fcBytes, _ := json.Marshal(current)
+	fcStr := string(fcBytes)
+
+	// COALESCE for primary: only fill project_id/name when currently empty.
+	// touched_project_ids always merges (union) so cross-repo evidence accumulates
+	// over time without overwriting correct primary attribution from earlier.
+	_, err := db.Exec(`
+		UPDATE drafts SET
+		  project_id   = COALESCE(NULLIF(project_id,   ''), ?),
+		  project_name = COALESCE(NULLIF(project_name, ''), ?),
+		  file_context = ?
+		WHERE content_hash = ? AND status = 'draft'
+	`, projectID, projectName, fcStr, contentHash)
+	return err
+}
+
+// TagUnattributedDrafts sets project_id/name on drafts that have no attribution yet.
+// Only touches drafts where project_id is currently empty — never overwrites
+// correct per-prompt tags set by the watcher.
+// projFiles maps projectID → projectName for projects with dirty files.
+// allIDs is the set of all touched project IDs to store in touched_project_ids.
+func TagUnattributedDrafts(primaryID, primaryName string, allIDs []string) error {
+	if primaryID == "" {
+		return nil
+	}
+	db := Open()
+	rows, err := db.Query(
+		`SELECT content_hash FROM drafts WHERE status IN ('draft','staged') AND (project_id IS NULL OR project_id = '')`,
+	)
+	if err != nil {
+		return err
+	}
+	var hashes []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			rows.Close()
+			return err
+		}
+		hashes = append(hashes, h)
+	}
+	rows.Close()
+
+	for _, h := range hashes {
+		if err := UpsertDraftProject(h, primaryID, primaryName, allIDs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UpdateDraftResponse fills in response_text for an existing draft that has none.
@@ -233,6 +348,20 @@ func GetAllDrafts(status DraftStatus, projectID string) ([]DraftRecord, error) {
 	rows, err := db.Query(
 		fmt.Sprintf("SELECT * FROM drafts %s ORDER BY captured_at ASC", where),
 		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDraftRows(rows)
+}
+
+// GetAllDraftsSortedByTime returns all non-pushed drafts ordered by captured_at ASC.
+// Used by retagDraftsNow to iterate prompts in chronological order for window attribution.
+func GetAllDraftsSortedByTime() ([]DraftRecord, error) {
+	db := Open()
+	rows, err := db.Query(
+		`SELECT * FROM drafts WHERE status IN ('draft','staged','committed') ORDER BY captured_at ASC`,
 	)
 	if err != nil {
 		return nil, err
