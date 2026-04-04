@@ -63,7 +63,6 @@ type ClaudeBundleData struct {
 	SessionShas   []string
 	HeadSha       string
 	ExchangeCount int
-	Items         []map[string]any
 	CommittedAt   string
 }
 
@@ -203,7 +202,7 @@ func UpsertCursorSession(token string, data CursorSessionData, projectID, userID
 	return err
 }
 
-// UpsertClaudeBundle pushes a bundle (with all prompt items) to claude_bundles.
+// UpsertClaudeBundle upserts bundle metadata to claude_bundles (no prompt data).
 func UpsertClaudeBundle(token string, data ClaudeBundleData, projectID, userID string) (string, error) {
 	payload := map[string]any{
 		"bundle_id":      data.BundleID,
@@ -214,7 +213,6 @@ func UpsertClaudeBundle(token string, data ClaudeBundleData, projectID, userID s
 		"session_shas":   data.SessionShas,
 		"head_sha":       nullableStr(data.HeadSha),
 		"exchange_count": data.ExchangeCount,
-		"items":          data.Items,
 		"committed_at":   nullableStr(data.CommittedAt),
 	}
 	resp, err := rpc(token, "upsert_claude_bundle", map[string]any{
@@ -227,6 +225,26 @@ func UpsertClaudeBundle(token string, data ClaudeBundleData, projectID, userID s
 	var remoteID string
 	_ = json.Unmarshal(resp, &remoteID)
 	return remoteID, nil
+}
+
+// UpsertBundlePrompts upserts prompt rows and their git diffs for a pushed bundle.
+func UpsertBundlePrompts(token string, items []map[string]any, diffs []map[string]any, userID string) error {
+	if len(items) > 0 {
+		if _, err := rpc(token, "upsert_prompts", map[string]any{
+			"p_records": items,
+			"p_user_id": nullableStr(userID),
+		}); err != nil {
+			return err
+		}
+	}
+	if len(diffs) > 0 {
+		if _, err := rpc(token, "upsert_git_diffs", map[string]any{
+			"p_diffs": diffs,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 

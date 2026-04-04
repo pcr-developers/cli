@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,16 +52,13 @@ var pushCmd = &cobra.Command{
 			return nil
 		}
 
+		currentBranch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
 		pushed := 0
 		for _, commit := range commits {
 			c, err := store.GetCommitWithItems(commit.ID)
 			if err != nil || c == nil {
 				continue
 			}
-
-			itemsJSON, _ := json.Marshal(c.Items)
-			var items []map[string]any
-			_ = json.Unmarshal(itemsJSON, &items)
 
 			remoteID, err := supabase.UpsertClaudeBundle("", supabase.ClaudeBundleData{
 				BundleID:      c.ID,
@@ -72,12 +68,45 @@ var pushCmd = &cobra.Command{
 				SessionShas:   c.SessionShas,
 				HeadSha:       c.HeadSha,
 				ExchangeCount: len(c.Items),
-				Items:         items,
 				CommittedAt:   c.CommittedAt,
 			}, c.ProjectID, a.UserID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "PCR: Failed to push bundle %q: %v\n", c.Message, err)
 				continue
+			}
+
+			// Push individual prompts and git diffs
+			var promptRecords []map[string]any
+			var diffRecords []map[string]any
+			for _, item := range c.Items {
+				rec := map[string]any{
+					"id":           item.ID,
+					"content_hash": item.ContentHash,
+					"bundle_id":    c.ID,
+					"session_id":   item.SessionID,
+					"prompt_text":  item.PromptText,
+					"tool_calls":   item.ToolCalls,
+					"model":        item.Model,
+					"source":       item.Source,
+					"branch_name":  item.BranchName,
+					"captured_at":  item.CapturedAt,
+				}
+				if item.ProjectID != "" {
+					rec["project_id"] = item.ProjectID
+				}
+				if item.ResponseText != "" {
+					rec["response_text"] = item.ResponseText
+				}
+				promptRecords = append(promptRecords, rec)
+				if item.GitDiff != "" {
+					diffRecords = append(diffRecords, map[string]any{
+						"prompt_id": item.ID,
+						"diff":      item.GitDiff,
+					})
+				}
+			}
+			if err := supabase.UpsertBundlePrompts("", promptRecords, diffRecords, a.UserID); err != nil {
+				fmt.Fprintf(os.Stderr, "PCR: Warning — bundle metadata pushed but prompts failed: %v\n", err)
 			}
 
 			if remoteID == "" {
@@ -90,7 +119,7 @@ var pushCmd = &cobra.Command{
 			reviewURL := config.AppURL + "/review/" + remoteID
 			branch := c.BranchName
 			if branch == "" {
-				branch = gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
+				branch = currentBranch
 			}
 			fmt.Fprintf(os.Stderr, "PCR: Pushed %q (%d prompt%s)\n", c.Message, len(c.Items), plural(len(c.Items)))
 			if branch != "" {
