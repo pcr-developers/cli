@@ -278,9 +278,27 @@ func MergeDraftFileContext(sessionID, promptText string, updates map[string]any)
 	return err
 }
 
-// UpdateDraftToolCalls fills in tool_calls for an existing draft that has none.
-// Only updates if the draft currently has no tool_calls recorded, so the first
-// complete set of tool calls wins and later watcher firings don't overwrite.
+// UpdateDraftGitDiff fills in git_diff for an existing draft that has none.
+// Only updates if the draft currently has no git_diff recorded, so a later
+// watcher firing (after edits are complete) can backfill the diff that was
+// missing when the prompt was first saved (captured before Claude responded).
+func UpdateDraftGitDiff(sessionID, promptText, gitDiff, headSha string) error {
+	if gitDiff == "" {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+	_, err := db.Exec(
+		"UPDATE drafts SET git_diff = ?, head_sha = COALESCE(NULLIF(head_sha,''), ?) WHERE content_hash = ? AND status = 'draft' AND (git_diff IS NULL OR git_diff = '')",
+		gitDiff, headSha, hash,
+	)
+	return err
+}
+
+// UpdateDraftToolCalls updates tool_calls for an existing draft, always replacing
+// with the latest value. Each watcher firing parses the full JSONL from the start,
+// so later firings accumulate more tool calls as Claude finishes its response —
+// the most recent parse is always the most complete.
 func UpdateDraftToolCalls(sessionID, promptText string, toolCalls []map[string]any) error {
 	if len(toolCalls) == 0 {
 		return nil
@@ -289,7 +307,7 @@ func UpdateDraftToolCalls(sessionID, promptText string, toolCalls []map[string]a
 	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	b, _ := json.Marshal(toolCalls)
 	_, err := db.Exec(
-		"UPDATE drafts SET tool_calls = ? WHERE content_hash = ? AND status = 'draft' AND (tool_calls IS NULL OR tool_calls = '')",
+		"UPDATE drafts SET tool_calls = ? WHERE content_hash = ? AND status = 'draft'",
 		string(b), hash,
 	)
 	return err

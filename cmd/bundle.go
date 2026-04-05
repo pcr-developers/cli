@@ -372,43 +372,11 @@ func runBundleCreate(name, selectArg, repoFilter string) error {
 	if len(ctx.ids) > 0 {
 		projectID = ctx.ids[0]
 	}
-	branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
-	// If the current dir isn't a git repo (e.g. pcr-developers/ org folder),
-	// find the branch from the primary touched project among the selected drafts.
-	if branch == "" {
-		projByID := loadProjByID()
-		// Collect all touched project IDs across selected drafts
-		touchedSet := map[string]int{}
-		for _, d := range selected {
-			if d.ProjectID != "" {
-				touchedSet[d.ProjectID]++
-			}
-			for _, id := range d.TouchedProjectIDs() {
-				touchedSet[id]++
-			}
-		}
-		// Pick the project with the most hits as primary for branch lookup
-		bestID, bestCount := "", 0
-		for id, count := range touchedSet {
-			if count > bestCount {
-				bestID, bestCount = id, count
-			}
-		}
-		if bestID != "" {
-			if name, ok := projByID[bestID]; ok {
-				for _, p := range projects.Load() {
-					if p.Name == name && p.Path != "" {
-						branch = gitOutputIn(p.Path, "git", "rev-parse", "--abbrev-ref", "HEAD")
-						break
-					}
-				}
-			}
-		}
-	}
 	sha := "bundle-" + generateID()
 
-	// "closed" = auto-sealed, ready to push
-	_, err = store.CreateCommit(name, sha, draftIDs(selected), projectID, projectName, branch, "closed")
+	// Branch is intentionally left empty here — it will be resolved from the
+	// current git state at pcr push time, so it reflects where the user ends up.
+	_, err = store.CreateCommit(name, sha, draftIDs(selected), projectID, projectName, "", "closed")
 	if err != nil {
 		return err
 	}

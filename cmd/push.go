@@ -148,9 +148,9 @@ func pushBundle(localID, currentBranch, userID string) int {
 	}
 
 	reviewURL := config.AppURL + "/review/" + remoteID
-	branch := c.BranchName
+	branch := currentBranch
 	if branch == "" {
-		branch = currentBranch
+		branch = c.BranchName
 	}
 	fmt.Fprintf(os.Stderr, "PCR: Pushed %q (%d prompt%s)\n", c.Message, len(c.Items), plural(len(c.Items)))
 	if branch != "" {
