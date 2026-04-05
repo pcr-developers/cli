@@ -23,7 +23,7 @@ var pushCmd = &cobra.Command{
 	},
 }
 
-// runManualPush is the default: push already-sealed bundles.
+// runManualPush is the default: push all unpushed bundles, sealing any open ones first.
 func runManualPush() error {
 	a := auth.Load()
 	if a == nil {
@@ -36,27 +36,21 @@ func runManualPush() error {
 		return err
 	}
 	if len(allUnpushed) == 0 {
-		fmt.Fprintln(os.Stderr, "PCR: No committed prompt bundles to push. Run `pcr commit` first.")
-		fmt.Fprintln(os.Stderr, "     Or use `pcr push --auto` to auto-bundle drafts by git commit.")
+		fmt.Fprintln(os.Stderr, "PCR: No prompt bundles to push. Run `pcr bundle \"name\" --select all` first.")
 		return nil
 	}
 
+	// Auto-seal open bundles — running pcr push means the session is done.
 	var commits []store.PromptCommit
-	var openCount int
 	for _, c := range allUnpushed {
 		if c.BundleStatus == "open" {
-			openCount++
-		} else {
-			commits = append(commits, c)
+			if err := store.CloseBundle(c.ID); err != nil {
+				return err
+			}
+			c.BundleStatus = "closed"
+			fmt.Fprintf(os.Stderr, "PCR: Sealed %q\n", c.Message)
 		}
-	}
-	if openCount > 0 {
-		fmt.Fprintf(os.Stderr, "PCR: Skipping %d open prompt bundle%s — seal with `pcr commit \"name\"` first.\n",
-			openCount, plural(openCount))
-	}
-	if len(commits) == 0 {
-		fmt.Fprintln(os.Stderr, "PCR: No sealed prompt bundles to push.")
-		return nil
+		commits = append(commits, c)
 	}
 
 	pushed := 0
