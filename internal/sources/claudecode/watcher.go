@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -327,15 +328,57 @@ func getGitDiff(projectPath string) string {
 	}
 	cmd := exec.Command("git", "diff", "HEAD")
 	cmd.Dir = projectPath
-	out, err := cmd.Output()
-	if err != nil || len(out) == 0 {
+	tracked, _ := cmd.Output()
+
+	untracked := untrackedDiff(projectPath)
+
+	combined := string(tracked) + untracked
+	if combined == "" {
 		return ""
 	}
 	const maxBytes = 50_000
-	if len(out) > maxBytes {
-		return string(out[:maxBytes]) + "\n[truncated]"
+	if len(combined) > maxBytes {
+		return combined[:maxBytes] + "\n[truncated]"
 	}
-	return string(out)
+	return combined
+}
+
+// untrackedDiff generates a unified-diff representation of untracked new files
+// so they appear alongside tracked modifications in the captured diff.
+func untrackedDiff(projectPath string) string {
+	out, err := exec.Command("git", "-C", projectPath, "status", "--porcelain").Output()
+	if err != nil || len(out) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, line := range strings.Split(string(out), "\n") {
+		if len(line) < 4 || line[:2] != "??" {
+			continue
+		}
+		rel := strings.TrimSpace(line[3:])
+		if rel == "" || strings.HasSuffix(rel, "/") {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(projectPath, rel))
+		if err != nil {
+			continue
+		}
+		// Skip binary files (null byte present in first 8 KB).
+		check := content
+		if len(check) > 8192 {
+			check = check[:8192]
+		}
+		if strings.ContainsRune(string(check), 0) {
+			continue
+		}
+		lines := strings.Split(strings.TrimRight(string(content), "\n"), "\n")
+		fmt.Fprintf(&sb, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1,%d @@\n",
+			rel, rel, rel, len(lines))
+		for _, l := range lines {
+			fmt.Fprintf(&sb, "+%s\n", l)
+		}
+	}
+	return sb.String()
 }
 
 func getCommitsSince(projectPath, sinceISO string) []string {
