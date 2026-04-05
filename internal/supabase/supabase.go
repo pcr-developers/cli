@@ -83,9 +83,23 @@ func PromptContentHash(sessionID, promptText, responseText string) string {
 	return fmt.Sprintf("%x", h)
 }
 
+// PromptContentHashV2 includes capturedAt so that identical messages sent at
+// different times in the same session get distinct hashes. Use this for new
+// captures when a per-bubble timestamp is available.
+func PromptContentHashV2(sessionID, promptText, capturedAt string) string {
+	h := sha256.Sum256([]byte(sessionID + "\x00" + promptText + "\x00" + capturedAt))
+	return fmt.Sprintf("%x", h)
+}
+
 // PromptID formats the same hash as a UUID (8-4-4-4-12).
 func PromptID(sessionID, promptText, responseText string) string {
 	hex := PromptContentHash(sessionID, promptText, responseText)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hex[:8], hex[8:12], hex[12:16], hex[16:20], hex[20:32])
+}
+
+// PromptIDV2 formats a V2 hash as a UUID.
+func PromptIDV2(sessionID, promptText, capturedAt string) string {
+	hex := PromptContentHashV2(sessionID, promptText, capturedAt)
 	return fmt.Sprintf("%s-%s-%s-%s-%s", hex[:8], hex[8:12], hex[12:16], hex[16:20], hex[20:32])
 }
 

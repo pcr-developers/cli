@@ -20,6 +20,8 @@ import (
 	"github.com/pcr-developers/cli/internal/sources"
 )
 
+var startVerbose bool
+
 var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Watch for new Claude Code and Cursor prompts and save them as drafts",
@@ -63,8 +65,10 @@ var startCmd = &cobra.Command{
 			userID = a.UserID
 		}
 
+		display.Verbose = startVerbose
+
 		projs := projects.Load()
-		display.PrintStartupBanner(Version, len(projs))
+		display.PrintStartupBanner(Version, BuildTime, len(projs))
 
 		// Start DiffTracker: polls every 3s to record timestamped file-change events.
 		// These events are queried by the watcher for per-prompt repo attribution.
@@ -85,6 +89,10 @@ var startCmd = &cobra.Command{
 		fmt.Fprintln(os.Stderr, "\nPCR: Watcher stopped.")
 		return nil
 	},
+}
+
+func init() {
+	startCmd.Flags().BoolVarP(&startVerbose, "verbose", "v", false, "Print real-time events from all watchers (diffs, session state changes, completed turns)")
 }
 
 func pidFilePath() string {

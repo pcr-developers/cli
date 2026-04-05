@@ -69,11 +69,24 @@ func (d DraftRecord) TouchedProjectIDs() []string {
 }
 
 // SaveDraft inserts or updates a draft. Idempotent via content_hash.
-func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff, headSha string) error {
+// If record.ID and record.ContentHash are pre-populated (e.g. using V2 hashes
+// that include a timestamp), those values are used directly so that identical
+// prompts sent at different times in the same session produce distinct records.
+func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff string, headShaArg ...string) error {
+	headSha := ""
+	if len(headShaArg) > 0 {
+		headSha = headShaArg[0]
+	}
 	db := Open()
 
-	id := supabase.PromptID(record.SessionID, record.PromptText, "")
-	hash := supabase.PromptContentHash(record.SessionID, record.PromptText, "")
+	id := record.ID
+	hash := record.ContentHash
+	if id == "" {
+		id = supabase.PromptID(record.SessionID, record.PromptText, "")
+	}
+	if hash == "" {
+		hash = supabase.PromptContentHash(record.SessionID, record.PromptText, "")
+	}
 
 	var toolCallsJSON, fileContextJSON, sessionShasJSON *string
 	if len(record.ToolCalls) > 0 {
@@ -134,12 +147,51 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff, head
 	return err
 }
 
-// IsDraftSaved checks if a draft with the given prompt-only hash already exists.
-func IsDraftSaved(sessionID, promptText string) bool {
+// IsDraftSavedByBubble checks whether a specific Cursor bubble (identified by
+// sessionID + bubbleID) has already been saved as a draft. Used by the
+// PromptScanner to avoid re-saving turns on restart.
+func IsDraftSavedByBubble(sessionID, bubbleID string) bool {
 	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	var exists int
-	_ = db.QueryRow("SELECT 1 FROM drafts WHERE content_hash = ?", hash).Scan(&exists)
+	_ = db.QueryRow(
+		"SELECT 1 FROM saved_bubbles WHERE session_id = ? AND bubble_id = ?",
+		sessionID, bubbleID,
+	).Scan(&exists)
+	return exists == 1
+}
+
+// MarkBubbleSaved records that a bubble has been saved, keyed by
+// session_id + bubble_id. Called immediately after SaveDraft succeeds.
+func MarkBubbleSaved(sessionID, bubbleID, draftHash string) error {
+	db := Open()
+	_, err := db.Exec(
+		`INSERT OR IGNORE INTO saved_bubbles (session_id, bubble_id, draft_hash) VALUES (?, ?, ?)`,
+		sessionID, bubbleID, draftHash,
+	)
+	return err
+}
+
+// IsDraftSaved checks if a draft with the given session + prompt text already
+// exists. Checks both the legacy hash (no timestamp) and the V2 hash (with
+// capturedAt) so that re-fires for the same bubble are correctly deduplicated.
+func IsDraftSaved(sessionID, promptText string) bool {
+	return IsDraftSavedAt(sessionID, promptText, "")
+}
+
+// IsDraftSavedAt checks if a draft exists for this session + prompt text +
+// timestamp combination. Pass capturedAt="" to check only the legacy hash.
+func IsDraftSavedAt(sessionID, promptText, capturedAt string) bool {
+	db := Open()
+	legacyHash := supabase.PromptContentHash(sessionID, promptText, "")
+	var exists int
+	_ = db.QueryRow("SELECT 1 FROM drafts WHERE content_hash = ?", legacyHash).Scan(&exists)
+	if exists == 1 {
+		return true
+	}
+	if capturedAt != "" {
+		v2Hash := supabase.PromptContentHashV2(sessionID, promptText, capturedAt)
+		_ = db.QueryRow("SELECT 1 FROM drafts WHERE content_hash = ?", v2Hash).Scan(&exists)
+	}
 	return exists == 1
 }
 
@@ -229,10 +281,92 @@ func TagUnattributedDrafts(primaryID, primaryName string, allIDs []string) error
 	return nil
 }
 
-// UpdateDraftResponse updates response_text for an existing draft.
-// Always overwrites so that later watcher firings (with the full completed
-// response) replace any partial response stored by an earlier firing.
-// Skips pushed drafts — those are immutable.
+// ClearAllChangedFiles removes diff_event-derived attribution from every draft:
+// file_context["changed_files"] and file_context["touched_project_ids"].
+// Called on tracker start to discard attributions derived from stale diff_events
+// so that only events from the current pcr start run are used for attribution.
+func ClearAllChangedFiles() error {
+	db := Open()
+	rows, err := db.Query(`SELECT content_hash, file_context FROM drafts WHERE status IN ('draft','staged')`)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		hash string
+		fc   string
+	}
+	var toUpdate []row
+	for rows.Next() {
+		var r row
+		if rows.Scan(&r.hash, &r.fc) == nil {
+			toUpdate = append(toUpdate, r)
+		}
+	}
+	rows.Close()
+
+	for _, r := range toUpdate {
+		fc := map[string]any{}
+		if r.fc != "" {
+			_ = json.Unmarshal([]byte(r.fc), &fc)
+		}
+		changed := false
+		for _, key := range []string{"changed_files", "touched_project_ids"} {
+			if _, exists := fc[key]; exists {
+				delete(fc, key)
+				changed = true
+			}
+		}
+		if !changed {
+			continue
+		}
+		b, _ := json.Marshal(fc)
+		_, _ = db.Exec(`UPDATE drafts SET file_context = ? WHERE content_hash = ?`, string(b), r.hash)
+	}
+	return nil
+}
+
+// EnrichDraftChangedFiles sets file_context["changed_files"] on a draft that
+// was saved without it (e.g. captured before the agent finished its response).
+// Only writes if changed_files is not already set — the first closed-window
+// attribution is considered authoritative and is not overwritten.
+// Returns nil silently if the draft doesn't exist or already has data.
+func EnrichDraftChangedFiles(contentHash string, changedFiles []string) error {
+	if len(changedFiles) == 0 {
+		return nil
+	}
+	db := Open()
+
+	var fcJSON *string
+	if err := db.QueryRow(
+		"SELECT file_context FROM drafts WHERE content_hash = ?",
+		contentHash,
+	).Scan(&fcJSON); err != nil {
+		return nil
+	}
+
+	fc := map[string]any{}
+	if fcJSON != nil {
+		_ = json.Unmarshal([]byte(*fcJSON), &fc)
+	}
+
+	// Don't overwrite attribution that was already set.
+	if existing, ok := fc["changed_files"]; ok && existing != nil {
+		if arr, ok := existing.([]any); ok && len(arr) > 0 {
+			return nil
+		}
+	}
+
+	fc["changed_files"] = changedFiles
+	b, _ := json.Marshal(fc)
+	_, err := db.Exec(
+		"UPDATE drafts SET file_context = ? WHERE content_hash = ?",
+		string(b), contentHash,
+	)
+	return err
+}
+
+// UpdateDraftResponse fills in response_text for an existing draft that has none.
+// Uses exact content hash match.
 func UpdateDraftResponse(sessionID, promptText, responseText string) error {
 	if responseText == "" {
 		return nil
@@ -240,75 +374,8 @@ func UpdateDraftResponse(sessionID, promptText, responseText string) error {
 	db := Open()
 	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	_, err := db.Exec(
-		"UPDATE drafts SET response_text = ? WHERE content_hash = ? AND status != 'pushed'",
+		"UPDATE drafts SET response_text = ? WHERE content_hash = ? AND (response_text IS NULL OR response_text = '')",
 		responseText, hash,
-	)
-	return err
-}
-
-// MergeDraftFileContext merges new key-value pairs into the existing file_context
-// for a draft. Existing keys are overwritten; unrelated keys are preserved.
-func MergeDraftFileContext(sessionID, promptText string, updates map[string]any) error {
-	if len(updates) == 0 {
-		return nil
-	}
-	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
-
-	var fcJSON *string
-	if err := db.QueryRow(
-		"SELECT file_context FROM drafts WHERE content_hash = ? AND status = 'draft'",
-		hash,
-	).Scan(&fcJSON); err != nil {
-		return nil // draft not found or already pushed
-	}
-
-	current := map[string]any{}
-	if fcJSON != nil {
-		_ = json.Unmarshal([]byte(*fcJSON), &current)
-	}
-	for k, v := range updates {
-		current[k] = v
-	}
-	b, _ := json.Marshal(current)
-	_, err := db.Exec(
-		"UPDATE drafts SET file_context = ? WHERE content_hash = ? AND status = 'draft'",
-		string(b), hash,
-	)
-	return err
-}
-
-// UpdateDraftGitDiff fills in git_diff for an existing draft that has none.
-// Only updates if the draft currently has no git_diff recorded, so a later
-// watcher firing (after edits are complete) can backfill the diff that was
-// missing when the prompt was first saved (captured before Claude responded).
-func UpdateDraftGitDiff(sessionID, promptText, gitDiff, headSha string) error {
-	if gitDiff == "" {
-		return nil
-	}
-	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
-	_, err := db.Exec(
-		"UPDATE drafts SET git_diff = ?, head_sha = COALESCE(NULLIF(head_sha,''), ?) WHERE content_hash = ? AND status = 'draft' AND (git_diff IS NULL OR git_diff = '')",
-		gitDiff, headSha, hash,
-	)
-	return err
-}
-
-// UpdateDraftToolCalls updates tool_calls for an existing draft, always replacing
-// with the latest value. Each watcher firing parses the full JSONL from the start,
-// so later firings accumulate more tool calls as Claude finishes its response —
-// the most recent parse is always the most complete.
-func UpdateDraftToolCalls(sessionID, promptText string, toolCalls []map[string]any) error {
-	if len(toolCalls) == 0 {
-		return nil
-	}
-	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
-	b, _ := json.Marshal(toolCalls)
-	_, err := db.Exec(
-		"UPDATE drafts SET tool_calls = ? WHERE content_hash = ? AND status = 'draft'",
-		string(b), hash,
 	)
 	return err
 }
@@ -662,4 +729,59 @@ func nullableStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+func UpdateDraftToolCalls(sessionID, promptText string, toolCalls []map[string]any) error {
+	if len(toolCalls) == 0 {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+	b, _ := json.Marshal(toolCalls)
+	_, err := db.Exec(
+		"UPDATE drafts SET tool_calls = ? WHERE content_hash = ? AND status = 'draft'",
+		string(b), hash,
+	)
+	return err
+}
+
+func MergeDraftFileContext(sessionID, promptText string, updates map[string]any) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+	var fcJSON *string
+	if err := db.QueryRow(
+		"SELECT file_context FROM drafts WHERE content_hash = ? AND status = 'draft'",
+		hash,
+	).Scan(&fcJSON); err != nil {
+		return nil
+	}
+	current := map[string]any{}
+	if fcJSON != nil {
+		_ = json.Unmarshal([]byte(*fcJSON), &current)
+	}
+	for k, v := range updates {
+		current[k] = v
+	}
+	b, _ := json.Marshal(current)
+	_, err := db.Exec(
+		"UPDATE drafts SET file_context = ? WHERE content_hash = ? AND status = 'draft'",
+		string(b), hash,
+	)
+	return err
+}
+
+func UpdateDraftGitDiff(sessionID, promptText, gitDiff, headSha string) error {
+	if gitDiff == "" {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+	_, err := db.Exec(
+		"UPDATE drafts SET git_diff = ?, head_sha = COALESCE(NULLIF(head_sha,''), ?) WHERE content_hash = ? AND status = 'draft' AND (git_diff IS NULL OR git_diff = '')",
+		gitDiff, headSha, hash,
+	)
+	return err
 }

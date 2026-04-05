@@ -43,7 +43,7 @@ func migrate(db *sql.DB) {
 	var version int
 	_ = db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version)
 
-	steps := []func(*sql.Tx) error{migrateV1, migrateV2, migrateV3, migrateV4}
+	steps := []func(*sql.Tx) error{migrateV1, migrateV2, migrateV3, migrateV4, migrateV5}
 
 	for i, step := range steps {
 		if i < version {
@@ -140,6 +140,31 @@ func migrateV3(tx *sql.Tx) error {
 		);
 		CREATE INDEX IF NOT EXISTS diff_events_occurred_at ON diff_events(occurred_at);
 		CREATE INDEX IF NOT EXISTS diff_events_project_id  ON diff_events(project_id);
+	`)
+	return err
+}
+
+func migrateV5(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS session_state_events (
+		  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+		  session_id           TEXT NOT NULL,
+		  occurred_at          TEXT NOT NULL,
+		  unified_mode         TEXT,
+		  model_name           TEXT,
+		  context_tokens_used  INTEGER,
+		  context_token_limit  INTEGER
+		);
+		CREATE INDEX IF NOT EXISTS sse_session_time
+		    ON session_state_events(session_id, occurred_at);
+
+		CREATE TABLE IF NOT EXISTS saved_bubbles (
+		  session_id   TEXT NOT NULL,
+		  bubble_id    TEXT NOT NULL,
+		  draft_hash   TEXT NOT NULL,
+		  saved_at     TEXT NOT NULL DEFAULT (datetime('now')),
+		  PRIMARY KEY (session_id, bubble_id)
+		);
 	`)
 	return err
 }

@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,85 +12,397 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/pcr-developers/cli/internal/display"
 	"github.com/pcr-developers/cli/internal/projects"
-	"github.com/pcr-developers/cli/internal/sources/shared"
 	"github.com/pcr-developers/cli/internal/store"
 	"github.com/pcr-developers/cli/internal/supabase"
 	"github.com/pcr-developers/cli/internal/versions"
 )
 
-// Poller is the interface the Cursor watcher uses to force an immediate
-// DiffTracker poll before querying diff events. Defined here to avoid an
-// import cycle between sources/cursor and the parent sources package.
+// Poller is the interface the PromptScanner uses to force an immediate
+// DiffTracker poll before querying diff events.
 type Poller interface {
 	Poll()
+	StartedAt() time.Time // when this pcr start instance began — attribution floor
 }
 
-const sourceID = "cursor"
+const sourceID = "cursor" // pcr
 
-type Watcher struct {
+// PromptScanner discovers completed Cursor agent turns by polling Cursor's
+// SQLite database every 20 seconds. A turn is "complete" when the last
+// assistant bubble in a user→assistant exchange has `turnDurationMs` set.
+//
+// When a completed turn is found for the first time:
+//  1. Look up mode/model from session_state_events at the exact prompt timestamp
+//  2. If agent mode: query diff_events in the exact turn window for changed files
+//  3. Save the draft once, fully attributed, no retroactive enrichment needed
+//
+// fsnotify watches the same directories as a fast-path trigger so newly created
+// sessions are processed within ~300ms instead of waiting up to 20 seconds.
+type PromptScanner struct {
 	dir         string
 	userID      string
-	state       *shared.FileState
-	dedup       *shared.Deduplicator
-	diffTracker Poller // forced poll before event queries
+	diffTracker Poller
 
-	timerMu sync.Mutex
-	timers  map[string]*time.Timer
-
-	lastFiredMu sync.Mutex
-	startedAt   time.Time
-	lastFiredAt time.Time
+	seenMu       sync.Mutex
+	seen         map[string]bool // "sessionID:userBubbleID" → already saved
+	initialScan  bool            // true during first scan — suppresses verbose output
 }
 
-func NewWatcher(dir, userID string, dt Poller) *Watcher {
-	return &Watcher{
+func NewPromptScanner(dir, userID string, dt Poller) *PromptScanner {
+	return &PromptScanner{
 		dir:         dir,
 		userID:      userID,
-		state:       shared.NewFileState(sourceID),
-		dedup:       shared.NewDeduplicator(),
-		timers:      map[string]*time.Timer{},
 		diffTracker: dt,
+		seen:        map[string]bool{},
+		initialScan: true,
 	}
 }
 
-func (w *Watcher) Start() {
-	w.lastFiredMu.Lock()
-	w.startedAt = time.Now()
-	w.lastFiredMu.Unlock()
+// Start launches the 20-second polling ticker and registers fsnotify as a
+// fast-path trigger. Both paths call scan() which is idempotent.
+func (s *PromptScanner) Start() {
+	display.PrintWatcherReady("Cursor", s.dir)
 
-	w.state.Load()
+	// Initial scan — saves historical prompts silently (no verbose flood).
+	s.scan()
+	s.initialScan = false
 
-	if _, err := os.Stat(w.dir); os.IsNotExist(err) {
-		display.PrintError("cursor", "Directory not found: "+w.dir+". Will activate when it appears.")
+	// Kick off fsnotify to catch newly created sessions quickly.
+	go s.watchFSNotify()
+
+	// Periodic full scan every 20 seconds — catches any missed fsnotify events.
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.scan()
 	}
-	display.PrintWatcherReady("Cursor", w.dir)
+}
 
+// scan walks the agent-transcripts directory, discovers sessions, and
+// processes any completed turns that haven't been saved yet.
+func (s *PromptScanner) scan() {
+	if s.diffTracker != nil {
+		s.diffTracker.Poll()
+	}
+
+	_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !isAgentTranscript(path) {
+			return nil
+		}
+		projectSlug, sessionID, ok := parseTranscriptPath(path)
+		if !ok {
+			return nil
+		}
+		s.processSession(projectSlug, sessionID)
+		return nil
+	})
+}
+
+// processSession checks one Cursor session for newly completed turns and
+// saves any that haven't been recorded yet.
+func (s *PromptScanner) processSession(projectSlug, sessionID string) {
+	candidates := projects.GetAllProjectsForCursorSlug(projectSlug)
+	if len(candidates) == 0 {
+		return
+	}
+
+	meta := GetSessionMeta(sessionID)
+	if meta == nil || len(meta.Bubbles) == 0 {
+		return
+	}
+
+	bubbles := meta.Bubbles
+
+	for i, b := range bubbles {
+		if b.Type != 1 || strings.TrimSpace(b.Text) == "" {
+			continue
+		}
+
+		// Check if this turn is already saved.
+		key := sessionID + ":" + b.BubbleID
+		s.seenMu.Lock()
+		if s.seen[key] {
+			s.seenMu.Unlock()
+			continue
+		}
+		s.seenMu.Unlock()
+
+		// Find the last assistant bubble for this user turn and check
+		// whether it has turnDurationMs (which means the turn is complete).
+		var lastAssistant *BubbleMeta
+		var responseText string
+		for j := i + 1; j < len(bubbles); j++ {
+			if bubbles[j].Type == 1 {
+				break // next user turn — stop
+			}
+			if bubbles[j].Type == 2 {
+				bub := bubbles[j]
+				lastAssistant = &bub
+				if responseText == "" && strings.TrimSpace(bub.Text) != "" {
+					responseText = bub.Text
+				}
+			}
+		}
+
+		if lastAssistant == nil || lastAssistant.TurnDurationMs == nil {
+			// Turn not yet complete — skip until next scan.
+			continue
+		}
+
+		// Mark as seen immediately to prevent duplicate saves if scan()
+		// is called again before this goroutine finishes.
+		s.seenMu.Lock()
+		s.seen[key] = true
+		s.seenMu.Unlock()
+
+		// Also verify against the persistent store in case of restarts.
+		// Check both new saved_bubbles table AND legacy hash-based drafts table.
+		if store.IsDraftSavedByBubble(sessionID, b.BubbleID) || store.IsDraftSaved(sessionID, b.Text) {
+			continue
+		}
+
+		if !s.initialScan {
+			durSec := *lastAssistant.TurnDurationMs / 1000
+			display.PrintVerboseEvent("scan", fmt.Sprintf("[%s]  turn complete  %ds  %q",
+				sessionID[:8], durSec, truncate(b.Text, 50)))
+		}
+
+		s.saveCompletedTurn(sessionID, meta.ComposerID, b, *lastAssistant, responseText, meta, candidates, !s.initialScan)
+	}
+}
+
+// saveCompletedTurn computes full attribution for a completed agent turn and
+// writes a single draft record. All attribution is resolved at save time:
+//   - Mode and model from session_state_events (point-in-time lookup)
+//   - Changed files from diff_events within the exact turn window
+func (s *PromptScanner) saveCompletedTurn(
+	sessionID, composerID string,
+	userBubble, lastAssistant BubbleMeta,
+	responseText string,
+	meta *SessionMeta,
+	candidates []projects.Project,
+	showOutput bool,
+) {
+	capturedAt := userBubble.CreatedAt
+	if capturedAt == "" {
+		capturedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	turnStart := parseBubbleTime(capturedAt)
+
+	// Turn end = last assistant bubble's createdAt + turnDurationMs
+	var turnEnd time.Time
+	if lastAssistant.CreatedAt != "" && lastAssistant.TurnDurationMs != nil {
+		assistantStart := parseBubbleTime(lastAssistant.CreatedAt)
+		if !assistantStart.IsZero() {
+			turnEnd = assistantStart.Add(time.Duration(*lastAssistant.TurnDurationMs) * time.Millisecond)
+		}
+	}
+	if turnEnd.IsZero() {
+		turnEnd = time.Now()
+	}
+
+	// ── Mode and model from session state timeline ─────────────────────────
+	mode := ""
+	modelName := meta.ModelName
+	if !turnStart.IsZero() {
+		if stateEvent, _ := store.GetSessionStateAt(sessionID, turnStart); stateEvent != nil {
+			mode = stateEvent.UnifiedMode
+			if stateEvent.ModelName != "" {
+				modelName = stateEvent.ModelName
+			}
+		}
+	}
+	// Fallback to session-level values.
+	if mode == "" {
+		mode = meta.UnifiedMode
+	}
+
+	// ── Changed files (agent mode only) ───────────────────────────────────
+	var changedFiles []string
+	var proj *projects.Project
+	var touchedIDs []string
+
+	// Both "agent" and "debug" modes involve autonomous tool use and can
+	// produce file changes. "plan" and "chat" are read-only.
+	isAgentTurn := mode == "agent" || mode == "debug"
+
+	if isAgentTurn && !turnStart.IsZero() {
+		// Use StartedAt as the floor so only events from THIS pcr start run
+		// are considered. Events from previous runs are unreliable.
+		floor := turnStart
+		if s.diffTracker != nil {
+			if st := s.diffTracker.StartedAt(); !st.IsZero() && st.After(floor) {
+				floor = st
+			}
+		}
+		windowEvents, _ := store.GetDiffEventsInWindow(floor, turnEnd)
+		if len(candidates) == 1 {
+			proj = &candidates[0]
+			if proj.ProjectID != "" {
+				touchedIDs = []string{proj.ProjectID}
+			}
+			changedFiles = extractChangedFiles(windowEvents, proj.ProjectID, touchedIDs, candidates)
+		} else {
+			proj, touchedIDs = resolveFromEvents(windowEvents, candidates)
+			changedFiles = extractChangedFiles(windowEvents, proj.ProjectID, touchedIDs, candidates)
+		}
+	}
+
+	if proj == nil {
+		// Non-agent turn or no events: use best-candidate attribution.
+		if len(candidates) == 1 {
+			proj = &candidates[0]
+		} else {
+			proj = &projects.Project{}
+		}
+	}
+
+	// Agent-mode prompts require verified file changes — without them there is
+	// no causal attribution and no value. Non-agent turns (ask, plan, debug)
+	// are always saved since they don't produce file changes by design.
+	if isAgentTurn && len(changedFiles) == 0 {
+		return
+	}
+
+	// ── Build file context ─────────────────────────────────────────────────
+	fileContext := map[string]any{
+		"capture_schema": versions.CaptureSchemaVersion,
+		"cursor_mode":    mode,
+		"is_agentic":     isAgentTurn,
+	}
+	if len(userBubble.RelevantFiles) > 0 {
+		fileContext["relevant_files"] = userBubble.RelevantFiles
+	}
+	if len(touchedIDs) > 1 {
+		fileContext["touched_project_ids"] = touchedIDs
+	}
+	if len(changedFiles) > 0 {
+		fileContext["changed_files"] = changedFiles
+	}
+	if lastAssistant.TurnDurationMs != nil {
+		fileContext["turn_duration_ms"] = *lastAssistant.TurnDurationMs
+	}
+
+	// ── Git metadata ───────────────────────────────────────────────────────
+	var commitShas []string
+	var gitDiff string
+	if proj.Path != "" {
+		fullSession := GetFullSessionData(sessionID)
+		if fullSession != nil {
+			commitShas = getCommitRange(proj.Path, fullSession.SessionCreatedAt, fullSession.SessionUpdatedAt)
+
+			if s.userID != "" {
+				var startSha, endSha string
+				if len(commitShas) > 0 {
+					endSha = commitShas[0]
+					startSha = commitShas[len(commitShas)-1]
+				}
+				_ = supabase.UpsertCursorSession("", supabase.CursorSessionData{
+					SessionID:         sessionID,
+					Branch:            fullSession.Branch,
+					ModelName:         fullSession.ModelName,
+					IsAgentic:         boolPtr(fullSession.IsAgentic),
+					UnifiedMode:       boolPtrFromStr(fullSession.UnifiedMode),
+					PlanModeUsed:      fullSession.PlanModeUsed,
+					DebugModeUsed:     fullSession.DebugModeUsed,
+					SchemaV:           fullSession.SchemaV,
+					ContextTokensUsed: fullSession.ContextTokensUsed,
+					ContextTokenLimit: fullSession.ContextTokenLimit,
+					FilesChangedCount: fullSession.FilesChangedCount,
+					TotalLinesAdded:   fullSession.TotalLinesAdded,
+					TotalLinesRemoved: fullSession.TotalLinesRemoved,
+					SessionCreatedAt:  fullSession.SessionCreatedAt,
+					SessionUpdatedAt:  fullSession.SessionUpdatedAt,
+					CommitShaStart:    startSha,
+					CommitShaEnd:      endSha,
+					CommitShas:        commitShas,
+					Meta:              fullSession.Meta,
+				}, proj.ProjectID, s.userID)
+			}
+		}
+		gitDiff = getGitDiff(proj.Path)
+	}
+
+	// ── Save ───────────────────────────────────────────────────────────────
+	hash := supabase.PromptContentHashV2(sessionID, userBubble.Text, capturedAt)
+	record := supabase.PromptRecord{
+		ID:            supabase.PromptIDV2(sessionID, userBubble.Text, capturedAt),
+		ContentHash:   hash,
+		SessionID:     sessionID,
+		ProjectID:     proj.ProjectID,
+		ProjectName:   proj.Name,
+		PromptText:    userBubble.Text,
+		ResponseText:  responseText,
+		Model:         modelName,
+		Source:        "cursor",
+		CaptureMethod: "prompt-scanner",
+		CapturedAt:    capturedAt,
+		UserID:        s.userID,
+		FileContext:   fileContext,
+	}
+
+	if err := store.SaveDraft(record, commitShas, gitDiff); err != nil {
+		display.PrintError("cursor", "Failed to save draft: "+err.Error())
+		return
+	}
+
+	// Mark the bubble ID in the persistent store so restarts don't re-save.
+	_ = store.MarkBubbleSaved(sessionID, userBubble.BubbleID, hash)
+
+	branch := ""
+	if fs := GetFullSessionData(sessionID); fs != nil {
+		branch = fs.Branch
+	}
+	displayName := proj.Name
+	if displayName == "" {
+		displayName = "?"
+	}
+	if !showOutput {
+		return
+	}
+	if s.userID == "" {
+		display.PrintDrafted(display.DraftDisplayOptions{
+			ProjectName:   displayName,
+			Branch:        branch,
+			PromptText:    userBubble.Text,
+			ExchangeCount: 1,
+		})
+	} else {
+		display.PrintCaptured(display.CaptureDisplayOptions{
+			ProjectName:   displayName,
+			Branch:        branch,
+			PromptText:    userBubble.Text,
+			ExchangeCount: 1,
+		})
+	}
+}
+
+// ─── fsnotify fast path ───────────────────────────────────────────────────────
+
+func (s *PromptScanner) watchFSNotify() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		display.PrintError("cursor", "Failed to create watcher: "+err.Error())
+		display.PrintError("cursor fsnotify", err.Error())
 		return
 	}
 	defer watcher.Close()
 
-	// Initial walk: register directories and record current line counts as
-	// baselines — do NOT process existing content. Only new prompts written
-	// after pcr start is running will be captured.
-	_ = filepath.WalkDir(w.dir, func(path string, d os.DirEntry, err error) error {
+	// Watch existing directories.
+	_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
 			_ = watcher.Add(path)
-		} else if isAgentTranscript(path) {
-			content, err := os.ReadFile(path)
-			if err != nil {
-				return nil
-			}
-			lines := filterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
-			w.state.Set(path, len(lines))
 		}
 		return nil
 	})
+
+	debounce := time.NewTimer(0)
+	<-debounce.C // drain initial tick
 
 	for {
 		select {
@@ -98,14 +411,16 @@ func (w *Watcher) Start() {
 				return
 			}
 			if event.Has(fsnotify.Create) {
-				info, err := os.Stat(event.Name)
-				if err == nil && info.IsDir() {
+				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
 					_ = watcher.Add(event.Name)
 				}
 			}
 			if (event.Has(fsnotify.Write) || event.Has(fsnotify.Create)) && isAgentTranscript(event.Name) {
-				w.scheduleProcess(event.Name)
+				// Debounce: wait 500ms after the last write before scanning.
+				debounce.Reset(500 * time.Millisecond)
 			}
+		case <-debounce.C:
+			s.scan()
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
@@ -115,29 +430,14 @@ func (w *Watcher) Start() {
 	}
 }
 
+// ─── Path helpers ─────────────────────────────────────────────────────────────
+
 func isAgentTranscript(path string) bool {
 	return strings.HasSuffix(path, ".jsonl") &&
 		strings.Contains(path, "/agent-transcripts/") &&
 		!strings.Contains(path, "/subagents/")
 }
 
-func (w *Watcher) scheduleProcess(path string) {
-	w.timerMu.Lock()
-	defer w.timerMu.Unlock()
-	if t, ok := w.timers[path]; ok {
-			t.Reset(300 * time.Millisecond)
-		} else {
-			w.timers[path] = time.AfterFunc(300*time.Millisecond, func() {
-			w.timerMu.Lock()
-			delete(w.timers, path)
-			w.timerMu.Unlock()
-			w.processFile(path, false)
-		})
-	}
-}
-
-// parseTranscriptPath extracts projectSlug and sessionUUID from the file path.
-// Pattern: ~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl
 func parseTranscriptPath(filePath string) (projectSlug, sessionUUID string, ok bool) {
 	parts := strings.Split(filePath, "/")
 	for i, p := range parts {
@@ -150,381 +450,88 @@ func parseTranscriptPath(filePath string) (projectSlug, sessionUUID string, ok b
 	return "", "", false
 }
 
-func (w *Watcher) processFile(filePath string, forceFullScan bool) {
-	projectSlug, sessionUUID, ok := parseTranscriptPath(filePath)
-	if !ok {
-		return
+func parseBubbleTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err == nil {
+		return t
 	}
-
-	// Always re-read session metadata on file change so we pick up
-	// bubble data that Cursor may have just written to the DB.
-	InvalidateSessionCache(sessionUUID)
-
-	// Resolve project candidates for this workspace slug.
-	// When the Cursor workspace contains multiple git repos (e.g. opening
-	// pcr-developers/ which holds cli/, pcr-dev/, etc.), we get several
-	// candidates and must resolve per-prompt using relevant_files.
-	candidates := projects.GetAllProjectsForCursorSlug(projectSlug)
-	if len(candidates) == 0 {
-		return
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return
-	}
-
-	lines := filterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
-	prevCount := w.state.Get(filePath)
-	if !forceFullScan && len(lines) <= prevCount {
-		return
-	}
-	w.state.Set(filePath, len(lines))
-
-	// Forced sync poll: capture any file changes that happened since the last
-	// background DiffTracker poll. This ensures changes made during THIS exchange
-	// (between JSONL write and watcher fire) are in the diff_events table before
-	// we query it for per-bubble attribution.
-	if w.diffTracker != nil {
-		w.diffTracker.Poll()
-	}
-
-	w.lastFiredMu.Lock()
-	firingTime := time.Now()
-	w.lastFiredAt = firingTime
-	w.lastFiredMu.Unlock()
-
-	sessionMeta := GetSessionMeta(sessionUUID)
-
-	schemaV := versions.CaptureSchemaVersion
-	var newPrompts []supabase.PromptRecord
-
-	// v14+: use DB bubble data directly — clean text, accurate timestamps, rich metadata.
-	// v13 and below: fall back to JSONL parser.
-	if sessionMeta != nil && len(sessionMeta.Bubbles) > 0 && sessionMeta.Bubbles[0].CreatedAt != "" {
-		model := sessionMeta.ModelName
-		bubbles := sessionMeta.Bubbles
-
-		for i, b := range bubbles {
-			if b.Type != 1 || strings.TrimSpace(b.Text) == "" {
-				continue
-			}
-
-			// Find the next assistant bubble for response text
-			var responseText string
-			for j := i + 1; j < len(bubbles); j++ {
-				if bubbles[j].Type == 2 && strings.TrimSpace(bubbles[j].Text) != "" {
-					responseText = bubbles[j].Text
-					break
-				}
-				if bubbles[j].Type == 1 {
-					break // hit the next user turn
-				}
-			}
-
-			hash := supabase.PromptContentHash(sessionUUID, b.Text, "")
-			if w.dedup.IsDuplicate(sessionUUID, hash) {
-				continue
-			}
-
-			if store.IsDraftSaved(sessionUUID, b.Text) {
-				w.dedup.Mark(sessionUUID, hash)
-				continue
-			}
-			w.dedup.Mark(sessionUUID, hash)
-
-			capturedAt := b.CreatedAt
-			if capturedAt == "" {
-				capturedAt = time.Now().UTC().Format(time.RFC3339)
-			}
-
-			// Per-prompt time-window attribution.
-			//
-			// Each prompt N's attribution window is [T_N, T_{N+1}]:
-			//   - T_N   = when this prompt was sent (b.CreatedAt)
-			//   - T_{N+1} = when the NEXT user bubble was sent
-			//             (or the current firing time for the last prompt)
-			//
-			// Files changed in that window = what the AI did in response to N.
-			// No events in window → unattributed (honest).
-			// Single-candidate workspace → always tag (no ambiguity).
-			bubbleTime := parseBubbleTime(capturedAt)
-			nextBubbleTime := firingTime
-			for j := i + 1; j < len(bubbles); j++ {
-				if bubbles[j].Type == 1 && bubbles[j].CreatedAt != "" {
-					if t := parseBubbleTime(bubbles[j].CreatedAt); !t.IsZero() {
-						nextBubbleTime = t
-						break
-					}
-				}
-			}
-
-			var proj *projects.Project
-			var touchedIDs []string
-			if len(candidates) == 1 {
-				proj = &candidates[0]
-				if proj.ProjectID != "" {
-					touchedIDs = []string{proj.ProjectID}
-				}
-			} else if !bubbleTime.IsZero() {
-				events, _ := store.GetDiffEventsInWindow(bubbleTime, nextBubbleTime)
-				proj, touchedIDs = resolveFromEvents(events, candidates)
-			} else {
-				proj = &projects.Project{}
-			}
-
-			fileContext := map[string]any{
-				"capture_schema": schemaV,
-			}
-			if b.IsAgentic != nil {
-				fileContext["is_agentic"] = *b.IsAgentic
-			} else {
-				fileContext["is_agentic"] = sessionMeta.IsAgentic
-			}
-			if b.UnifiedMode != "" {
-				fileContext["cursor_mode"] = b.UnifiedMode
-			} else if sessionMeta.UnifiedMode != "" {
-				fileContext["cursor_mode"] = sessionMeta.UnifiedMode
-			}
-			if len(b.RelevantFiles) > 0 {
-				fileContext["relevant_files"] = b.RelevantFiles
-			}
-			if len(touchedIDs) > 1 {
-				// More than one repo touched — dashboard uses this for cross-repo display.
-				fileContext["touched_project_ids"] = touchedIDs
-			}
-
-			newPrompts = append(newPrompts, supabase.PromptRecord{
-				SessionID:     sessionUUID,
-				ProjectName:   proj.Name,
-				PromptText:    b.Text,
-				ResponseText:  responseText,
-				Model:         model,
-				Source:        "cursor",
-				CaptureMethod: "file-watcher",
-				CapturedAt:    capturedAt,
-				UserID:        w.userID,
-				ProjectID:     proj.ProjectID,
-				FileContext:   fileContext,
-			})
-		}
-	} else {
-		// v13 and below: parse from JSONL, enrich with DB metadata where available.
-		session := ParseCursorTranscript(string(content), sessionUUID, projectSlug)
-		if len(session.Prompts) == 0 {
-			return
-		}
-
-		var assistantBubbles []BubbleMeta
-		if sessionMeta != nil {
-			for _, b := range sessionMeta.Bubbles {
-				if b.Type == 2 {
-					assistantBubbles = append(assistantBubbles, b)
-				}
-			}
-		}
-
-		for promptIdx, p := range session.Prompts {
-			hash := supabase.PromptContentHash(p.SessionID, p.PromptText, "")
-			if w.dedup.IsDuplicate(p.SessionID, hash) {
-				continue
-			}
-			if store.IsDraftSaved(p.SessionID, p.PromptText) {
-				w.dedup.Mark(p.SessionID, hash)
-				continue
-			}
-			w.dedup.Mark(p.SessionID, hash)
-
-			fileContext := map[string]any{"capture_schema": schemaV}
-			var bubble *BubbleMeta
-			if promptIdx < len(assistantBubbles) {
-				b := assistantBubbles[promptIdx]
-				bubble = &b
-			}
-
-			if bubble != nil && bubble.IsAgentic != nil {
-				fileContext["is_agentic"] = *bubble.IsAgentic
-			} else if sessionMeta != nil {
-				fileContext["is_agentic"] = sessionMeta.IsAgentic
-			}
-			if sessionMeta != nil && sessionMeta.UnifiedMode != "" {
-				fileContext["cursor_mode"] = sessionMeta.UnifiedMode
-			}
-			if bubble != nil && bubble.ResponseDurationMs != nil {
-				fileContext["response_duration_ms"] = *bubble.ResponseDurationMs
-			}
-			if bubble != nil && len(bubble.RelevantFiles) > 0 {
-				fileContext["relevant_files"] = bubble.RelevantFiles
-			}
-
-			capturedAt := p.CapturedAt
-			if bubble != nil && bubble.SubmittedAt != nil {
-				capturedAt = time.UnixMilli(*bubble.SubmittedAt).UTC().Format(time.RFC3339)
-			}
-
-			// Per-prompt time-window attribution using SubmittedAt timestamps.
-			promptTime := time.Time{}
-			if bubble != nil && bubble.SubmittedAt != nil {
-				promptTime = time.UnixMilli(*bubble.SubmittedAt).UTC()
-			}
-			nextPromptTime := firingTime
-			if promptIdx+1 < len(session.Prompts) {
-				next := session.Prompts[promptIdx+1]
-				if nextBubble := findAssistantBubble(assistantBubbles, promptIdx+1); nextBubble != nil && nextBubble.SubmittedAt != nil {
-					nextPromptTime = time.UnixMilli(*nextBubble.SubmittedAt).UTC()
-				} else {
-					_ = next // keep promptIdx+1 in scope
-				}
-			}
-
-			var proj *projects.Project
-			var touchedIDs []string
-			if len(candidates) == 1 {
-				proj = &candidates[0]
-				if proj.ProjectID != "" {
-					touchedIDs = []string{proj.ProjectID}
-				}
-			} else if !promptTime.IsZero() {
-				events, _ := store.GetDiffEventsInWindow(promptTime, nextPromptTime)
-				proj, touchedIDs = resolveFromEvents(events, candidates)
-			} else {
-				proj = &projects.Project{}
-			}
-
-			if len(touchedIDs) > 1 {
-				fileContext["touched_project_ids"] = touchedIDs
-			}
-
-			model := p.Model
-			if sessionMeta != nil && sessionMeta.ModelName != "" {
-				model = sessionMeta.ModelName
-			}
-
-			p.CapturedAt = capturedAt
-			p.Model = model
-			p.UserID = w.userID
-			p.ProjectID = proj.ProjectID
-			p.ProjectName = proj.Name
-			p.FileContext = fileContext
-			newPrompts = append(newPrompts, p)
-		}
-	}
-
-	if len(newPrompts) == 0 {
-		return
-	}
-
-	// Get commit range and git diff per sub-project (cached by path).
-	fullSession := GetFullSessionData(sessionUUID)
-	type projectGitData struct {
-		commitShas []string
-		gitDiff    string
-		headSha    string
-	}
-	gitCache := map[string]*projectGitData{}
-	getGitData := func(proj *projects.Project) *projectGitData {
-		if d, ok := gitCache[proj.Path]; ok {
-			return d
-		}
-		d := &projectGitData{}
-		if fullSession != nil && proj.Path != "" {
-			d.commitShas = getCommitRange(proj.Path, fullSession.SessionCreatedAt, fullSession.SessionUpdatedAt)
-		}
-		d.gitDiff = getGitDiff(proj.Path)
-		d.headSha = getHeadSha(proj.Path)
-		gitCache[proj.Path] = d
-
-		// Upsert cursor session metadata once per sub-project (non-fatal).
-		if w.userID != "" && fullSession != nil && proj.Path != "" {
-			var startSha, endSha string
-			if len(d.commitShas) > 0 {
-				endSha = d.commitShas[0]
-				startSha = d.commitShas[len(d.commitShas)-1]
-			}
-			_ = supabase.UpsertCursorSession("", supabase.CursorSessionData{
-				SessionID:         sessionUUID,
-				Branch:            fullSession.Branch,
-				ModelName:         fullSession.ModelName,
-				IsAgentic:         boolPtr(fullSession.IsAgentic),
-				UnifiedMode:       boolPtrFromStr(fullSession.UnifiedMode),
-				PlanModeUsed:      fullSession.PlanModeUsed,
-				DebugModeUsed:     fullSession.DebugModeUsed,
-				SchemaV:           fullSession.SchemaV,
-				ContextTokensUsed: fullSession.ContextTokensUsed,
-				ContextTokenLimit: fullSession.ContextTokenLimit,
-				FilesChangedCount: fullSession.FilesChangedCount,
-				TotalLinesAdded:   fullSession.TotalLinesAdded,
-				TotalLinesRemoved: fullSession.TotalLinesRemoved,
-				SessionCreatedAt:  fullSession.SessionCreatedAt,
-				SessionUpdatedAt:  fullSession.SessionUpdatedAt,
-				CommitShaStart:    startSha,
-				CommitShaEnd:      endSha,
-				CommitShas:        d.commitShas,
-				Meta:              fullSession.Meta,
-			}, proj.ProjectID, w.userID)
-		}
-		return d
-	}
-
-	// Re-resolve project per saved prompt to get the right git data.
-	// We stored ProjectID on each PromptRecord; find the matching candidate.
-	findCandidate := func(projectID string) *projects.Project {
-		if projectID != "" {
-			for i := range candidates {
-				if candidates[i].ProjectID == projectID {
-					return &candidates[i]
-				}
-			}
-		}
-		// No match or unattributed — return empty project so display shows "?"
-		return &projects.Project{}
-	}
-
-	for _, p := range newPrompts {
-		proj := findCandidate(p.ProjectID)
-		gd := getGitData(proj)
-		if err := store.SaveDraft(p, gd.commitShas, gd.gitDiff, gd.headSha); err != nil {
-			display.PrintError("cursor", "Failed to save draft: "+err.Error())
-		}
-	}
-
-	last := newPrompts[len(newPrompts)-1]
-	branch := ""
-	if fullSession != nil {
-		branch = fullSession.Branch
-	}
-	lastProj := findCandidate(last.ProjectID)
-	displayName := lastProj.Name
-	if displayName == "" {
-		displayName = "?"
-	}
-	if w.userID == "" {
-		display.PrintDrafted(display.DraftDisplayOptions{
-			ProjectName:   displayName,
-			Branch:        branch,
-			PromptText:    last.PromptText,
-			ExchangeCount: len(newPrompts),
-		})
-	} else {
-		display.PrintCaptured(display.CaptureDisplayOptions{
-			ProjectName:   displayName,
-			Branch:        branch,
-			PromptText:    last.PromptText,
-			ExchangeCount: len(newPrompts),
-		})
-	}
+	t, _ = time.Parse("2006-01-02T15:04:05.999Z", s)
+	return t
 }
 
-func getHeadSha(projectPath string) string {
-	if projectPath == "" {
-		return ""
+// ─── Attribution helpers ──────────────────────────────────────────────────────
+
+func resolveFromEvents(events []store.DiffEvent, candidates []projects.Project) (*projects.Project, []string) {
+	hits := map[string]int{}
+	byID := map[string]*projects.Project{}
+	for i := range candidates {
+		if candidates[i].ProjectID != "" {
+			byID[candidates[i].ProjectID] = &candidates[i]
+		}
 	}
-	out, err := exec.Command("git", "-C", projectPath, "rev-parse", "HEAD").Output()
-	if err != nil {
-		return ""
+	for _, e := range events {
+		if _, ok := byID[e.ProjectID]; ok {
+			hits[e.ProjectID] += len(e.Files)
+		}
 	}
-	return strings.TrimSpace(string(out))
+	var allIDs []string
+	for id := range hits {
+		allIDs = append(allIDs, id)
+	}
+	var primary *projects.Project
+	for id, p := range byID {
+		if hits[id] == 0 {
+			continue
+		}
+		if primary == nil || hits[id] > hits[primary.ProjectID] ||
+			(hits[id] == hits[primary.ProjectID] && len(p.Path) > len(primary.Path)) {
+			primary = p
+		}
+	}
+	if primary == nil {
+		return &projects.Project{}, nil
+	}
+	return primary, allIDs
 }
+
+func extractChangedFiles(events []store.DiffEvent, primaryProjectID string, touchedIDs []string, candidates []projects.Project) []string {
+	if len(events) == 0 {
+		return nil
+	}
+	filter := map[string]bool{}
+	if primaryProjectID != "" {
+		filter[primaryProjectID] = true
+	}
+	for _, id := range touchedIDs {
+		if id != "" {
+			filter[id] = true
+		}
+	}
+	if len(filter) == 0 {
+		for _, c := range candidates {
+			if c.ProjectID != "" {
+				filter[c.ProjectID] = true
+			}
+		}
+	}
+
+	seen := map[string]bool{}
+	var files []string
+	for _, e := range events {
+		if len(filter) > 0 && !filter[e.ProjectID] {
+			continue
+		}
+		for _, f := range e.Files {
+			if !seen[f] {
+				seen[f] = true
+				files = append(files, f)
+			}
+		}
+	}
+	return files
+}
+
+// ─── Git helpers ──────────────────────────────────────────────────────────────
 
 func getGitDiff(projectPath string) string {
 	if projectPath == "" {
@@ -570,59 +577,11 @@ func filterNonEmpty(lines []string) []string {
 	return result
 }
 
-
-// parseBubbleTime parses Cursor's bubble createdAt field which may include
-// milliseconds ("2026-04-04T18:16:30.123Z") that time.RFC3339 can't handle.
-func findAssistantBubble(bubbles []BubbleMeta, idx int) *BubbleMeta {
-	if idx < len(bubbles) {
-		return &bubbles[idx]
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	return nil
-}
-
-func parseBubbleTime(s string) time.Time {
-	t, err := time.Parse(time.RFC3339, s)
-	if err == nil {
-		return t
-	}
-	t, _ = time.Parse("2006-01-02T15:04:05.999Z", s)
-	return t
-}
-
-// resolveFromEvents picks the primary project and all touched project IDs
-// from a set of DiffTracker events, filtered to the given workspace candidates.
-// Returns an empty project (unattributed) when no events match any candidate.
-func resolveFromEvents(events []store.DiffEvent, candidates []projects.Project) (*projects.Project, []string) {
-	hits := map[string]int{}
-	byID := map[string]*projects.Project{}
-	for i := range candidates {
-		if candidates[i].ProjectID != "" {
-			byID[candidates[i].ProjectID] = &candidates[i]
-		}
-	}
-	for _, e := range events {
-		if _, ok := byID[e.ProjectID]; ok {
-			hits[e.ProjectID] += len(e.Files)
-		}
-	}
-	var allIDs []string
-	for id := range hits {
-		allIDs = append(allIDs, id)
-	}
-	var primary *projects.Project
-	for id, p := range byID {
-		if hits[id] == 0 {
-			continue
-		}
-		if primary == nil || hits[id] > hits[primary.ProjectID] ||
-			(hits[id] == hits[primary.ProjectID] && len(p.Path) > len(primary.Path)) {
-			primary = p
-		}
-	}
-	if primary == nil {
-		return &projects.Project{}, nil
-	}
-	return primary, allIDs
+	return s[:n-1] + "…"
 }
 
 func boolPtr(b bool) *bool { return &b }

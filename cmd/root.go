@@ -8,6 +8,7 @@ import (
 )
 
 var Version = "dev"
+var BuildTime = ""
 
 var rootCmd = &cobra.Command{
 	Use:          "pcr",
@@ -15,8 +16,9 @@ var rootCmd = &cobra.Command{
 	SilenceUsage: true,
 }
 
-func Execute(version string) {
+func Execute(version, buildTime string) {
 	Version = version
+	BuildTime = buildTime
 	rootCmd.Version = version
 	rootCmd.SetVersionTemplate("{{.Version}}\n")
 	rootCmd.CompletionOptions.DisableDefaultCmd = true

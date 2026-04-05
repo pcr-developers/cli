@@ -61,7 +61,8 @@ Examples:
 		if err != nil {
 			return err
 		}
-		all := append(drafts, staged...)
+		// Apply the same filter as pcr bundle so numbering is consistent.
+		all := filterWithChangedFiles(append(drafts, staged...))
 
 		if len(all) == 0 {
 			fmt.Fprintln(os.Stderr, "PCR: No draft prompts.")
@@ -135,24 +136,36 @@ Examples:
 		fmt.Fprintf(os.Stderr, "%s%sPROMPT%s\n", bold, cyan, rst)
 		fmt.Fprintf(os.Stderr, "%s\n", d.PromptText)
 
-		// Response if present
+		// Changed files first — most actionable info.
+		if fc := d.FileContext; fc != nil {
+			if raw, ok := fc["changed_files"]; ok {
+				if fl, ok := raw.([]any); ok && len(fl) > 0 {
+					fmt.Fprintf(os.Stderr, "\n%s%sCHANGED FILES%s\n", bold, cyan, rst)
+					for _, f := range fl {
+						short := shortFilePath(fmt.Sprintf("%v", f), projByID)
+						fmt.Fprintf(os.Stderr, "  %s%s%s\n", dim, short, rst)
+					}
+				}
+			}
+		}
+
+		// Response — first 200 chars only (enough to see what the agent did).
 		if d.ResponseText != "" {
 			fmt.Fprintf(os.Stderr, "\n%s%sRESPONSE%s\n", bold, grn, rst)
 			resp := d.ResponseText
-			if len(resp) > 1000 {
-				resp = resp[:1000] + fmt.Sprintf("\n%s… (%d more chars)%s", dim, len(d.ResponseText)-1000, rst)
+			if len(resp) > 200 {
+				resp = resp[:200] + fmt.Sprintf("%s…%s", dim, rst)
 			}
 			fmt.Fprintf(os.Stderr, "%s\n", resp)
 		}
 
-		// Relevant files — show short paths (relative to project root when possible).
+		// Files in context (read by the agent but not necessarily changed).
 		if fc := d.FileContext; fc != nil {
 			if files, ok := fc["relevant_files"]; ok {
 				if fileList, ok := files.([]any); ok && len(fileList) > 0 {
 					fmt.Fprintf(os.Stderr, "\n%s%sFILES IN CONTEXT%s\n", bold, gry, rst)
 					for _, f := range fileList {
 						path := fmt.Sprintf("%v", f)
-						// Show the shortest useful suffix: repo/subpath
 						short := shortFilePath(path, projByID)
 						fmt.Fprintf(os.Stderr, "  %s%s%s\n", dim, short, rst)
 					}
