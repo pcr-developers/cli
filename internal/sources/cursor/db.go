@@ -15,15 +15,14 @@ import (
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type BubbleMeta struct {
-	Type               int      `json:"type"` // 1=user, 2=assistant
-	BubbleID           string   `json:"bubbleId,omitempty"`
-	Text               string   `json:"text,omitempty"`
-	CreatedAt          string   `json:"createdAt,omitempty"` // ISO8601 from v14+
-	IsAgentic          *bool    `json:"isAgentic,omitempty"`
-	SubmittedAt        *int64   `json:"submittedAt,omitempty"` // ms, v13 and below
-	ResponseDurationMs *int64   `json:"responseDurationMs,omitempty"`
-	RelevantFiles      []string `json:"relevantFiles,omitempty"`
-	UnifiedMode        string   `json:"unifiedMode,omitempty"`
+	Type           int      `json:"type"` // 1=user, 2=assistant
+	BubbleID       string   `json:"bubbleId,omitempty"`
+	Text           string   `json:"text,omitempty"`
+	CreatedAt      string   `json:"createdAt,omitempty"`      // ISO8601 from v14+
+	TurnDurationMs *int64   `json:"turnDurationMs,omitempty"` // ms; set on final assistant bubble when turn completes
+	IsAgentic      *bool    `json:"isAgentic,omitempty"`
+	RelevantFiles  []string `json:"relevantFiles,omitempty"`
+	UnifiedMode    string   `json:"unifiedMode,omitempty"`
 }
 
 type SessionMeta struct {
@@ -109,7 +108,7 @@ type cacheEntry struct {
 var (
 	metaCache   = map[string]cacheEntry{}
 	metaCacheMu sync.RWMutex
-	cacheTTL    = 30 * time.Second // short TTL so active sessions stay fresh
+	cacheTTL    = 60 * time.Second // polling-based scanner; 60s TTL is sufficient
 )
 
 // InvalidateSessionCache removes a session from the metadata cache.
@@ -136,35 +135,27 @@ func GetSessionMeta(sessionID string) *SessionMeta {
 	}
 
 	var (
-		schemaV     *int
 		isAgentic   *int
 		unifiedMode *string
 		modelConfig *string
-		conversation *string
-		headersOnly  *string
+		headersOnly *string
 	)
 
 	err := db.QueryRow(`
 		SELECT
-		  json_extract(value, '$._v')                           as schema_v,
 		  json_extract(value, '$.isAgentic')                   as is_agentic,
 		  json_extract(value, '$.unifiedMode')                 as unified_mode,
 		  json_extract(value, '$.modelConfig')                 as model_config,
-		  json_extract(value, '$.conversation')                as conversation,
 		  json_extract(value, '$.fullConversationHeadersOnly') as headers_only
 		FROM cursorDiskKV
 		WHERE key = ?
 	`, "composerData:"+sessionID).Scan(
-		&schemaV, &isAgentic, &unifiedMode, &modelConfig, &conversation, &headersOnly,
+		&isAgentic, &unifiedMode, &modelConfig, &headersOnly,
 	)
 	if err != nil {
 		return storeMetaCache(sessionID, nil)
 	}
 
-	sv := 0
-	if schemaV != nil {
-		sv = *schemaV
-	}
 	agentic := isAgentic != nil && *isAgentic == 1
 
 	var modelName string
@@ -183,77 +174,43 @@ func GetSessionMeta(sessionID string) *SessionMeta {
 	}
 
 	var composerID string
-	if headersOnly != nil {
-		// extract composerId from the main object too
-	}
 	_ = db.QueryRow(`SELECT json_extract(value, '$.composerId') FROM cursorDiskKV WHERE key = ?`,
 		"composerData:"+sessionID).Scan(&composerID)
 
 	var bubbles []BubbleMeta
-	if sv >= 14 {
-		if headersOnly != nil {
-			var headers []struct {
-				BubbleID string `json:"bubbleId"`
-				Type     int    `json:"type"`
-			}
-			if json.Unmarshal([]byte(*headersOnly), &headers) == nil {
-				for _, h := range headers {
-					b := BubbleMeta{Type: h.Type, BubbleID: h.BubbleID}
-					// Look up full bubble data by bubbleId:<composerId>:<bubbleId>
-					if composerID != "" && h.BubbleID != "" {
-						var bval string
-						bkey := "bubbleId:" + composerID + ":" + h.BubbleID
-						if err := db.QueryRow(`SELECT value FROM cursorDiskKV WHERE key = ?`, bkey).Scan(&bval); err == nil {
-							var bd map[string]any
-							if json.Unmarshal([]byte(bval), &bd) == nil {
-								b.Text = getString(bd, "text")
-								b.CreatedAt = getString(bd, "createdAt")
-								b.UnifiedMode = getString(bd, "unifiedMode")
-								if rf, ok := bd["relevantFiles"].([]any); ok {
-									for _, f := range rf {
-										if s, ok := f.(string); ok {
-											b.RelevantFiles = append(b.RelevantFiles, s)
-										}
+	if headersOnly != nil {
+		var headers []struct {
+			BubbleID string `json:"bubbleId"`
+			Type     int    `json:"type"`
+		}
+		if json.Unmarshal([]byte(*headersOnly), &headers) == nil {
+			for _, h := range headers {
+				b := BubbleMeta{Type: h.Type, BubbleID: h.BubbleID}
+				if composerID != "" && h.BubbleID != "" {
+					var bval string
+					bkey := "bubbleId:" + composerID + ":" + h.BubbleID
+					if err := db.QueryRow(`SELECT value FROM cursorDiskKV WHERE key = ?`, bkey).Scan(&bval); err == nil {
+						var bd map[string]any
+						if json.Unmarshal([]byte(bval), &bd) == nil {
+							b.Text = getString(bd, "text")
+							b.CreatedAt = getString(bd, "createdAt")
+							b.UnifiedMode = getString(bd, "unifiedMode")
+							if rf, ok := bd["relevantFiles"].([]any); ok {
+								for _, f := range rf {
+									if s, ok := f.(string); ok {
+										b.RelevantFiles = append(b.RelevantFiles, s)
 									}
 								}
-								if ag, ok := bd["isAgentic"].(bool); ok {
-									b.IsAgentic = &ag
-								}
+							}
+							if ag, ok := bd["isAgentic"].(bool); ok {
+								b.IsAgentic = &ag
+							}
+							if dur, ok := bd["turnDurationMs"].(float64); ok {
+								ms := int64(dur)
+								b.TurnDurationMs = &ms
 							}
 						}
 					}
-					bubbles = append(bubbles, b)
-				}
-			}
-		}
-	} else if conversation != nil {
-		type rawBubble struct {
-			Type       int      `json:"type"`
-			IsAgentic  *bool    `json:"isAgentic"`
-			TimingInfo *struct {
-				ClientStartTime  *int64 `json:"clientStartTime"`
-				ClientRpcSendTime *int64 `json:"clientRpcSendTime"`
-				ClientSettleTime  *int64 `json:"clientSettleTime"`
-			} `json:"timingInfo"`
-			RelevantFiles []string `json:"relevantFiles"`
-		}
-		var conv []rawBubble
-		if json.Unmarshal([]byte(*conversation), &conv) == nil {
-			for _, rb := range conv {
-				b := BubbleMeta{Type: rb.Type}
-				if rb.Type == 2 {
-					b.IsAgentic = rb.IsAgentic
-					if rb.TimingInfo != nil {
-						b.SubmittedAt = rb.TimingInfo.ClientStartTime
-						if rb.TimingInfo.ClientRpcSendTime != nil && rb.TimingInfo.ClientSettleTime != nil &&
-							*rb.TimingInfo.ClientSettleTime > *rb.TimingInfo.ClientRpcSendTime {
-							dur := *rb.TimingInfo.ClientSettleTime - *rb.TimingInfo.ClientRpcSendTime
-							b.ResponseDurationMs = &dur
-						}
-					}
-				}
-				if len(rb.RelevantFiles) > 0 {
-					b.RelevantFiles = rb.RelevantFiles
 				}
 				bubbles = append(bubbles, b)
 			}
@@ -267,6 +224,25 @@ func GetSessionMeta(sessionID string) *SessionMeta {
 		UnifiedMode: um,
 		ComposerID:  composerID,
 	})
+}
+
+// GetSessionsForWorkspace returns all session IDs (composer IDs) that belong
+// to the given Cursor workspace slug. Used by the PromptScanner to discover
+// all sessions in the current workspace on each polling cycle.
+func GetSessionsForWorkspace(slug string) []string {
+	db := openCursorDB()
+	if db == nil {
+		return nil
+	}
+	// composerData keys match the workspace via the JSONL transcript path pattern:
+	// ~/.cursor/projects/<slug>/agent-transcripts/<sessionID>/<sessionID>.jsonl
+	// We can't directly join composerData to slug, so we use the agent-transcripts
+	// directory listing (done by the caller) and look up each composerData by ID.
+	// This function provides a convenience: given a known set of session IDs,
+	// it just returns the ones that exist in the DB.
+	// The actual slug→sessionIDs mapping is done by the PromptScanner via filesystem.
+	_ = slug
+	return nil // stub — slug→sessionID mapping is done via filesystem walk in the scanner
 }
 
 func storeMetaCache(sessionID string, meta *SessionMeta) *SessionMeta {
@@ -412,3 +388,4 @@ func getInt64Ptr(m map[string]any, key string) *int64 {
 	}
 	return nil
 }
+

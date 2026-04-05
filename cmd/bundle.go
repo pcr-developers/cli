@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -30,55 +29,31 @@ func formatCapturedAt(s string) string {
 // syncLatestPrompts forces a crawl of the most recent Cursor transcripts so
 // pcr bundle always shows the latest prompts — including exchanges the
 // background watcher hasn't picked up yet.
-// Also records any file changes since the last DiffTracker background poll
-// so attribution is current for the latest exchange.
 func syncLatestPrompts() {
 	fmt.Fprint(os.Stderr, "Fetching latest prompts...\r")
 
-	// Record current git state for all registered projects so diff_events
-	// is up to date before the force sync queries it for attribution.
-	// This handles the case where the DiffTracker hasn't polled yet.
-	for _, p := range projects.Load() {
-		if p.Path == "" || p.ProjectID == "" {
-			continue
-		}
-		// Use a one-shot inline poll via git status --porcelain.
-		// The DiffTracker will deduplicate against its own state; we just
-		// ensure the events are in the DB before the per-bubble queries run.
-		out, _ := exec.Command("git", "-C", p.Path, "status", "--porcelain").Output()
-		if len(out) > 0 {
-			var files []string
-			for _, line := range filterNonEmpty(strings.Split(string(out), "\n")) {
-				if len(line) >= 4 {
-					files = append(files, filepath.Join(p.Path, strings.TrimSpace(line[3:])))
-				}
-			}
-			if len(files) > 0 {
-				_ = store.RecordDiffEvent(p.ProjectID, p.Name, files, time.Now())
-			}
-		}
-	}
+	// NOTE: We intentionally do NOT record diff_events here. Attribution is
+	// handled by the live DiffTracker (content-hash based) running in pcr start.
+	// The old code dumped all dirty files from git status into diff_events on
+	// every pcr bundle call, causing massive false-positive attribution.
 
 	cursor.ForceSync("", nil, 5)
 	fmt.Fprint(os.Stderr, "                          \r")
 }
 
-// retagDraftsNow re-attributes all local drafts using the DiffTracker's event log.
-// Falls back to tool call file paths when no DiffEvents exist for a window (e.g. pcr start not running).
+// retagDraftsNow is a no-op. Attribution is now handled at save time by the
+// PromptScanner using exact turnDurationMs windows. Retroactive re-attribution
+// from diff_events caused false positives (stale dirty files contaminating
+// prompt windows) and has been removed.
 func retagDraftsNow() {
+	return
 	drafts, err := store.GetAllDraftsSortedByTime()
 	if err != nil || len(drafts) == 0 {
 		return
 	}
 
-	// Build project registry: ID → project, path → project.
-	allProjs := projects.Load()
-	projByID := map[string]projects.Project{}
-	for _, p := range allProjs {
-		if p.ProjectID != "" {
-			projByID[p.ProjectID] = p
-		}
-	}
+	// Cache workspace slug → candidate project IDs to avoid re-deriving per draft.
+	slugCandidates := map[string][]string{}
 
 	for i, d := range drafts {
 		capturedAt, err := parseDraftTime(d.CapturedAt)
@@ -87,6 +62,7 @@ func retagDraftsNow() {
 		}
 
 		// Window: [this prompt's captured_at, next prompt's captured_at].
+		// For the last prompt: add a 5-minute buffer (AI may still be responding).
 		var windowEnd time.Time
 		if i+1 < len(drafts) {
 			windowEnd, _ = parseDraftTime(drafts[i+1].CapturedAt)
@@ -94,71 +70,152 @@ func retagDraftsNow() {
 		if windowEnd.IsZero() {
 			windowEnd = capturedAt.Add(5 * time.Minute)
 		}
+		windowStart := capturedAt
 
-		projectHits := map[string]int{}
-
-		if d.Source == "claude-code" {
-			// For Claude Code: use tool call file paths — exact files the AI edited.
-			for _, tc := range d.ToolCalls {
-				path := toolCallPath(tc)
-				if path == "" {
-					continue
-				}
-				for _, p := range allProjs {
-					if p.ProjectID != "" && p.Path != "" && strings.HasPrefix(path, p.Path+"/") {
-						projectHits[p.ProjectID]++
-					}
-				}
-			}
-		} else {
-			// For Cursor and other sources: use DiffTracker events in the time window.
-			events, err := store.GetDiffEventsInWindow(capturedAt, windowEnd)
-			if err == nil {
-				for _, e := range events {
-					if _, ok := projByID[e.ProjectID]; ok {
-						projectHits[e.ProjectID] += len(e.Files)
-					}
-				}
-			}
-		}
-
-		if len(projectHits) == 0 {
+		events, err := store.GetDiffEventsInWindow(windowStart, windowEnd)
+		if err != nil {
 			continue
 		}
 
-		// Primary = project with most hits.
-		var primaryID, primaryName string
-		var allIDs []string
-		for id, count := range projectHits {
-			allIDs = append(allIDs, id)
-			if primaryID == "" || count > projectHits[primaryID] {
-				primaryID = id
-				primaryName = projNameForID(id)
+		// DiffTracker polls at an interval, so changes made during a prompt's
+		// response may not be recorded until after the NEXT prompt fires.
+		// Expand the window forward by up to 10 minutes to catch delayed polls,
+		// but only use the extras if the primary window was empty.
+		if len(events) == 0 {
+			extended, _ := store.GetDiffEventsInWindow(windowStart, windowEnd.Add(10*time.Minute))
+			events = extended
+		}
+		if len(events) == 0 {
+			continue
+		}
+
+		// ── Pass 0: Strip out-of-workspace projects from touched_project_ids ──
+		// Old captures may have included projects from unrelated workspaces
+		// (e.g. PCR.dev appearing in pcr-developers session drafts). Clean those
+		// out so the display correctly shows only projects that belong here.
+		{
+			candidateIDs, ok := slugCandidates[d.SessionID]
+			if !ok {
+				slug := cursorWorkspaceSlugForSession(d.SessionID)
+				for _, p := range projects.GetAllProjectsForCursorSlug(slug) {
+					if p.ProjectID != "" {
+						candidateIDs = append(candidateIDs, p.ProjectID)
+					}
+				}
+				slugCandidates[d.SessionID] = candidateIDs
+			}
+			if len(candidateIDs) > 0 {
+				validSet := map[string]bool{}
+				for _, id := range candidateIDs {
+					validSet[id] = true
+				}
+				touched := d.TouchedProjectIDs()
+				var cleaned []string
+				changed := false
+				for _, id := range touched {
+					if validSet[id] {
+						cleaned = append(cleaned, id)
+					} else {
+						changed = true
+					}
+				}
+				if changed {
+					_ = store.UpsertDraftProject(d.ContentHash, d.ProjectID, d.ProjectName, cleaned)
+				}
 			}
 		}
 
-		_ = store.UpsertDraftProject(d.ContentHash, primaryID, primaryName, allIDs)
-	}
-}
+		// ── Pass 1: Attribution (workspace-scoped) ────────────────────────
+		// Derive valid project candidates from the draft's Cursor workspace so
+		// we never attribute a pcr-developers session to an unrelated project
+		// like PCR.dev that lives in a completely different directory.
+		if d.ProjectID == "" {
+			candidateIDs, ok := slugCandidates[d.SessionID]
+			if !ok {
+				slug := cursorWorkspaceSlugForSession(d.SessionID)
+				for _, p := range projects.GetAllProjectsForCursorSlug(slug) {
+					if p.ProjectID != "" {
+						candidateIDs = append(candidateIDs, p.ProjectID)
+					}
+				}
+				slugCandidates[d.SessionID] = candidateIDs
+			}
+			if len(candidateIDs) > 0 {
+				projectHits := map[string]int{}
+				for _, e := range events {
+					for _, id := range candidateIDs {
+						if e.ProjectID == id {
+							projectHits[e.ProjectID] += len(e.Files)
+						}
+					}
+				}
+				if len(projectHits) > 0 {
+					var primaryID, primaryName string
+					var allIDs []string
+					for id, count := range projectHits {
+						allIDs = append(allIDs, id)
+						if primaryID == "" || count > projectHits[primaryID] {
+							primaryID = id
+							primaryName = projNameForID(id)
+						}
+					}
+					_ = store.UpsertDraftProject(d.ContentHash, primaryID, primaryName, allIDs)
+					d.ProjectID = primaryID
+				}
+			}
+		}
 
-// toolCallPath extracts the file path from a tool call record.
-func toolCallPath(tc map[string]any) string {
-	if input, ok := tc["input"].(map[string]any); ok {
-		if p, _ := input["path"].(string); p != "" {
-			return p
+		// ── Pass 2: changed_files enrichment (draft's own project_id) ─────
+		// Use the draft's attributed project as the sole filter — avoids
+		// cross-repo noise and works from any working directory.
+		filterID := d.ProjectID
+		if filterID == "" {
+			continue
 		}
-		if p, _ := input["file_path"].(string); p != "" {
-			return p
+		seen := map[string]bool{}
+		var changedFiles []string
+		for _, e := range events {
+			if e.ProjectID != filterID {
+				continue
+			}
+			for _, f := range e.Files {
+				if !seen[f] {
+					seen[f] = true
+					changedFiles = append(changedFiles, f)
+				}
+			}
 		}
+		_ = store.EnrichDraftChangedFiles(d.ContentHash, changedFiles)
 	}
-	if p, _ := tc["path"].(string); p != "" {
-		return p
-	}
-	return ""
 }
 
 // parseDraftTime parses a draft's captured_at field which may include
 // milliseconds ("2026-04-04T18:22:05.044Z") not handled by time.RFC3339.
+// cursorWorkspaceSlugForSession finds the Cursor workspace slug for a session
+// by searching for its transcript file under ~/.cursor/projects/*/agent-transcripts/.
+// Returns "" if not found (e.g. for Claude Code sessions).
+func cursorWorkspaceSlugForSession(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	home, _ := os.UserHomeDir()
+	base := filepath.Join(home, ".cursor", "projects")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		transcriptDir := filepath.Join(base, e.Name(), "agent-transcripts", sessionID)
+		if _, err := os.Stat(transcriptDir); err == nil {
+			return e.Name()
+		}
+	}
+	return ""
+}
+
 func parseDraftTime(s string) (time.Time, error) {
 	t, err := time.Parse(time.RFC3339, s)
 	if err == nil {
@@ -204,6 +261,45 @@ func repoBadge(d store.DraftRecord, projByID map[string]string) string {
 	}
 	if d.ProjectName != "" {
 		return "[" + d.ProjectName + "]"
+	}
+	return ""
+}
+
+// filterWithChangedFiles removes agent-mode drafts that have no changed_files.
+// Non-agent turns (ask, plan, debug, chat) are always kept — they don't
+// produce file changes by design and are still valuable as conversation records.
+func filterWithChangedFiles(drafts []store.DraftRecord) []store.DraftRecord {
+	var out []store.DraftRecord
+	for _, d := range drafts {
+		mode := draftCursorMode(d)
+		isAgent := mode == "agent" || mode == ""
+		if isAgent {
+			// Agent turn: only include if it has changed_files
+			fc := d.FileContext
+			if fc == nil {
+				continue
+			}
+			raw, ok := fc["changed_files"]
+			if !ok {
+				continue
+			}
+			fl, ok := raw.([]any)
+			if !ok || len(fl) == 0 {
+				continue
+			}
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// draftCursorMode returns the cursor_mode stored in a draft's file_context.
+func draftCursorMode(d store.DraftRecord) string {
+	if d.FileContext == nil {
+		return ""
+	}
+	if v, ok := d.FileContext["cursor_mode"].(string); ok {
+		return v
 	}
 	return ""
 }
@@ -319,22 +415,10 @@ Examples:
 }
 
 // forced poll test - final cli
-// genericBundleNames are rejected as bundle names — they're placeholders people
-// type by accident and create useless bundles with no meaningful label.
-var genericBundleNames = map[string]bool{
-	"name": true, "test": true, "bundle": true, "prompt bundle": true,
-	"my bundle": true, "untitled": true, "draft": true, "temp": true,
-}
-
 // runBundleCreate creates a new sealed bundle from selected drafts.
 // repoFilter, if set, narrows the draft pool to only prompts that touched that repo.
 // Draft numbers shown in the overview always correspond to the (possibly filtered) pool.
 func runBundleCreate(name, selectArg, repoFilter string) error {
-	if genericBundleNames[strings.ToLower(strings.TrimSpace(name))] {
-		fmt.Fprintf(os.Stderr, "PCR: %q is not a useful bundle name — describe what you actually changed.\n", name)
-		fmt.Fprintln(os.Stderr, `     Example: pcr bundle "fix interactive terminal in Cursor" --select all`)
-		return nil
-	}
 	ctx := resolveProjectContext()
 
 	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
@@ -345,7 +429,7 @@ func runBundleCreate(name, selectArg, repoFilter string) error {
 	if err != nil {
 		return err
 	}
-	all := filterByRepo(append(drafts, staged...), repoFilter, loadProjByID())
+	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, loadProjByID()))
 
 	if len(all) == 0 {
 		if repoFilter != "" {
@@ -372,11 +456,11 @@ func runBundleCreate(name, selectArg, repoFilter string) error {
 	if len(ctx.ids) > 0 {
 		projectID = ctx.ids[0]
 	}
+	branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
 	sha := "bundle-" + generateID()
 
-	// Branch is intentionally left empty here — it will be resolved from the
-	// current git state at pcr push time, so it reflects where the user ends up.
-	_, err = store.CreateCommit(name, sha, draftIDs(selected), projectID, projectName, "", "closed")
+	// "closed" = auto-sealed, ready to push
+	_, err = store.CreateCommit(name, sha, draftIDs(selected), projectID, projectName, branch, "closed")
 	if err != nil {
 		return err
 	}
@@ -526,8 +610,6 @@ func runBundleList() error {
 // runBundleInteractive shows the draft list and reads selection from stdin.
 // Only called when isInteractiveTerminal() is true (real terminal, not Cursor).
 func runBundleInteractive(name, repoFilter string) error {
-	syncLatestPrompts()
-	retagDraftsNow()
 	ctx := resolveProjectContext()
 	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
 	if err != nil {
@@ -538,7 +620,7 @@ func runBundleInteractive(name, repoFilter string) error {
 		return err
 	}
 	projByID := loadProjByID()
-	all := filterByRepo(append(drafts, staged...), repoFilter, projByID)
+	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, projByID))
 
 	if len(all) == 0 {
 		fmt.Fprintln(os.Stderr, "PCR: No draft prompts available.")
@@ -562,7 +644,11 @@ func runBundleInteractive(name, repoFilter string) error {
 		if badge != "" {
 			badgeFmt = " " + cyn + badge + rst
 		}
-		fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, promptPreview(d.PromptText, 55))
+		modeFmt := ""
+		if m := draftCursorMode(d); m != "" && m != "agent" {
+			modeFmt = " " + dim + m + rst
+		}
+		fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, modeFmt, promptPreview(d.PromptText, 55))
 	}
 	fmt.Fprintln(os.Stderr)
 
@@ -596,7 +682,7 @@ func runBundleShowHint(name, repoFilter string) error {
 		return err
 	}
 	projByID := loadProjByID()
-	all := filterByRepo(append(drafts, staged...), repoFilter, projByID)
+	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, projByID))
 
 	if len(all) == 0 {
 		fmt.Fprintln(os.Stderr, "PCR: No draft prompts available.")
@@ -621,7 +707,11 @@ func runBundleShowHint(name, repoFilter string) error {
 		if badge != "" {
 			badgeFmt = " " + cyn + badge + rst
 		}
-		fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, promptPreview(d.PromptText, 55))
+		modeFmt := ""
+		if m := draftCursorMode(d); m != "" && m != "agent" {
+			modeFmt = " " + dim + m + rst
+		}
+		fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, modeFmt, promptPreview(d.PromptText, 55))
 	}
 	fmt.Fprintln(os.Stderr)
 	repoSuffix := ""
@@ -647,7 +737,7 @@ func runBundleOverview(repoFilter string) error {
 		return err
 	}
 	projByID := loadProjByID()
-	all := filterByRepo(append(drafts, staged...), repoFilter, projByID)
+	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, projByID))
 	unpushed, _ := store.GetUnpushedCommits()
 
 	const bold = "\x1b[1m"
@@ -670,7 +760,11 @@ func runBundleOverview(repoFilter string) error {
 			if badge != "" {
 				badgeFmt = " " + cyn + badge + rst
 			}
-			fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, promptPreview(d.PromptText, 55))
+			modeFmt := ""
+			if m := draftCursorMode(d); m != "" && m != "agent" {
+				modeFmt = " " + dim + m + rst
+			}
+			fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, modeFmt, promptPreview(d.PromptText, 55))
 		}
 		fmt.Fprintln(os.Stderr)
 	} else if repoFilter != "" {

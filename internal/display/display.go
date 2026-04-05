@@ -9,6 +9,9 @@ import (
 
 // All output goes to stderr so it never interferes with MCP stdio.
 
+// Verbose enables real-time event output from all watchers. Set by pcr start --verbose.
+var Verbose bool
+
 const (
 	reset  = "\x1b[0m"
 	bold   = "\x1b[1m"
@@ -28,11 +31,15 @@ func timestamp() string {
 	return time.Now().Format("15:04:05")
 }
 
-func PrintStartupBanner(version string, projectCount int) {
+func PrintStartupBanner(version, buildTime string, projectCount int) {
 	w := 56
 	line := strings.Repeat("─", w)
+	versionStr := "v" + version
+	if buildTime != "" {
+		versionStr += " built " + buildTime
+	}
 	fmt.Fprintf(os.Stderr, "\n%s %s — live capture stream\n",
-		c(cyan+bold, "PCR.dev"), c(gray, "v"+version))
+		c(cyan+bold, "PCR.dev"), c(gray, versionStr))
 	fmt.Fprintln(os.Stderr, c(gray, line))
 	if projectCount == 0 {
 		fmt.Fprintf(os.Stderr, "%s%s\n",
@@ -165,6 +172,20 @@ func PrintDrafted(opts DraftDisplayOptions) {
 
 func PrintWatcherReady(sourceName, dir string) {
 	fmt.Fprintf(os.Stderr, "  %s  %s\n", c(gray, "◎  "+sourceName), c(dim, dir))
+}
+
+// PrintVerboseEvent prints a real-time watcher event when Verbose is true.
+// source is a short label (e.g. "diff", "session", "scan").
+func PrintVerboseEvent(source, msg string) {
+	if !Verbose {
+		return
+	}
+	ts := timestamp()
+	fmt.Fprintf(os.Stderr, "  %s  %s  %s\n",
+		c(gray, ts),
+		c(dim, "~  "+source),
+		c(dim, msg),
+	)
 }
 
 func PrintError(context, msg string) {

@@ -16,15 +16,22 @@ func (s *Source) Name() string { return "Cursor" }
 func (s *Source) Start(userID string) {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cursor", "projects")
-	w := NewWatcher(dir, userID, s.DiffTracker)
-	w.Start()
+
+	// PromptScanner: discovers completed turns (turnDurationMs present) and
+	// saves fully-attributed drafts. Polls every 20s + fsnotify fast path.
+	scanner := NewPromptScanner(dir, userID, s.DiffTracker)
+	go scanner.Start()
+
+	// SessionStateWatcher: tracks mode/model/context changes every 2s so the
+	// PromptScanner can do a point-in-time lookup for each prompt's exact mode.
+	stateWatcher := NewSessionStateWatcher()
+	go stateWatcher.Start()
 }
 
-// ForceSync creates a one-shot watcher and force-processes the N most recently
-// modified transcript files. Called by `pcr bundle` to capture any prompts that
-// haven't been picked up by the background watcher yet.
+// ForceSync runs a one-shot scan of the N most recently modified transcript
+// files. Called by `pcr bundle` to capture any turns that haven't been picked
+// up by the background scanner yet.
 func ForceSync(userID string, dt Poller, maxFiles int) {
-	// Forced DiffTracker poll first so events are current.
 	if dt != nil {
 		dt.Poll()
 	}
@@ -32,7 +39,6 @@ func ForceSync(userID string, dt Poller, maxFiles int) {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cursor", "projects")
 
-	// Find recently modified transcript JSONL files.
 	type entry struct {
 		path    string
 		modTime time.Time
@@ -53,23 +59,22 @@ func ForceSync(userID string, dt Poller, maxFiles int) {
 		return nil
 	})
 
-	// Sort newest first, take up to maxFiles.
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].modTime.After(files[j].modTime)
 	})
 	if len(files) > maxFiles {
 		files = files[:maxFiles]
 	}
-
 	if len(files) == 0 {
 		return
 	}
 
-	// Process with a fresh watcher (forceFullScan=false so dedup + IsDraftSaved
-	// prevent duplicates; only genuinely new bubbles get saved).
-	w := NewWatcher(dir, userID, dt)
-	w.startedAt = time.Now().Add(-24 * time.Hour) // allow attributing recent history
+	scanner := NewPromptScanner(dir, userID, dt)
 	for _, f := range files {
-		w.processFile(f.path, false)
+		projectSlug, sessionID, ok := parseTranscriptPath(f.path)
+		if !ok {
+			continue
+		}
+		scanner.processSession(projectSlug, sessionID)
 	}
 }

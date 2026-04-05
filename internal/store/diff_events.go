@@ -85,3 +85,22 @@ func PruneDiffEvents(before time.Time) error {
 	)
 	return err
 }
+
+// PurgeAllDiffEvents deletes every diff_event record.
+func PurgeAllDiffEvents() error {
+	db := Open()
+	_, err := db.Exec(`DELETE FROM diff_events`)
+	return err
+}
+
+// PruneDiffEventsBefore deletes all diff_events recorded before the given
+// time. Called at pcr start startup to discard events from previous runs
+// while keeping events from the current run for future attribution.
+func PruneDiffEventsBefore(before time.Time) error {
+	db := Open()
+	_, err := db.Exec(
+		`DELETE FROM diff_events WHERE occurred_at < ?`,
+		before.UTC().Format(time.RFC3339),
+	)
+	return err
+}
