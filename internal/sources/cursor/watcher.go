@@ -419,6 +419,7 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 	type projectGitData struct {
 		commitShas []string
 		gitDiff    string
+		headSha    string
 	}
 	gitCache := map[string]*projectGitData{}
 	getGitData := func(proj *projects.Project) *projectGitData {
@@ -430,6 +431,7 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			d.commitShas = getCommitRange(proj.Path, fullSession.SessionCreatedAt, fullSession.SessionUpdatedAt)
 		}
 		d.gitDiff = getGitDiff(proj.Path)
+		d.headSha = getHeadSha(proj.Path)
 		gitCache[proj.Path] = d
 
 		// Upsert cursor session metadata once per sub-project (non-fatal).
@@ -481,7 +483,7 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 	for _, p := range newPrompts {
 		proj := findCandidate(p.ProjectID)
 		gd := getGitData(proj)
-		if err := store.SaveDraft(p, gd.commitShas, gd.gitDiff); err != nil {
+		if err := store.SaveDraft(p, gd.commitShas, gd.gitDiff, gd.headSha); err != nil {
 			display.PrintError("cursor", "Failed to save draft: "+err.Error())
 		}
 	}
@@ -511,6 +513,17 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			ExchangeCount: len(newPrompts),
 		})
 	}
+}
+
+func getHeadSha(projectPath string) string {
+	if projectPath == "" {
+		return ""
+	}
+	out, err := exec.Command("git", "-C", projectPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func getGitDiff(projectPath string) string {

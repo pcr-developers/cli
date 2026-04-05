@@ -43,7 +43,7 @@ func migrate(db *sql.DB) {
 	var version int
 	_ = db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version)
 
-	steps := []func(*sql.Tx) error{migrateV1, migrateV2, migrateV3}
+	steps := []func(*sql.Tx) error{migrateV1, migrateV2, migrateV3, migrateV4}
 
 	for i, step := range steps {
 		if i < version {
@@ -121,6 +121,11 @@ func migrateV2(tx *sql.Tx) error {
 		ALTER TABLE prompt_commits ADD COLUMN bundle_status TEXT NOT NULL DEFAULT 'open';
 		CREATE INDEX IF NOT EXISTS idx_commits_bundle_status ON prompt_commits(bundle_status);
 	`)
+	return err
+}
+
+func migrateV4(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE drafts ADD COLUMN head_sha TEXT`)
 	return err
 }
 

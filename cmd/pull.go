@@ -79,7 +79,7 @@ var pullCmd = &cobra.Command{
 
 		restored := 0
 		for _, item := range items {
-			if err := store.SaveDraft(item, nil, ""); err == nil {
+			if err := store.SaveDraft(item, nil, "", ""); err == nil {
 				restored++
 			}
 		}
