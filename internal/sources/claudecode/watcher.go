@@ -240,6 +240,11 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
 				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, map[string]any{"repo_snapshots": snaps})
 			}
+			// Backfill git_diff if it was empty when the draft was first saved
+			// (captured before Claude finished editing files).
+			if gd := getGitData(p.ProjectID); gd.gitDiff != "" {
+				_ = store.UpdateDraftGitDiff(p.SessionID, p.PromptText, gd.gitDiff, gd.headSha)
+			}
 			continue
 		}
 		if store.IsDraftSaved(p.SessionID, p.PromptText) {
@@ -248,6 +253,10 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			_ = store.UpdateDraftToolCalls(p.SessionID, p.PromptText, p.ToolCalls)
 			if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
 				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, map[string]any{"repo_snapshots": snaps})
+			}
+			// Backfill git_diff if it was empty when the draft was first saved.
+			if gd := getGitData(p.ProjectID); gd.gitDiff != "" {
+				_ = store.UpdateDraftGitDiff(p.SessionID, p.PromptText, gd.gitDiff, gd.headSha)
 			}
 			continue
 		}
