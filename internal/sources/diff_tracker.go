@@ -64,12 +64,10 @@ func (t *DiffTracker) Poll() {
 // Start launches the polling goroutine. Call as go tracker.Start().
 func (t *DiffTracker) Start() {
 	// Purge diff_events from before this instance started. Those came from a
-	// previous run and may include restart bursts or stale dirty files that
-	// cannot be attributed to prompts in this run with confidence.
-	// Events recorded AFTER startedAt (by this instance) are trustworthy.
-	// Also clear changed_files from drafts that were attributed from old events.
+	// previous run and may include restart bursts or stale dirty files.
+	// Do NOT clear changed_files — those were set by the PromptScanner at
+	// save time with correct attribution and must survive restarts.
 	_ = store.PruneDiffEventsBefore(t.startedAt)
-	_ = store.ClearAllChangedFiles()
 
 	ticker := time.NewTicker(t.pollInterval)
 	for range ticker.C {

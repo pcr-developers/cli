@@ -24,7 +24,7 @@ type Poller interface {
 	StartedAt() time.Time // when this pcr start instance began — attribution floor
 }
 
-const sourceID = "cursor"
+const sourceID = "cursor" // pcr
 
 // PromptScanner discovers completed Cursor agent turns by polling Cursor's
 // SQLite database every 20 seconds. A turn is "complete" when the last
@@ -42,8 +42,9 @@ type PromptScanner struct {
 	userID      string
 	diffTracker Poller
 
-	seenMu sync.Mutex
-	seen   map[string]bool // "sessionID:userBubbleID" → already saved
+	seenMu       sync.Mutex
+	seen         map[string]bool // "sessionID:userBubbleID" → already saved
+	initialScan  bool            // true during first scan — suppresses verbose output
 }
 
 func NewPromptScanner(dir, userID string, dt Poller) *PromptScanner {
@@ -52,6 +53,7 @@ func NewPromptScanner(dir, userID string, dt Poller) *PromptScanner {
 		userID:      userID,
 		diffTracker: dt,
 		seen:        map[string]bool{},
+		initialScan: true,
 	}
 }
 
@@ -59,6 +61,10 @@ func NewPromptScanner(dir, userID string, dt Poller) *PromptScanner {
 // fast-path trigger. Both paths call scan() which is idempotent.
 func (s *PromptScanner) Start() {
 	display.PrintWatcherReady("Cursor", s.dir)
+
+	// Initial scan — saves historical prompts silently (no verbose flood).
+	s.scan()
+	s.initialScan = false
 
 	// Kick off fsnotify to catch newly created sessions quickly.
 	go s.watchFSNotify()
@@ -157,11 +163,13 @@ func (s *PromptScanner) processSession(projectSlug, sessionID string) {
 			continue
 		}
 
-		durSec := *lastAssistant.TurnDurationMs / 1000
-		display.PrintVerboseEvent("scan", fmt.Sprintf("[%s]  turn complete  %ds  %q",
-			sessionID[:8], durSec, truncate(b.Text, 50)))
+		if !s.initialScan {
+			durSec := *lastAssistant.TurnDurationMs / 1000
+			display.PrintVerboseEvent("scan", fmt.Sprintf("[%s]  turn complete  %ds  %q",
+				sessionID[:8], durSec, truncate(b.Text, 50)))
+		}
 
-		s.saveCompletedTurn(sessionID, meta.ComposerID, b, *lastAssistant, responseText, meta, candidates)
+		s.saveCompletedTurn(sessionID, meta.ComposerID, b, *lastAssistant, responseText, meta, candidates, !s.initialScan)
 	}
 }
 
@@ -175,6 +183,7 @@ func (s *PromptScanner) saveCompletedTurn(
 	responseText string,
 	meta *SessionMeta,
 	candidates []projects.Project,
+	showOutput bool,
 ) {
 	capturedAt := userBubble.CreatedAt
 	if capturedAt == "" {
@@ -350,6 +359,9 @@ func (s *PromptScanner) saveCompletedTurn(
 	displayName := proj.Name
 	if displayName == "" {
 		displayName = "?"
+	}
+	if !showOutput {
+		return
 	}
 	if s.userID == "" {
 		display.PrintDrafted(display.DraftDisplayOptions{

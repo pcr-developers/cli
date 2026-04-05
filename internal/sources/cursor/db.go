@@ -108,7 +108,7 @@ type cacheEntry struct {
 var (
 	metaCache   = map[string]cacheEntry{}
 	metaCacheMu sync.RWMutex
-	cacheTTL    = 60 * time.Second // polling-based scanner; 60s TTL is sufficient
+	cacheTTL    = 60 * time.Second
 )
 
 // InvalidateSessionCache removes a session from the metadata cache.
