@@ -38,6 +38,7 @@ type DraftRecord struct {
 	Status            DraftStatus      `json:"status"`
 	CreatedAt         string           `json:"created_at"`
 	GitDiff           string           `json:"git_diff,omitempty"`
+	HeadSha           string           `json:"head_sha,omitempty"`
 }
 
 // TouchedProjectIDs returns all project IDs recorded in file_context for this
@@ -68,7 +69,7 @@ func (d DraftRecord) TouchedProjectIDs() []string {
 }
 
 // SaveDraft inserts or updates a draft. Idempotent via content_hash.
-func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff string) error {
+func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff, headSha string) error {
 	db := Open()
 
 	id := supabase.PromptID(record.SessionID, record.PromptText, "")
@@ -100,14 +101,15 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff strin
 		INSERT INTO drafts (
 		  id, content_hash, session_id, project_id, project_name, branch_name,
 		  prompt_text, response_text, model, source, capture_method,
-		  tool_calls, file_context, captured_at, session_commit_shas, status, git_diff
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+		  tool_calls, file_context, captured_at, session_commit_shas, status, git_diff, head_sha
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
 		ON CONFLICT(content_hash) DO UPDATE SET
 		  response_text = COALESCE(excluded.response_text, drafts.response_text),
 		  tool_calls    = COALESCE(excluded.tool_calls,    drafts.tool_calls),
 		  file_context  = COALESCE(excluded.file_context,  drafts.file_context),
 		  model         = COALESCE(excluded.model,          drafts.model),
 		  git_diff      = COALESCE(excluded.git_diff,       drafts.git_diff),
+		  head_sha      = COALESCE(excluded.head_sha,       drafts.head_sha),
 		  project_id   = COALESCE(NULLIF(drafts.project_id,   ''), excluded.project_id),
 		  project_name = COALESCE(NULLIF(drafts.project_name, ''), excluded.project_name)
 		WHERE drafts.status = 'draft'
@@ -127,6 +129,7 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff strin
 		capturedAt,
 		sessionShasJSON,
 		nullableStr(gitDiff),
+		nullableStr(headSha),
 	)
 	return err
 }
@@ -226,8 +229,10 @@ func TagUnattributedDrafts(primaryID, primaryName string, allIDs []string) error
 	return nil
 }
 
-// UpdateDraftResponse fills in response_text for an existing draft that has none.
-// Uses exact content hash match.
+// UpdateDraftResponse updates response_text for an existing draft.
+// Always overwrites so that later watcher firings (with the full completed
+// response) replace any partial response stored by an earlier firing.
+// Skips pushed drafts — those are immutable.
 func UpdateDraftResponse(sessionID, promptText, responseText string) error {
 	if responseText == "" {
 		return nil
@@ -235,8 +240,57 @@ func UpdateDraftResponse(sessionID, promptText, responseText string) error {
 	db := Open()
 	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	_, err := db.Exec(
-		"UPDATE drafts SET response_text = ? WHERE content_hash = ? AND (response_text IS NULL OR response_text = '')",
+		"UPDATE drafts SET response_text = ? WHERE content_hash = ? AND status != 'pushed'",
 		responseText, hash,
+	)
+	return err
+}
+
+// MergeDraftFileContext merges new key-value pairs into the existing file_context
+// for a draft. Existing keys are overwritten; unrelated keys are preserved.
+func MergeDraftFileContext(sessionID, promptText string, updates map[string]any) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+
+	var fcJSON *string
+	if err := db.QueryRow(
+		"SELECT file_context FROM drafts WHERE content_hash = ? AND status = 'draft'",
+		hash,
+	).Scan(&fcJSON); err != nil {
+		return nil // draft not found or already pushed
+	}
+
+	current := map[string]any{}
+	if fcJSON != nil {
+		_ = json.Unmarshal([]byte(*fcJSON), &current)
+	}
+	for k, v := range updates {
+		current[k] = v
+	}
+	b, _ := json.Marshal(current)
+	_, err := db.Exec(
+		"UPDATE drafts SET file_context = ? WHERE content_hash = ? AND status = 'draft'",
+		string(b), hash,
+	)
+	return err
+}
+
+// UpdateDraftToolCalls fills in tool_calls for an existing draft that has none.
+// Only updates if the draft currently has no tool_calls recorded, so the first
+// complete set of tool calls wins and later watcher firings don't overwrite.
+func UpdateDraftToolCalls(sessionID, promptText string, toolCalls []map[string]any) error {
+	if len(toolCalls) == 0 {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+	b, _ := json.Marshal(toolCalls)
+	_, err := db.Exec(
+		"UPDATE drafts SET tool_calls = ? WHERE content_hash = ? AND status = 'draft' AND (tool_calls IS NULL OR tool_calls = '')",
+		string(b), hash,
 	)
 	return err
 }
@@ -540,6 +594,7 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 		fileContextJSON       *string
 		sessionCommitShasJSON *string
 		gitDiff               *string
+		headSha               *string
 	)
 	err := row.Scan(
 		&d.ID, &d.ContentHash, &d.SessionID,
@@ -549,7 +604,7 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 		&toolCallsJSON, &fileContextJSON,
 		&d.CapturedAt, &sessionCommitShasJSON,
 		&d.Status, &d.CreatedAt,
-		&gitDiff,
+		&gitDiff, &headSha,
 	)
 	if err != nil {
 		return d, err
@@ -577,6 +632,9 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 	}
 	if gitDiff != nil {
 		d.GitDiff = *gitDiff
+	}
+	if headSha != nil {
+		d.HeadSha = *headSha
 	}
 	return d, nil
 }

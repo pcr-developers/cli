@@ -37,8 +37,10 @@ PCR: 2 new prompts — add to "auth-refactor"? [Y/n/b]
 
 Single keypress, no Enter needed. Only fires when `pcr start` is running.
 
+Open bundles created by the hook are automatically sealed when you run `pcr push` — no manual sealing step needed.
+
 **If your tool doesn't have a Stop hook** (currently: Cursor, Codex, others), prompts are
-saved as drafts automatically. Bundle them manually with `pcr add` after your session.
+saved as drafts automatically. Bundle them manually with `pcr bundle` after your session.
 
 ### 3. Check what's been captured
 ```bash
@@ -67,8 +69,13 @@ pcr bundle --list                           # see all unpushed bundles
 ```bash
 pcr push
 ```
+Seals any open bundles automatically, then pushes all sealed bundles. Each prompt is uploaded with:
+- An incremental git diff scoped to the files the AI actually edited in that response
+- Multi-repo attribution: if a response touched files in multiple registered repos, all of them are tagged on the prompt and bundle
+
 Output:
 ```
+PCR: Sealed "auth-refactor"
 PCR: Pushed "auth refactor" (5 prompts)
     Branch:  feature/auth-refactor
     Review:  https://pcr.dev/review/<id>

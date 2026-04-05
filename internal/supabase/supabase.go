@@ -55,17 +55,6 @@ type CursorSessionData struct {
 	Meta               map[string]any
 }
 
-type ClaudeBundleData struct {
-	BundleID      string
-	Message       string
-	ProjectName   string
-	BranchName    string
-	SessionShas   []string
-	HeadSha       string
-	ExchangeCount int
-	CommittedAt   string
-}
-
 // TouchedProject represents one repo a bundle touched, with its branch at push time.
 type TouchedProject struct {
 	ProjectID string `json:"project_id"`
@@ -227,7 +216,7 @@ func UpsertCursorSession(token string, data CursorSessionData, projectID, userID
 
 // UpsertBundle upserts bundle metadata to the unified bundles table.
 // Source should be "cursor", "claude-code", or any future source identifier.
-func UpsertBundle(token string, data BundleData, projectID, userID string) (string, error) {
+func UpsertBundle(token string, data BundleData, userID string) (string, error) {
 	sessionShas := data.SessionShas
 	if sessionShas == nil {
 		sessionShas = []string{}
@@ -248,35 +237,6 @@ func UpsertBundle(token string, data BundleData, projectID, userID string) (stri
 		"touched_projects": touchedProjects, // array of {project_id, branch, is_primary}
 	}
 	resp, err := rpc(token, "upsert_bundle", map[string]any{
-		"p_bundle":  payload,
-		"p_user_id": nullableStr(userID),
-	})
-	if err != nil {
-		return "", err
-	}
-	var remoteID string
-	_ = json.Unmarshal(resp, &remoteID)
-	return remoteID, nil
-}
-
-// UpsertClaudeBundle upserts bundle metadata to claude_bundles (no prompt data).
-func UpsertClaudeBundle(token string, data ClaudeBundleData, projectID, userID string) (string, error) {
-	claudeSessionShas := data.SessionShas
-	if claudeSessionShas == nil {
-		claudeSessionShas = []string{}
-	}
-	payload := map[string]any{
-		"bundle_id":      data.BundleID,
-		"message":        data.Message,
-		"project_id":     nullableStr(projectID),
-		"project_name":   nullableStr(data.ProjectName),
-		"branch_name":    nullableStr(data.BranchName),
-		"session_shas":   claudeSessionShas,
-		"head_sha":       nullableStr(data.HeadSha),
-		"exchange_count": data.ExchangeCount,
-		"committed_at":   nullableStr(data.CommittedAt),
-	}
-	resp, err := rpc(token, "upsert_claude_bundle", map[string]any{
 		"p_bundle":  payload,
 		"p_user_id": nullableStr(userID),
 	})

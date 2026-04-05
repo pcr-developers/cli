@@ -64,14 +64,20 @@ func syncLatestPrompts() {
 }
 
 // retagDraftsNow re-attributes all local drafts using the DiffTracker's event log.
-// For each draft we query DiffEvents in the window [prev_captured_at, captured_at + 2min]
-// to find which repos had file changes during that prompt's response time.
-// This gives precise per-prompt attribution without any git commands running here.
+// Falls back to tool call file paths when no DiffEvents exist for a window (e.g. pcr start not running).
 func retagDraftsNow() {
-	ctx := resolveProjectContext()
 	drafts, err := store.GetAllDraftsSortedByTime()
 	if err != nil || len(drafts) == 0 {
 		return
+	}
+
+	// Build project registry: ID → project, path → project.
+	allProjs := projects.Load()
+	projByID := map[string]projects.Project{}
+	for _, p := range allProjs {
+		if p.ProjectID != "" {
+			projByID[p.ProjectID] = p
+		}
 	}
 
 	for i, d := range drafts {
@@ -81,9 +87,6 @@ func retagDraftsNow() {
 		}
 
 		// Window: [this prompt's captured_at, next prompt's captured_at].
-		// Same logic as the real-time watcher — files changed between T_N and
-		// T_{N+1} were the AI's response to prompt N.
-		// For the last prompt: add a 5-minute buffer (AI may still be responding).
 		var windowEnd time.Time
 		if i+1 < len(drafts) {
 			windowEnd, _ = parseDraftTime(drafts[i+1].CapturedAt)
@@ -92,28 +95,38 @@ func retagDraftsNow() {
 			windowEnd = capturedAt.Add(5 * time.Minute)
 		}
 
-		// Window start: this prompt's captured_at (events before it belong to the previous prompt).
-		windowStart := capturedAt
-
-		events, err := store.GetDiffEventsInWindow(windowStart, windowEnd)
-		if err != nil || len(events) == 0 {
-			continue
-		}
-
-		// Only consider events for projects registered in the current workspace.
 		projectHits := map[string]int{}
-		for _, e := range events {
-			for _, id := range ctx.ids {
-				if e.ProjectID == id {
-					projectHits[e.ProjectID] += len(e.Files)
+
+		if d.Source == "claude-code" {
+			// For Claude Code: use tool call file paths — exact files the AI edited.
+			for _, tc := range d.ToolCalls {
+				path := toolCallPath(tc)
+				if path == "" {
+					continue
+				}
+				for _, p := range allProjs {
+					if p.ProjectID != "" && p.Path != "" && strings.HasPrefix(path, p.Path+"/") {
+						projectHits[p.ProjectID]++
+					}
+				}
+			}
+		} else {
+			// For Cursor and other sources: use DiffTracker events in the time window.
+			events, err := store.GetDiffEventsInWindow(capturedAt, windowEnd)
+			if err == nil {
+				for _, e := range events {
+					if _, ok := projByID[e.ProjectID]; ok {
+						projectHits[e.ProjectID] += len(e.Files)
+					}
 				}
 			}
 		}
+
 		if len(projectHits) == 0 {
 			continue
 		}
 
-		// Primary = project with most file changes.
+		// Primary = project with most hits.
 		var primaryID, primaryName string
 		var allIDs []string
 		for id, count := range projectHits {
@@ -126,6 +139,22 @@ func retagDraftsNow() {
 
 		_ = store.UpsertDraftProject(d.ContentHash, primaryID, primaryName, allIDs)
 	}
+}
+
+// toolCallPath extracts the file path from a tool call record.
+func toolCallPath(tc map[string]any) string {
+	if input, ok := tc["input"].(map[string]any); ok {
+		if p, _ := input["path"].(string); p != "" {
+			return p
+		}
+		if p, _ := input["file_path"].(string); p != "" {
+			return p
+		}
+	}
+	if p, _ := tc["path"].(string); p != "" {
+		return p
+	}
+	return ""
 }
 
 // parseDraftTime parses a draft's captured_at field which may include
@@ -529,6 +558,8 @@ func runBundleList() error {
 // runBundleInteractive shows the draft list and reads selection from stdin.
 // Only called when isInteractiveTerminal() is true (real terminal, not Cursor).
 func runBundleInteractive(name, repoFilter string) error {
+	syncLatestPrompts()
+	retagDraftsNow()
 	ctx := resolveProjectContext()
 	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
 	if err != nil {

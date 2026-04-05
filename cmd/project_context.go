@@ -31,8 +31,9 @@ func resolveProjectContext() projectContext {
 	var ctx projectContext
 
 	for _, p := range projs {
-		// match: exact path OR the current path is inside this project's directory
-		if p.Path != cwd && !strings.HasPrefix(cwd, p.Path+"/") {
+		// match: exact path, cwd is inside this project, OR this project is inside cwd
+		// (the last case handles running from a parent workspace folder like pcr-developers/)
+		if p.Path != cwd && !strings.HasPrefix(cwd, p.Path+"/") && !strings.HasPrefix(p.Path, cwd+"/") {
 			continue
 		}
 		if seen[p.Path] {

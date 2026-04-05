@@ -158,16 +158,97 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		"capture_schema": schemaV,
 	}
 
+	// Build per-project git data cache upfront — needed in dedup paths too.
+	type projectGitData struct {
+		commitShas []string
+		gitDiff    string
+		headSha    string
+	}
+	gitCache := map[string]*projectGitData{}
+	projByID := map[string]*projects.Project{}
+	for _, p := range projects.Load() {
+		p := p // capture loop var
+		if p.ProjectID != "" {
+			projByID[p.ProjectID] = &p
+		}
+	}
+	getGitData := func(projectID string) *projectGitData {
+		proj, ok := projByID[projectID]
+		if !ok || proj.Path == "" {
+			proj = project // fall back to the file's project
+		}
+		if d, ok := gitCache[proj.Path]; ok {
+			return d
+		}
+		d := &projectGitData{
+			gitDiff: getGitDiff(proj.Path),
+			headSha: getHeadSha(proj.Path),
+		}
+		if proj.Path != "" && session.SessionCreatedAt != "" {
+			d.commitShas = getCommitsSince(proj.Path, session.SessionCreatedAt)
+		}
+		gitCache[proj.Path] = d
+		return d
+	}
+
+	// repoSnapshots returns git snapshots for repos OTHER than primaryProjectID
+	// that are referenced by tool call file paths. Stored in file_context so
+	// push can compute incremental diffs for each touched repo.
+	repoSnapshots := func(toolCalls []map[string]any, primaryProjectID string) map[string]any {
+		result := map[string]any{}
+		for _, tc := range toolCalls {
+			var path string
+			if input, ok := tc["input"].(map[string]any); ok {
+				path, _ = input["path"].(string)
+				if path == "" {
+					path, _ = input["file_path"].(string)
+				}
+			}
+			if path == "" {
+				path, _ = tc["path"].(string)
+			}
+			if path == "" {
+				continue
+			}
+			for id, proj := range projByID {
+				if id == primaryProjectID || proj.Path == "" {
+					continue
+				}
+				if strings.HasPrefix(path, proj.Path+"/") {
+					if _, ok := result[id]; !ok {
+						gd := getGitData(id)
+						result[id] = map[string]any{
+							"head_sha": gd.headSha,
+							"git_diff": gd.gitDiff,
+						}
+					}
+				}
+			}
+		}
+		if len(result) == 0 {
+			return nil
+		}
+		return result
+	}
+
 	var newPrompts []supabase.PromptRecord
 	for _, p := range session.Prompts {
 		hash := supabase.PromptContentHash(p.SessionID, p.PromptText, "")
 		if w.dedup.IsDuplicate(p.SessionID, hash) {
 			_ = store.UpdateDraftResponse(p.SessionID, p.PromptText, p.ResponseText)
+			_ = store.UpdateDraftToolCalls(p.SessionID, p.PromptText, p.ToolCalls)
+			if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
+				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, map[string]any{"repo_snapshots": snaps})
+			}
 			continue
 		}
 		if store.IsDraftSaved(p.SessionID, p.PromptText) {
 			w.dedup.Mark(p.SessionID, hash)
 			_ = store.UpdateDraftResponse(p.SessionID, p.PromptText, p.ResponseText)
+			_ = store.UpdateDraftToolCalls(p.SessionID, p.PromptText, p.ToolCalls)
+			if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
+				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, map[string]any{"repo_snapshots": snaps})
+			}
 			continue
 		}
 		w.dedup.Mark(p.SessionID, hash)
@@ -189,17 +270,13 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		return
 	}
 
-	// Get git commits since session start
-	var commitShas []string
-	if project.Path != "" && session.SessionCreatedAt != "" {
-		commitShas = getCommitsSince(project.Path, session.SessionCreatedAt)
-	}
-
-	// Capture git diff at the moment of capture (capped at 50KB)
-	gitDiff := getGitDiff(project.Path)
-
-	for _, p := range newPrompts {
-		if err := store.SaveDraft(p, commitShas, gitDiff); err != nil {
+	for i := range newPrompts {
+		p := &newPrompts[i]
+		gd := getGitData(p.ProjectID)
+		if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
+			p.FileContext["repo_snapshots"] = snaps
+		}
+		if err := store.SaveDraft(*p, gd.commitShas, gd.gitDiff, gd.headSha); err != nil {
 			display.PrintError("claude-code", "Failed to save draft: "+err.Error())
 		}
 	}
@@ -222,6 +299,17 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		})
 	}
 
+}
+
+func getHeadSha(projectPath string) string {
+	if projectPath == "" {
+		return ""
+	}
+	out, err := exec.Command("git", "-C", projectPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func getGitDiff(projectPath string) string {
