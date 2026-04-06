@@ -45,6 +45,7 @@ type claudeCodeMessage struct {
 	SessionIDCamel    string      `json:"sessionId"`
 	IsSidechain        bool        `json:"isSidechain"`
 	GitBranch         string      `json:"gitBranch"`
+	PermissionMode    string      `json:"permissionMode"`
 }
 
 // ParsedSession is the result of parsing a Claude Code JSONL file.
@@ -141,13 +142,14 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 		}
 
 		var (
-			responseText   string
-			model          string
-			toolCalls      []map[string]any
-			toolResults    []map[string]any
+			responseText    string
+			model           string
+			toolCalls       []map[string]any
+			toolResults     []map[string]any
 			thinkingContent string
-			inputTokens    int
-			outputTokens   int
+			inputTokens     int
+			outputTokens    int
+			agentToolIDs    = map[string]bool{} // tool_use IDs for Agent calls
 		)
 
 		for j := i + 1; j < len(messages); j++ {
@@ -176,6 +178,13 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 				}
 				tools := extractToolCalls(next.Message.Content)
 				toolCalls = append(toolCalls, tools...)
+				for _, tc := range tools {
+					if tc["tool"] == "Agent" {
+						if id, ok := tc["id"].(string); ok && id != "" {
+							agentToolIDs[id] = true
+						}
+					}
+				}
 
 				if next.Message.Usage != nil {
 					inputTokens += next.Message.Usage.InputTokens
@@ -186,6 +195,18 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 				continue
 			}
 			if next.Type == "human" || next.Type == "user" {
+				// Include Agent tool results in response_text at full length so
+				// the subagent's answer is captured, not just the short wrap-up.
+				if len(agentToolIDs) > 0 {
+					agentText := extractAgentResults(next.Message.Content, agentToolIDs)
+					if agentText != "" {
+						if responseText != "" {
+							responseText += "\n" + agentText
+						} else {
+							responseText = agentText
+						}
+					}
+				}
 				results := extractToolResults(next.Message.Content)
 				toolResults = append(toolResults, results...)
 				if strings.TrimSpace(extractText(next.Message.Content)) != "" {
@@ -220,17 +241,18 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 		}
 
 		prompts = append(prompts, supabase.PromptRecord{
-			SessionID:     sessionID,
-			ProjectName:   projectName,
-			BranchName:    branch,
-			PromptText:    promptText,
-			ResponseText:  responseText,
-			Model:         model,
-			Source:        "claude-code",
-			CaptureMethod: "file-watcher",
-			ToolCalls:     toolCalls,
-			FileContext:   fileContext,
-			CapturedAt:    capturedAt,
+			SessionID:      sessionID,
+			ProjectName:    projectName,
+			BranchName:     branch,
+			PromptText:     promptText,
+			ResponseText:   responseText,
+			Model:          model,
+			Source:         "claude-code",
+			CaptureMethod:  "file-watcher",
+			ToolCalls:      toolCalls,
+			FileContext:    fileContext,
+			CapturedAt:     capturedAt,
+			PermissionMode: msg.PermissionMode,
 		})
 	}
 
@@ -302,6 +324,41 @@ func extractToolCalls(raw json.RawMessage) []map[string]any {
 		}
 	}
 	return result
+}
+
+// extractAgentResults returns the text content of tool_result blocks whose
+// tool_use_id is in agentIDs (i.e. results from Agent tool calls). No truncation
+// is applied so the full subagent response is captured.
+func extractAgentResults(raw json.RawMessage, agentIDs map[string]bool) string {
+	blocks := parseContent(raw)
+	var parts []string
+	for _, b := range blocks {
+		if b.Type != "tool_result" || !agentIDs[b.ToolUseID] {
+			continue
+		}
+		var text string
+		if b.Content != nil {
+			var s string
+			if err := json.Unmarshal(b.Content, &s); err == nil {
+				text = s
+			} else {
+				var subBlocks []contentBlock
+				if err := json.Unmarshal(b.Content, &subBlocks); err == nil {
+					var subParts []string
+					for _, sb := range subBlocks {
+						if sb.Type == "text" && sb.Text != "" {
+							subParts = append(subParts, sb.Text)
+						}
+					}
+					text = strings.Join(subParts, "\n")
+				}
+			}
+		}
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func extractToolResults(raw json.RawMessage) []map[string]any {

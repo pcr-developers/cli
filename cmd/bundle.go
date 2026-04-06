@@ -265,16 +265,22 @@ func repoBadge(d store.DraftRecord, projByID map[string]string) string {
 	return ""
 }
 
-// filterWithChangedFiles removes agent-mode drafts that have no changed_files.
-// Non-agent turns (ask, plan, debug, chat) are always kept — they don't
-// produce file changes by design and are still valuable as conversation records.
+// filterWithChangedFiles removes agent-mode Cursor drafts that have no changed_files.
+// Claude Code drafts are always kept — they don't use the DiffTracker and never
+// have changed_files populated. Non-agent Cursor turns (ask, plan, debug, chat)
+// are also always kept.
 func filterWithChangedFiles(drafts []store.DraftRecord) []store.DraftRecord {
 	var out []store.DraftRecord
 	for _, d := range drafts {
+		// Claude Code drafts are never filtered by changed_files.
+		if d.Source == "claude-code" {
+			out = append(out, d)
+			continue
+		}
 		mode := draftCursorMode(d)
 		isAgent := mode == "agent" || mode == ""
 		if isAgent {
-			// Agent turn: only include if it has changed_files
+			// Cursor agent turn: only include if it has changed_files
 			fc := d.FileContext
 			if fc == nil {
 				continue
@@ -302,6 +308,84 @@ func draftCursorMode(d store.DraftRecord) string {
 		return v
 	}
 	return ""
+}
+
+// getAvailableDrafts returns the filtered draft pool for the current context.
+//
+// Single-repo context (ctx.singleRepo): fetches ALL non-committed drafts, filters
+// to those that touched the current repo, and excludes any already bundled for it.
+// This allows cross-repo drafts to remain available for bundling from other repos.
+//
+// Workspace context: uses current project ID/name filter (existing behaviour).
+func getAvailableDrafts(ctx projectContext, repoFilter string, projByID map[string]string) ([]store.DraftRecord, error) {
+	if ctx.singleRepo && len(ctx.ids) > 0 {
+		// Fetch ALL drafts — older drafts may have been saved before the project was
+		// registered (empty project_id / different name), so SQL-level filtering by
+		// project_id/name would miss them. We filter in Go instead.
+		allDrafts, err := store.GetDraftsByStatus(store.StatusDraft, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		staged, err := store.GetStagedDrafts()
+		if err != nil {
+			return nil, err
+		}
+
+		// Keep drafts that are associated with this project:
+		//   1. project_id matches one of ctx.ids
+		//   2. project_name matches one of ctx.names (handles pre-registration captures)
+		//   3. touched_project_ids contains one of ctx.ids (cross-repo drafts)
+		idSet := make(map[string]bool, len(ctx.ids))
+		for _, id := range ctx.ids {
+			idSet[id] = true
+		}
+		nameSet := make(map[string]bool, len(ctx.names))
+		for _, n := range ctx.names {
+			nameSet[strings.ToLower(n)] = true
+		}
+		var repoMatched []store.DraftRecord
+		for _, d := range append(allDrafts, staged...) {
+			if idSet[d.ProjectID] || nameSet[strings.ToLower(d.ProjectName)] {
+				repoMatched = append(repoMatched, d)
+				continue
+			}
+			for _, tid := range d.TouchedProjectIDs() {
+				if idSet[tid] {
+					repoMatched = append(repoMatched, d)
+					break
+				}
+			}
+		}
+
+		candidates := filterWithChangedFiles(repoMatched)
+
+		// Exclude drafts already bundled for this specific project.
+		bundled, err := store.GetBundledDraftIDsForProject(ctx.ids[0])
+		if err != nil {
+			return nil, err
+		}
+		if len(bundled) == 0 {
+			return candidates, nil
+		}
+		var available []store.DraftRecord
+		for _, d := range candidates {
+			if !bundled[d.ID] {
+				available = append(available, d)
+			}
+		}
+		return available, nil
+	}
+
+	// Workspace context: existing behaviour.
+	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
+	if err != nil {
+		return nil, err
+	}
+	staged, err := store.GetStagedDrafts()
+	if err != nil {
+		return nil, err
+	}
+	return filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, projByID)), nil
 }
 
 func filterByRepo(drafts []store.DraftRecord, repoName string, projByID map[string]string) []store.DraftRecord {
@@ -420,20 +504,20 @@ Examples:
 // Draft numbers shown in the overview always correspond to the (possibly filtered) pool.
 func runBundleCreate(name, selectArg, repoFilter string) error {
 	ctx := resolveProjectContext()
+	projByID := loadProjByID()
 
-	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
+	all, err := getAvailableDrafts(ctx, repoFilter, projByID)
 	if err != nil {
 		return err
 	}
-	staged, err := store.GetStagedDrafts()
-	if err != nil {
-		return err
-	}
-	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, loadProjByID()))
 
 	if len(all) == 0 {
-		if repoFilter != "" {
-			fmt.Fprintf(os.Stderr, "PCR: No draft prompts attributed to repo %q.\n", repoFilter)
+		if repoFilter != "" || ctx.singleRepo {
+			label := repoFilter
+			if label == "" {
+				label = ctx.name
+			}
+			fmt.Fprintf(os.Stderr, "PCR: No draft prompts attributed to repo %q.\n", label)
 		} else {
 			fmt.Fprintln(os.Stderr, "PCR: No draft prompts available. Run `pcr start` to capture prompts.")
 		}
@@ -459,8 +543,9 @@ func runBundleCreate(name, selectArg, repoFilter string) error {
 	branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
 	sha := "bundle-" + generateID()
 
-	// "closed" = auto-sealed, ready to push
-	_, err = store.CreateCommit(name, sha, draftIDs(selected), projectID, projectName, branch, "closed")
+	// Single-repo context: soft bundle — draft remains available for other repos.
+	// Workspace context: mark drafts as committed globally.
+	_, err = store.CreateCommit(name, sha, draftIDs(selected), projectID, projectName, branch, "closed", ctx.singleRepo)
 	if err != nil {
 		return err
 	}
@@ -611,16 +696,11 @@ func runBundleList() error {
 // Only called when isInteractiveTerminal() is true (real terminal, not Cursor).
 func runBundleInteractive(name, repoFilter string) error {
 	ctx := resolveProjectContext()
-	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
-	if err != nil {
-		return err
-	}
-	staged, err := store.GetStagedDrafts()
-	if err != nil {
-		return err
-	}
 	projByID := loadProjByID()
-	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, projByID))
+	all, err := getAvailableDrafts(ctx, repoFilter, projByID)
+	if err != nil {
+		return err
+	}
 
 	if len(all) == 0 {
 		fmt.Fprintln(os.Stderr, "PCR: No draft prompts available.")
@@ -673,16 +753,11 @@ func runBundleShowHint(name, repoFilter string) error {
 	syncLatestPrompts()
 	retagDraftsNow()
 	ctx := resolveProjectContext()
-	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
-	if err != nil {
-		return err
-	}
-	staged, err := store.GetStagedDrafts()
-	if err != nil {
-		return err
-	}
 	projByID := loadProjByID()
-	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, projByID))
+	all, err := getAvailableDrafts(ctx, repoFilter, projByID)
+	if err != nil {
+		return err
+	}
 
 	if len(all) == 0 {
 		fmt.Fprintln(os.Stderr, "PCR: No draft prompts available.")
@@ -728,16 +803,11 @@ func runBundleOverview(repoFilter string) error {
 	syncLatestPrompts()
 	retagDraftsNow()
 	ctx := resolveProjectContext()
-	drafts, err := store.GetDraftsByStatus(store.StatusDraft, ctx.ids, ctx.names)
-	if err != nil {
-		return err
-	}
-	staged, err := store.GetStagedDrafts()
-	if err != nil {
-		return err
-	}
 	projByID := loadProjByID()
-	all := filterWithChangedFiles(filterByRepo(append(drafts, staged...), repoFilter, projByID))
+	all, err := getAvailableDrafts(ctx, repoFilter, projByID)
+	if err != nil {
+		return err
+	}
 	unpushed, _ := store.GetUnpushedCommits()
 
 	const bold = "\x1b[1m"

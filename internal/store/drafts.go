@@ -39,6 +39,7 @@ type DraftRecord struct {
 	CreatedAt         string           `json:"created_at"`
 	GitDiff           string           `json:"git_diff,omitempty"`
 	HeadSha           string           `json:"head_sha,omitempty"`
+	PermissionMode    string           `json:"permission_mode,omitempty"`
 }
 
 // TouchedProjectIDs returns all project IDs recorded in file_context for this
@@ -114,17 +115,19 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff strin
 		INSERT INTO drafts (
 		  id, content_hash, session_id, project_id, project_name, branch_name,
 		  prompt_text, response_text, model, source, capture_method,
-		  tool_calls, file_context, captured_at, session_commit_shas, status, git_diff, head_sha
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+		  tool_calls, file_context, captured_at, session_commit_shas, status, git_diff, head_sha,
+		  permission_mode
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
 		ON CONFLICT(content_hash) DO UPDATE SET
-		  response_text = COALESCE(excluded.response_text, drafts.response_text),
-		  tool_calls    = COALESCE(excluded.tool_calls,    drafts.tool_calls),
-		  file_context  = COALESCE(excluded.file_context,  drafts.file_context),
-		  model         = COALESCE(excluded.model,          drafts.model),
-		  git_diff      = COALESCE(excluded.git_diff,       drafts.git_diff),
-		  head_sha      = COALESCE(excluded.head_sha,       drafts.head_sha),
-		  project_id   = COALESCE(NULLIF(drafts.project_id,   ''), excluded.project_id),
-		  project_name = COALESCE(NULLIF(drafts.project_name, ''), excluded.project_name)
+		  response_text  = COALESCE(excluded.response_text, drafts.response_text),
+		  tool_calls     = COALESCE(excluded.tool_calls,    drafts.tool_calls),
+		  file_context   = COALESCE(excluded.file_context,  drafts.file_context),
+		  model          = COALESCE(excluded.model,          drafts.model),
+		  git_diff       = COALESCE(excluded.git_diff,       drafts.git_diff),
+		  head_sha       = COALESCE(excluded.head_sha,       drafts.head_sha),
+		  project_id     = COALESCE(NULLIF(drafts.project_id,   ''), excluded.project_id),
+		  project_name   = COALESCE(NULLIF(drafts.project_name, ''), excluded.project_name),
+		  permission_mode = COALESCE(excluded.permission_mode, drafts.permission_mode)
 		WHERE drafts.status = 'draft'
 	`,
 		id, hash,
@@ -143,6 +146,7 @@ func SaveDraft(record supabase.PromptRecord, sessionShas []string, gitDiff strin
 		sessionShasJSON,
 		nullableStr(gitDiff),
 		nullableStr(headSha),
+		nullableStr(record.PermissionMode),
 	)
 	return err
 }
@@ -363,6 +367,35 @@ func EnrichDraftChangedFiles(contentHash string, changedFiles []string) error {
 		string(b), contentHash,
 	)
 	return err
+}
+
+// GetBundledDraftIDsForProject returns the set of draft IDs already in any
+// unpushed bundle attributed to the given projectID. Used to exclude drafts
+// from a single-repo bundle view when they've already been bundled for that repo.
+func GetBundledDraftIDsForProject(projectID string) (map[string]bool, error) {
+	if projectID == "" {
+		return nil, nil
+	}
+	db := Open()
+	rows, err := db.Query(`
+		SELECT DISTINCT pci.draft_id
+		FROM prompt_commit_items pci
+		JOIN prompt_commits pc ON pc.id = pci.prompt_commit_id
+		WHERE pc.project_id = ? AND pc.pushed_at IS NULL
+	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Close()
 }
 
 // UpdateDraftResponse fills in response_text for an existing draft that has none.
@@ -680,6 +713,7 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 		sessionCommitShasJSON *string
 		gitDiff               *string
 		headSha               *string
+		permissionMode        *string
 	)
 	err := row.Scan(
 		&d.ID, &d.ContentHash, &d.SessionID,
@@ -689,7 +723,7 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 		&toolCallsJSON, &fileContextJSON,
 		&d.CapturedAt, &sessionCommitShasJSON,
 		&d.Status, &d.CreatedAt,
-		&gitDiff, &headSha,
+		&gitDiff, &headSha, &permissionMode,
 	)
 	if err != nil {
 		return d, err
@@ -720,6 +754,9 @@ func scanOneDraft(row interface{ Scan(...any) error }) (DraftRecord, error) {
 	}
 	if headSha != nil {
 		d.HeadSha = *headSha
+	}
+	if permissionMode != nil {
+		d.PermissionMode = *permissionMode
 	}
 	return d, nil
 }
