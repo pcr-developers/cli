@@ -26,7 +26,10 @@ type PromptCommit struct {
 
 // CreateCommit bundles drafts into a commit record atomically.
 // bundleStatus should be "open" or "closed".
-func CreateCommit(message, headSha string, draftIDs []string, projectID, projectName, branchName, bundleStatus string) (*PromptCommit, error) {
+// softBundle controls whether draft status is updated to 'committed': pass true
+// when bundling from a single-repo context so the draft remains available for
+// bundling from other repos that the prompt also touched.
+func CreateCommit(message, headSha string, draftIDs []string, projectID, projectName, branchName, bundleStatus string, softBundle bool) (*PromptCommit, error) {
 	db := Open()
 	id := newUUID()
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -79,8 +82,10 @@ func CreateCommit(message, headSha string, draftIDs []string, projectID, project
 		if _, err := tx.Exec("INSERT OR IGNORE INTO prompt_commit_items (prompt_commit_id, draft_id) VALUES (?, ?)", id, draftID); err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec("UPDATE drafts SET status = 'committed' WHERE id = ?", draftID); err != nil {
-			return nil, err
+		if !softBundle {
+			if _, err := tx.Exec("UPDATE drafts SET status = 'committed' WHERE id = ?", draftID); err != nil {
+				return nil, err
+			}
 		}
 	}
 

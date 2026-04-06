@@ -369,6 +369,35 @@ func EnrichDraftChangedFiles(contentHash string, changedFiles []string) error {
 	return err
 }
 
+// GetBundledDraftIDsForProject returns the set of draft IDs already in any
+// unpushed bundle attributed to the given projectID. Used to exclude drafts
+// from a single-repo bundle view when they've already been bundled for that repo.
+func GetBundledDraftIDsForProject(projectID string) (map[string]bool, error) {
+	if projectID == "" {
+		return nil, nil
+	}
+	db := Open()
+	rows, err := db.Query(`
+		SELECT DISTINCT pci.draft_id
+		FROM prompt_commit_items pci
+		JOIN prompt_commits pc ON pc.id = pci.prompt_commit_id
+		WHERE pc.project_id = ? AND pc.pushed_at IS NULL
+	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Close()
+}
+
 // UpdateDraftResponse fills in response_text for an existing draft that has none.
 // Uses exact content hash match.
 func UpdateDraftResponse(sessionID, promptText, responseText string) error {

@@ -106,18 +106,19 @@ func pushBundle(localID, currentBranch, userID string) int {
 		}
 
 		rec := map[string]any{
-			"id":             item.ID,
-			"content_hash":   item.ContentHash,
-			"bundle_id":      c.ID,
-			"session_id":     item.SessionID,
-			"prompt_text":    item.PromptText,
-			"tool_calls":     item.ToolCalls,
-			"model":          item.Model,
-			"source":         item.Source,
-			"branch_name":    item.BranchName,
-			"captured_at":    item.CapturedAt,
-			"capture_method": item.CaptureMethod,
-			"project_ids":    promptProjectIDs,
+			"id":              item.ID,
+			"content_hash":    item.ContentHash,
+			"bundle_id":       c.ID,
+			"session_id":      item.SessionID,
+			"prompt_text":     item.PromptText,
+			"tool_calls":      item.ToolCalls,
+			"model":           item.Model,
+			"source":          item.Source,
+			"branch_name":     item.BranchName,
+			"captured_at":     item.CapturedAt,
+			"capture_method":  item.CaptureMethod,
+			"project_ids":     promptProjectIDs,
+			"permission_mode": item.PermissionMode,
 		}
 		if item.ProjectID != "" {
 			rec["project_id"] = item.ProjectID

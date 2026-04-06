@@ -135,7 +135,7 @@ func hookAddToBundle(ttyFile *os.File, drafts []store.DraftRecord, targetBundle 
 			projectID = ctx.ids[0]
 		}
 		syntheticSha := "hook-" + generateID()
-		_, err := store.CreateCommit(bundleName, syntheticSha, ids, projectID, projectName, bundleName, "open")
+		_, err := store.CreateCommit(bundleName, syntheticSha, ids, projectID, projectName, bundleName, "open", false)
 		if err != nil {
 			_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
 			return nil
@@ -168,7 +168,7 @@ func hookCreateNewBundle(ttyFile *os.File, drafts []store.DraftRecord, ctx proje
 	ids := draftIDs(drafts)
 	branch := gitOutput("git", "rev-parse", "--abbrev-ref", "HEAD")
 	syntheticSha := "hook-" + generateID()
-	_, err := store.CreateCommit(name, syntheticSha, ids, projectID, projectName, branch, "open")
+	_, err := store.CreateCommit(name, syntheticSha, ids, projectID, projectName, branch, "open", false)
 	if err != nil {
 		_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
 		return nil
