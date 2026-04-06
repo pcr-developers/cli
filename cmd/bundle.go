@@ -725,7 +725,7 @@ func runBundleInteractive(name, repoFilter string) error {
 			badgeFmt = " " + cyn + badge + rst
 		}
 		modeFmt := ""
-		if m := draftCursorMode(d); m != "" && m != "agent" {
+		if m := draftCursorMode(d); m != "" {
 			modeFmt = " " + dim + m + rst
 		}
 		fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, modeFmt, promptPreview(d.PromptText, 55))
@@ -783,7 +783,7 @@ func runBundleShowHint(name, repoFilter string) error {
 			badgeFmt = " " + cyn + badge + rst
 		}
 		modeFmt := ""
-		if m := draftCursorMode(d); m != "" && m != "agent" {
+		if m := draftCursorMode(d); m != "" {
 			modeFmt = " " + dim + m + rst
 		}
 		fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, modeFmt, promptPreview(d.PromptText, 55))
@@ -831,7 +831,7 @@ func runBundleOverview(repoFilter string) error {
 				badgeFmt = " " + cyn + badge + rst
 			}
 			modeFmt := ""
-			if m := draftCursorMode(d); m != "" && m != "agent" {
+			if m := draftCursorMode(d); m != "" {
 				modeFmt = " " + dim + m + rst
 			}
 			fmt.Fprintf(os.Stderr, "  [%d] %s%s%s%s%s %q\n", idx+1, dim, date, rst, badgeFmt, modeFmt, promptPreview(d.PromptText, 55))

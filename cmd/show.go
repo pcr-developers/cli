@@ -100,13 +100,16 @@ Examples:
 		fmt.Fprintf(os.Stderr, "\n%s[%d] Draft prompt%s\n", bold, n, rst)
 		fmt.Fprintf(os.Stderr, "%s─────────────────────────────────────────%s\n", gry, rst)
 
-		// Metadata line: time · source · model · branch
+		// Metadata line: time · source · mode · model · branch
 		meta := []string{}
 		if d.CapturedAt != "" {
 			meta = append(meta, fmtTime(d.CapturedAt))
 		}
 		if d.Source != "" {
 			meta = append(meta, d.Source)
+		}
+		if mode := draftCursorMode(d); mode != "" {
+			meta = append(meta, mode)
 		}
 		if d.Model != "" {
 			meta = append(meta, d.Model)
