@@ -28,8 +28,9 @@ type PromptRecord struct {
 	ToolCalls     []map[string]any `json:"tool_calls,omitempty"`
 	FileContext   map[string]any   `json:"file_context,omitempty"`
 	CapturedAt    string           `json:"captured_at,omitempty"`
-	UserID        string           `json:"user_id,omitempty"`
-	TeamID        string           `json:"team_id,omitempty"`
+	UserID         string           `json:"user_id,omitempty"`
+	TeamID         string           `json:"team_id,omitempty"`
+	PermissionMode string           `json:"permission_mode,omitempty"`
 }
 
 type CursorSessionData struct {

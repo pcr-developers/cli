@@ -45,6 +45,7 @@ type claudeCodeMessage struct {
 	SessionIDCamel    string      `json:"sessionId"`
 	IsSidechain        bool        `json:"isSidechain"`
 	GitBranch         string      `json:"gitBranch"`
+	PermissionMode    string      `json:"permissionMode"`
 }
 
 // ParsedSession is the result of parsing a Claude Code JSONL file.
@@ -220,17 +221,18 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 		}
 
 		prompts = append(prompts, supabase.PromptRecord{
-			SessionID:     sessionID,
-			ProjectName:   projectName,
-			BranchName:    branch,
-			PromptText:    promptText,
-			ResponseText:  responseText,
-			Model:         model,
-			Source:        "claude-code",
-			CaptureMethod: "file-watcher",
-			ToolCalls:     toolCalls,
-			FileContext:   fileContext,
-			CapturedAt:    capturedAt,
+			SessionID:      sessionID,
+			ProjectName:    projectName,
+			BranchName:     branch,
+			PromptText:     promptText,
+			ResponseText:   responseText,
+			Model:          model,
+			Source:         "claude-code",
+			CaptureMethod:  "file-watcher",
+			ToolCalls:      toolCalls,
+			FileContext:    fileContext,
+			CapturedAt:     capturedAt,
+			PermissionMode: msg.PermissionMode,
 		})
 	}
 

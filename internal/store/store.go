@@ -43,7 +43,7 @@ func migrate(db *sql.DB) {
 	var version int
 	_ = db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version)
 
-	steps := []func(*sql.Tx) error{migrateV1, migrateV2, migrateV3, migrateV4, migrateV5}
+	steps := []func(*sql.Tx) error{migrateV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6}
 
 	for i, step := range steps {
 		if i < version {
@@ -141,6 +141,11 @@ func migrateV3(tx *sql.Tx) error {
 		CREATE INDEX IF NOT EXISTS diff_events_occurred_at ON diff_events(occurred_at);
 		CREATE INDEX IF NOT EXISTS diff_events_project_id  ON diff_events(project_id);
 	`)
+	return err
+}
+
+func migrateV6(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE drafts ADD COLUMN permission_mode TEXT`)
 	return err
 }
 
