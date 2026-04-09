@@ -37,7 +37,7 @@ func syncLatestPrompts() {
 	// The old code dumped all dirty files from git status into diff_events on
 	// every pcr bundle call, causing massive false-positive attribution.
 
-	cursor.ForceSync("", nil, 5)
+	cursor.ForceSync("", 5)
 	fmt.Fprint(os.Stderr, "                          \r")
 }
 

@@ -7,9 +7,7 @@ import (
 	"time"
 )
 
-type Source struct {
-	DiffTracker Poller
-}
+type Source struct{}
 
 func (s *Source) Name() string { return "Cursor" }
 
@@ -17,9 +15,14 @@ func (s *Source) Start(userID string) {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cursor", "projects")
 
+	// DiffTracker: polls registered projects every 3s to record timestamped
+	// file-change events used for per-prompt attribution in agent turns.
+	dt := newDiffTracker(3 * time.Second)
+	go dt.start()
+
 	// PromptScanner: discovers completed turns (turnDurationMs present) and
 	// saves fully-attributed drafts. Polls every 20s + fsnotify fast path.
-	scanner := NewPromptScanner(dir, userID, s.DiffTracker)
+	scanner := NewPromptScanner(dir, userID, dt)
 	go scanner.Start()
 
 	// SessionStateWatcher: tracks mode/model/context changes every 2s so the
@@ -31,11 +34,7 @@ func (s *Source) Start(userID string) {
 // ForceSync runs a one-shot scan of the N most recently modified transcript
 // files. Called by `pcr bundle` to capture any turns that haven't been picked
 // up by the background scanner yet.
-func ForceSync(userID string, dt Poller, maxFiles int) {
-	if dt != nil {
-		dt.Poll()
-	}
-
+func ForceSync(userID string, maxFiles int) {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".cursor", "projects")
 
@@ -69,7 +68,7 @@ func ForceSync(userID string, dt Poller, maxFiles int) {
 		return
 	}
 
-	scanner := NewPromptScanner(dir, userID, dt)
+	scanner := NewPromptScanner(dir, userID, nil)
 	for _, f := range files {
 		projectSlug, sessionID, ok := parseTranscriptPath(f.path)
 		if !ok {

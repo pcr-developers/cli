@@ -17,13 +17,6 @@ import (
 	"github.com/pcr-developers/cli/internal/versions"
 )
 
-// Poller is the interface the PromptScanner uses to interact with the DiffTracker.
-type Poller interface {
-	Poll()
-	StartedAt() time.Time    // when this pcr start instance began — attribution floor
-	RegisterProject(id string) // tell the tracker to poll this project
-}
-
 const sourceID = "cursor" // pcr
 
 // PromptScanner discovers completed Cursor agent turns by polling Cursor's
@@ -40,14 +33,14 @@ const sourceID = "cursor" // pcr
 type PromptScanner struct {
 	dir         string
 	userID      string
-	diffTracker Poller
+	diffTracker *diffTracker
 
 	seenMu       sync.Mutex
 	seen         map[string]bool // "sessionID:userBubbleID" → already saved
 	initialScan  bool            // true during first scan — suppresses verbose output
 }
 
-func NewPromptScanner(dir, userID string, dt Poller) *PromptScanner {
+func NewPromptScanner(dir, userID string, dt *diffTracker) *PromptScanner {
 	return &PromptScanner{
 		dir:         dir,
 		userID:      userID,
@@ -81,7 +74,7 @@ func (s *PromptScanner) Start() {
 // processes any completed turns that haven't been saved yet.
 func (s *PromptScanner) scan() {
 	if s.diffTracker != nil {
-		s.diffTracker.Poll()
+		s.diffTracker.poll()
 	}
 
 	_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
@@ -112,7 +105,7 @@ func (s *PromptScanner) processSession(projectSlug, sessionID string) {
 	// This is the only place diff_events are generated — Claude Code never calls this.
 	if s.diffTracker != nil {
 		for _, c := range candidates {
-			s.diffTracker.RegisterProject(c.ProjectID)
+			s.diffTracker.registerProject(c.ProjectID)
 		}
 	}
 
@@ -243,7 +236,7 @@ func (s *PromptScanner) saveCompletedTurn(
 		// are considered. Events from previous runs are unreliable.
 		floor := turnStart
 		if s.diffTracker != nil {
-			if st := s.diffTracker.StartedAt(); !st.IsZero() && st.After(floor) {
+			if st := s.diffTracker.startedAt_(); !st.IsZero() && st.After(floor) {
 				floor = st
 			}
 		}

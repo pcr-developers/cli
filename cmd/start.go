@@ -11,8 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"time"
-
 	"github.com/pcr-developers/cli/internal/auth"
 	"github.com/pcr-developers/cli/internal/config"
 	"github.com/pcr-developers/cli/internal/display"
@@ -70,13 +68,8 @@ var startCmd = &cobra.Command{
 		projs := projects.Load()
 		display.PrintStartupBanner(Version, BuildTime, len(projs))
 
-		// Start DiffTracker: polls every 3s to record timestamped file-change events.
-		// These events are queried by the watcher for per-prompt repo attribution.
-		diffTracker := sources.NewDiffTracker(3 * time.Second)
-		go diffTracker.Start()
-
 		// Start all sources in goroutines
-		allSources := sources.All(diffTracker)
+		allSources := sources.All()
 		for _, src := range allSources {
 			go src.Start(userID)
 		}
