@@ -180,7 +180,9 @@ func RemoveDraftsFromBundle(bundleID string, draftIDs []string) error {
 }
 
 // AddDraftsToBundle appends drafts to a bundle, reopening it if sealed.
-func AddDraftsToBundle(bundleID string, draftIDs []string) error {
+// soft=true leaves draft status as-is so the draft remains available for
+// bundling from other repos it touched (cross-repo soft-bundle behaviour).
+func AddDraftsToBundle(bundleID string, draftIDs []string, soft bool) error {
 	db := Open()
 	// Reopen sealed bundles so edits are allowed
 	if _, err := db.Exec("UPDATE prompt_commits SET bundle_status = 'open' WHERE id = ? AND bundle_status = 'closed'", bundleID); err != nil {
@@ -197,8 +199,10 @@ func AddDraftsToBundle(bundleID string, draftIDs []string) error {
 		if _, err := tx.Exec("INSERT OR IGNORE INTO prompt_commit_items (prompt_commit_id, draft_id) VALUES (?, ?)", bundleID, draftID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("UPDATE drafts SET status = 'committed' WHERE id = ?", draftID); err != nil {
-			return err
+		if !soft {
+			if _, err := tx.Exec("UPDATE drafts SET status = 'committed' WHERE id = ?", draftID); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

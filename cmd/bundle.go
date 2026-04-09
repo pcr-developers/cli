@@ -445,7 +445,7 @@ func runBundleAdd(name, selectArg string) error {
 		return nil
 	}
 
-	if err := store.AddDraftsToBundle(bundle.ID, draftIDs(selected)); err != nil {
+	if err := store.AddDraftsToBundle(bundle.ID, draftIDs(selected), ctx.singleRepo); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "PCR: Added %d prompt%s to %q — push with `pcr push`\n",

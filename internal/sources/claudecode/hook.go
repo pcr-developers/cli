@@ -100,7 +100,7 @@ func RunHook(projectIDs, projectNames []string, projectName string) error {
 func hookAddToBundle(ttyFile *os.File, drafts []store.DraftRecord, targetBundle *store.PromptCommit, bundleName string, projectIDs []string, projectName string, n int) error {
 	ids := draftIDs(drafts)
 	if targetBundle != nil {
-		if err := store.AddDraftsToBundle(targetBundle.ID, ids); err != nil {
+		if err := store.AddDraftsToBundle(targetBundle.ID, ids, true); err != nil {
 			_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
 			return nil
 		}
@@ -111,7 +111,7 @@ func hookAddToBundle(ttyFile *os.File, drafts []store.DraftRecord, targetBundle 
 			projectID = projectIDs[0]
 		}
 		syntheticSha := fmt.Sprintf("hook-%d", time.Now().UnixNano())
-		_, err := store.CreateCommit(bundleName, syntheticSha, ids, projectID, projectName, bundleName, "open", false)
+		_, err := store.CreateCommit(bundleName, syntheticSha, ids, projectID, projectName, bundleName, "open", true)
 		if err != nil {
 			_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
 			return nil
@@ -141,7 +141,7 @@ func hookCreateNewBundle(ttyFile *os.File, drafts []store.DraftRecord, projectID
 	ids := draftIDs(drafts)
 	branch := gitBranch()
 	syntheticSha := fmt.Sprintf("hook-%d", time.Now().UnixNano())
-	_, err := store.CreateCommit(name, syntheticSha, ids, projectID, projectName, branch, "open", false)
+	_, err := store.CreateCommit(name, syntheticSha, ids, projectID, projectName, branch, "open", true)
 	if err != nil {
 		_, _ = ttyFile.WriteString(fmt.Sprintf("PCR: error: %v\r\n", err))
 		return nil
