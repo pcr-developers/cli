@@ -192,6 +192,38 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		return d
 	}
 
+	// touchedProjectIDs returns all registered project IDs whose files appear in
+	// tool call paths. Used to set touched_project_ids in file_context so that
+	// `pcr bundle` shows the draft in every repo the prompt actually edited.
+	touchedProjectIDs := func(toolCalls []map[string]any, projByID map[string]*projects.Project) []string {
+		seen := map[string]bool{}
+		for _, tc := range toolCalls {
+			var path string
+			if input, ok := tc["input"].(map[string]any); ok {
+				path, _ = input["path"].(string)
+				if path == "" {
+					path, _ = input["file_path"].(string)
+				}
+			}
+			if path == "" {
+				path, _ = tc["path"].(string)
+			}
+			if path == "" {
+				continue
+			}
+			for id, proj := range projByID {
+				if proj.Path != "" && strings.HasPrefix(path, proj.Path+"/") {
+					seen[id] = true
+				}
+			}
+		}
+		ids := make([]string, 0, len(seen))
+		for id := range seen {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+
 	// repoSnapshots returns git snapshots for repos OTHER than primaryProjectID
 	// that are referenced by tool call file paths. Stored in file_context so
 	// push can compute incremental diffs for each touched repo.
@@ -252,8 +284,15 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			w.dedup.Mark(p.SessionID, hash)
 			_ = store.UpdateDraftResponse(p.SessionID, p.PromptText, p.ResponseText)
 			_ = store.UpdateDraftToolCalls(p.SessionID, p.PromptText, p.ToolCalls)
+			fc := map[string]any{}
 			if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
-				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, map[string]any{"repo_snapshots": snaps})
+				fc["repo_snapshots"] = snaps
+			}
+			if ids := touchedProjectIDs(p.ToolCalls, projByID); len(ids) > 0 {
+				fc["touched_project_ids"] = ids
+			}
+			if len(fc) > 0 {
+				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, fc)
 			}
 			// Backfill git_diff if it was empty when the draft was first saved.
 			if gd := getGitData(p.ProjectID); gd.gitDiff != "" {
@@ -272,6 +311,13 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		}
 		p.UserID = w.userID
 		p.ProjectID = project.ProjectID
+		p.ProjectName = project.Name
+
+		// Populate touched_project_ids from tool call file paths so the draft
+		// surfaces in every repo's `pcr bundle`, not just the session's repo.
+		if ids := touchedProjectIDs(p.ToolCalls, projByID); len(ids) > 0 {
+			merged["touched_project_ids"] = ids
+		}
 		p.FileContext = merged
 		newPrompts = append(newPrompts, p)
 	}

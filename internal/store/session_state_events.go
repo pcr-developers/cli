@@ -64,12 +64,3 @@ func GetSessionStateAt(sessionID string, at time.Time) (*SessionStateEvent, erro
 	return &e, nil
 }
 
-// PruneSessionStateEvents deletes events older than the given time.
-func PruneSessionStateEvents(before time.Time) error {
-	db := Open()
-	_, err := db.Exec(
-		`DELETE FROM session_state_events WHERE occurred_at < ?`,
-		before.UTC().Format(time.RFC3339),
-	)
-	return err
-}

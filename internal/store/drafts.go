@@ -413,62 +413,6 @@ func UpdateDraftResponse(sessionID, promptText, responseText string) error {
 	return err
 }
 
-// UpdateDraftResponseFuzzy fills in response_text by matching session_id + prompt prefix
-// in Go (not SQL). Handles cases where the prompt was captured from a partially-written
-// JSONL line, meaning the stored prompt_text is a prefix of the full parsed prompt.
-// Returns the number of rows updated.
-func UpdateDraftResponseFuzzy(sessionID string, prompts map[string]string) (int, error) {
-	if len(prompts) == 0 {
-		return 0, nil
-	}
-	db := Open()
-
-	// Fetch all drafts for the session with missing response_text
-	rows, err := db.Query(
-		"SELECT id, prompt_text FROM drafts WHERE session_id = ? AND (response_text IS NULL OR response_text = '')",
-		sessionID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	type row struct{ id, text string }
-	var drafts []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.text); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		drafts = append(drafts, r)
-	}
-	rows.Close()
-
-	// For each draft, find the JSONL prompt that starts with (or equals) the stored text.
-	updated := 0
-	for _, d := range drafts {
-		for promptText, responseText := range prompts {
-			if responseText == "" {
-				continue
-			}
-			// Match: JSONL prompt starts with stored text, or exact match.
-			if strings.HasPrefix(promptText, d.text) || promptText == d.text {
-				res, err := db.Exec(
-					"UPDATE drafts SET response_text = ? WHERE id = ? AND (response_text IS NULL OR response_text = '')",
-					responseText, d.id,
-				)
-				if err != nil {
-					return updated, err
-				}
-				if n, _ := res.RowsAffected(); n > 0 {
-					updated++
-				}
-				break
-			}
-		}
-	}
-	return updated, nil
-}
-
 // GetDraftsByStatus returns drafts filtered by status and optionally by project.
 // projectIDs and projectNames are OR-combined; pass nil slices to return all.
 func GetDraftsByStatus(status DraftStatus, projectIDs, projectNames []string) ([]DraftRecord, error) {
@@ -492,48 +436,6 @@ func GetDraftsByStatus(status DraftStatus, projectIDs, projectNames []string) ([
 	rows, err := db.Query(
 		fmt.Sprintf("SELECT * FROM drafts WHERE %s ORDER BY captured_at ASC", where),
 		args...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanDraftRows(rows)
-}
-
-// GetAllDrafts returns all drafts with optional filters.
-func GetAllDrafts(status DraftStatus, projectID string) ([]DraftRecord, error) {
-	db := Open()
-	conditions := []string{}
-	args := []any{}
-	if status != "" {
-		conditions = append(conditions, "status = ?")
-		args = append(args, string(status))
-	}
-	if projectID != "" {
-		conditions = append(conditions, "project_id = ?")
-		args = append(args, projectID)
-	}
-	where := ""
-	if len(conditions) > 0 {
-		where = "WHERE " + strings.Join(conditions, " AND ")
-	}
-	rows, err := db.Query(
-		fmt.Sprintf("SELECT * FROM drafts %s ORDER BY captured_at ASC", where),
-		args...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanDraftRows(rows)
-}
-
-// GetAllDraftsSortedByTime returns all non-pushed drafts ordered by captured_at ASC.
-// Used by retagDraftsNow to iterate prompts in chronological order for window attribution.
-func GetAllDraftsSortedByTime() ([]DraftRecord, error) {
-	db := Open()
-	rows, err := db.Query(
-		`SELECT * FROM drafts WHERE status IN ('draft','staged','committed') ORDER BY captured_at ASC`,
 	)
 	if err != nil {
 		return nil, err
@@ -668,17 +570,6 @@ func ClearStaged() error {
 	db := Open()
 	_, err := db.Exec("UPDATE drafts SET status = 'draft' WHERE status = 'staged'")
 	return err
-}
-
-// RestoreDraftToDraft sets a pushed draft back to 'draft' status.
-func RestoreDraftToDraft(draftID string) bool {
-	db := Open()
-	res, err := db.Exec("UPDATE drafts SET status = 'draft' WHERE id = ? AND status = 'pushed'", draftID)
-	if err != nil {
-		return false
-	}
-	n, _ := res.RowsAffected()
-	return n > 0
 }
 
 // ─── Row scanning ─────────────────────────────────────────────────────────────

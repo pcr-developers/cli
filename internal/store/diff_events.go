@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -86,21 +87,21 @@ func PruneDiffEvents(before time.Time) error {
 	return err
 }
 
-// PurgeAllDiffEvents deletes every diff_event record.
-func PurgeAllDiffEvents() error {
+// DeleteDiffEventsByID deletes specific diff_events by ID. Called after a
+// Cursor turn is saved so consumed events are removed immediately rather
+// than waiting for the TTL prune.
+func DeleteDiffEventsByID(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	db := Open()
-	_, err := db.Exec(`DELETE FROM diff_events`)
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	_, err := db.Exec(`DELETE FROM diff_events WHERE id IN (`+placeholders+`)`, args...)
 	return err
 }
 
-// PruneDiffEventsBefore deletes all diff_events recorded before the given
-// time. Called at pcr start startup to discard events from previous runs
-// while keeping events from the current run for future attribution.
-func PruneDiffEventsBefore(before time.Time) error {
-	db := Open()
-	_, err := db.Exec(
-		`DELETE FROM diff_events WHERE occurred_at < ?`,
-		before.UTC().Format(time.RFC3339),
-	)
-	return err
-}

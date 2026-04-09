@@ -180,7 +180,9 @@ func RemoveDraftsFromBundle(bundleID string, draftIDs []string) error {
 }
 
 // AddDraftsToBundle appends drafts to a bundle, reopening it if sealed.
-func AddDraftsToBundle(bundleID string, draftIDs []string) error {
+// soft=true leaves draft status as-is so the draft remains available for
+// bundling from other repos it touched (cross-repo soft-bundle behaviour).
+func AddDraftsToBundle(bundleID string, draftIDs []string, soft bool) error {
 	db := Open()
 	// Reopen sealed bundles so edits are allowed
 	if _, err := db.Exec("UPDATE prompt_commits SET bundle_status = 'open' WHERE id = ? AND bundle_status = 'closed'", bundleID); err != nil {
@@ -197,8 +199,10 @@ func AddDraftsToBundle(bundleID string, draftIDs []string) error {
 		if _, err := tx.Exec("INSERT OR IGNORE INTO prompt_commit_items (prompt_commit_id, draft_id) VALUES (?, ?)", bundleID, draftID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("UPDATE drafts SET status = 'committed' WHERE id = ?", draftID); err != nil {
-			return err
+		if !soft {
+			if _, err := tx.Exec("UPDATE drafts SET status = 'committed' WHERE id = ?", draftID); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -298,21 +302,6 @@ func ListPushedCommits() ([]PromptCommit, error) {
 	return ListCommits(&t, nil, nil)
 }
 
-// GetCommitBySha finds a commit by its git HEAD SHA.
-func GetCommitBySha(headSha string) (*PromptCommit, error) {
-	db := Open()
-	rows, err := db.Query("SELECT * FROM prompt_commits WHERE head_sha = ?", headSha)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	commits, err := scanCommitRows(rows)
-	if err != nil || len(commits) == 0 {
-		return nil, err
-	}
-	return &commits[0], nil
-}
-
 // UnmarkPushed resets a pushed commit back to unpushed so it can be re-pushed.
 func UnmarkPushed(commitID string) error {
 	db := Open()
@@ -332,13 +321,6 @@ func UnmarkPushed(commitID string) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-// RelinkCommit updates a commit's HEAD SHA (for git amend).
-func RelinkCommit(commitID, newHeadSha string) error {
-	db := Open()
-	_, err := db.Exec("UPDATE prompt_commits SET head_sha = ? WHERE id = ?", newHeadSha, commitID)
-	return err
 }
 
 // GetCommitWithItems fetches a commit and its associated drafts.

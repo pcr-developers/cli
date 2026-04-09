@@ -17,13 +17,6 @@ import (
 	"github.com/pcr-developers/cli/internal/versions"
 )
 
-// Poller is the interface the PromptScanner uses to force an immediate
-// DiffTracker poll before querying diff events.
-type Poller interface {
-	Poll()
-	StartedAt() time.Time // when this pcr start instance began — attribution floor
-}
-
 const sourceID = "cursor" // pcr
 
 // PromptScanner discovers completed Cursor agent turns by polling Cursor's
@@ -40,14 +33,14 @@ const sourceID = "cursor" // pcr
 type PromptScanner struct {
 	dir         string
 	userID      string
-	diffTracker Poller
+	diffTracker *diffTracker
 
 	seenMu       sync.Mutex
 	seen         map[string]bool // "sessionID:userBubbleID" → already saved
 	initialScan  bool            // true during first scan — suppresses verbose output
 }
 
-func NewPromptScanner(dir, userID string, dt Poller) *PromptScanner {
+func NewPromptScanner(dir, userID string, dt *diffTracker) *PromptScanner {
 	return &PromptScanner{
 		dir:         dir,
 		userID:      userID,
@@ -81,7 +74,7 @@ func (s *PromptScanner) Start() {
 // processes any completed turns that haven't been saved yet.
 func (s *PromptScanner) scan() {
 	if s.diffTracker != nil {
-		s.diffTracker.Poll()
+		s.diffTracker.poll()
 	}
 
 	_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
@@ -106,6 +99,14 @@ func (s *PromptScanner) processSession(projectSlug, sessionID string) {
 	candidates := projects.GetAllProjectsForCursorSlug(projectSlug)
 	if len(candidates) == 0 {
 		return
+	}
+
+	// Register candidate projects with the DiffTracker so it begins polling them.
+	// This is the only place diff_events are generated — Claude Code never calls this.
+	if s.diffTracker != nil {
+		for _, c := range candidates {
+			s.diffTracker.registerProject(c.ProjectID)
+		}
 	}
 
 	meta := GetSessionMeta(sessionID)
@@ -229,16 +230,20 @@ func (s *PromptScanner) saveCompletedTurn(
 	// produce file changes. "plan" and "chat" are read-only.
 	isAgentTurn := mode == "agent" || mode == "debug"
 
+	var consumedEventIDs []int64
 	if isAgentTurn && !turnStart.IsZero() {
 		// Use StartedAt as the floor so only events from THIS pcr start run
 		// are considered. Events from previous runs are unreliable.
 		floor := turnStart
 		if s.diffTracker != nil {
-			if st := s.diffTracker.StartedAt(); !st.IsZero() && st.After(floor) {
+			if st := s.diffTracker.startedAt_(); !st.IsZero() && st.After(floor) {
 				floor = st
 			}
 		}
 		windowEvents, _ := store.GetDiffEventsInWindow(floor, turnEnd)
+		for _, e := range windowEvents {
+			consumedEventIDs = append(consumedEventIDs, e.ID)
+		}
 		if len(candidates) == 1 {
 			proj = &candidates[0]
 			if proj.ProjectID != "" {
@@ -348,6 +353,10 @@ func (s *PromptScanner) saveCompletedTurn(
 		display.PrintError("cursor", "Failed to save draft: "+err.Error())
 		return
 	}
+
+	// Attribution is now baked into the draft record — delete the consumed
+	// diff_events so they don't accumulate indefinitely.
+	_ = store.DeleteDiffEventsByID(consumedEventIDs)
 
 	// Mark the bubble ID in the persistent store so restarts don't re-save.
 	_ = store.MarkBubbleSaved(sessionID, userBubble.BubbleID, hash)

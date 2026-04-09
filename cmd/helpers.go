@@ -78,17 +78,6 @@ func openTTY() *ttyHandle {
 	return &ttyHandle{f: f, reader: bufio.NewReader(f)}
 }
 
-// openHookTTY opens /dev/tty directly for the Stop hook command.
-// The hook runs inside a tool's process that holds stdin, so it always
-// needs /dev/tty regardless of the terminal environment.
-func openHookTTY() *ttyHandle {
-	f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0600)
-	if err != nil {
-		return &ttyHandle{reader: bufio.NewReader(os.Stdin)}
-	}
-	return &ttyHandle{f: f, reader: bufio.NewReader(f)}
-}
-
 func ttyPrompt(tty *ttyHandle, question string) string {
 	if tty.f != nil {
 		_, _ = tty.f.WriteString(question)
@@ -97,10 +86,6 @@ func ttyPrompt(tty *ttyHandle, question string) string {
 	}
 	line, _ := tty.reader.ReadString('\n')
 	return strings.TrimRight(line, "\r\n")
-}
-
-func hasTTY() bool {
-	return isInteractiveTerminal()
 }
 
 func nonInteractiveHint(cmd string) {
@@ -212,16 +197,6 @@ func promptPreview(text string, n int) string {
 		preview = meaningful[0]
 	}
 	return truncate(preview, n)
-}
-
-func filterNonEmpty(lines []string) []string {
-	var result []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) != "" {
-			result = append(result, l)
-		}
-	}
-	return result
 }
 
 func plural(n int) string {
