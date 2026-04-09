@@ -41,153 +41,6 @@ func syncLatestPrompts() {
 	fmt.Fprint(os.Stderr, "                          \r")
 }
 
-// retagDraftsNow is a no-op. Attribution is now handled at save time by the
-// PromptScanner using exact turnDurationMs windows. Retroactive re-attribution
-// from diff_events caused false positives (stale dirty files contaminating
-// prompt windows) and has been removed.
-func retagDraftsNow() {
-	return
-	drafts, err := store.GetAllDraftsSortedByTime()
-	if err != nil || len(drafts) == 0 {
-		return
-	}
-
-	// Cache workspace slug → candidate project IDs to avoid re-deriving per draft.
-	slugCandidates := map[string][]string{}
-
-	for i, d := range drafts {
-		capturedAt, err := parseDraftTime(d.CapturedAt)
-		if err != nil {
-			continue
-		}
-
-		// Window: [this prompt's captured_at, next prompt's captured_at].
-		// For the last prompt: add a 5-minute buffer (AI may still be responding).
-		var windowEnd time.Time
-		if i+1 < len(drafts) {
-			windowEnd, _ = parseDraftTime(drafts[i+1].CapturedAt)
-		}
-		if windowEnd.IsZero() {
-			windowEnd = capturedAt.Add(5 * time.Minute)
-		}
-		windowStart := capturedAt
-
-		events, err := store.GetDiffEventsInWindow(windowStart, windowEnd)
-		if err != nil {
-			continue
-		}
-
-		// DiffTracker polls at an interval, so changes made during a prompt's
-		// response may not be recorded until after the NEXT prompt fires.
-		// Expand the window forward by up to 10 minutes to catch delayed polls,
-		// but only use the extras if the primary window was empty.
-		if len(events) == 0 {
-			extended, _ := store.GetDiffEventsInWindow(windowStart, windowEnd.Add(10*time.Minute))
-			events = extended
-		}
-		if len(events) == 0 {
-			continue
-		}
-
-		// ── Pass 0: Strip out-of-workspace projects from touched_project_ids ──
-		// Old captures may have included projects from unrelated workspaces
-		// (e.g. PCR.dev appearing in pcr-developers session drafts). Clean those
-		// out so the display correctly shows only projects that belong here.
-		{
-			candidateIDs, ok := slugCandidates[d.SessionID]
-			if !ok {
-				slug := cursorWorkspaceSlugForSession(d.SessionID)
-				for _, p := range projects.GetAllProjectsForCursorSlug(slug) {
-					if p.ProjectID != "" {
-						candidateIDs = append(candidateIDs, p.ProjectID)
-					}
-				}
-				slugCandidates[d.SessionID] = candidateIDs
-			}
-			if len(candidateIDs) > 0 {
-				validSet := map[string]bool{}
-				for _, id := range candidateIDs {
-					validSet[id] = true
-				}
-				touched := d.TouchedProjectIDs()
-				var cleaned []string
-				changed := false
-				for _, id := range touched {
-					if validSet[id] {
-						cleaned = append(cleaned, id)
-					} else {
-						changed = true
-					}
-				}
-				if changed {
-					_ = store.UpsertDraftProject(d.ContentHash, d.ProjectID, d.ProjectName, cleaned)
-				}
-			}
-		}
-
-		// ── Pass 1: Attribution (workspace-scoped) ────────────────────────
-		// Derive valid project candidates from the draft's Cursor workspace so
-		// we never attribute a pcr-developers session to an unrelated project
-		// like PCR.dev that lives in a completely different directory.
-		if d.ProjectID == "" {
-			candidateIDs, ok := slugCandidates[d.SessionID]
-			if !ok {
-				slug := cursorWorkspaceSlugForSession(d.SessionID)
-				for _, p := range projects.GetAllProjectsForCursorSlug(slug) {
-					if p.ProjectID != "" {
-						candidateIDs = append(candidateIDs, p.ProjectID)
-					}
-				}
-				slugCandidates[d.SessionID] = candidateIDs
-			}
-			if len(candidateIDs) > 0 {
-				projectHits := map[string]int{}
-				for _, e := range events {
-					for _, id := range candidateIDs {
-						if e.ProjectID == id {
-							projectHits[e.ProjectID] += len(e.Files)
-						}
-					}
-				}
-				if len(projectHits) > 0 {
-					var primaryID, primaryName string
-					var allIDs []string
-					for id, count := range projectHits {
-						allIDs = append(allIDs, id)
-						if primaryID == "" || count > projectHits[primaryID] {
-							primaryID = id
-							primaryName = projNameForID(id)
-						}
-					}
-					_ = store.UpsertDraftProject(d.ContentHash, primaryID, primaryName, allIDs)
-					d.ProjectID = primaryID
-				}
-			}
-		}
-
-		// ── Pass 2: changed_files enrichment (draft's own project_id) ─────
-		// Use the draft's attributed project as the sole filter — avoids
-		// cross-repo noise and works from any working directory.
-		filterID := d.ProjectID
-		if filterID == "" {
-			continue
-		}
-		seen := map[string]bool{}
-		var changedFiles []string
-		for _, e := range events {
-			if e.ProjectID != filterID {
-				continue
-			}
-			for _, f := range e.Files {
-				if !seen[f] {
-					seen[f] = true
-					changedFiles = append(changedFiles, f)
-				}
-			}
-		}
-		_ = store.EnrichDraftChangedFiles(d.ContentHash, changedFiles)
-	}
-}
 
 // parseDraftTime parses a draft's captured_at field which may include
 // milliseconds ("2026-04-04T18:22:05.044Z") not handled by time.RFC3339.
@@ -751,7 +604,6 @@ func runBundleInteractive(name, repoFilter string) error {
 // runBundleShowHint shows the draft list with a hint to use --select.
 func runBundleShowHint(name, repoFilter string) error {
 	syncLatestPrompts()
-	retagDraftsNow()
 	ctx := resolveProjectContext()
 	projByID := loadProjByID()
 	all, err := getAvailableDrafts(ctx, repoFilter, projByID)
@@ -801,7 +653,6 @@ func runBundleShowHint(name, repoFilter string) error {
 // runBundleOverview shows all drafts and unpushed bundles.
 func runBundleOverview(repoFilter string) error {
 	syncLatestPrompts()
-	retagDraftsNow()
 	ctx := resolveProjectContext()
 	projByID := loadProjByID()
 	all, err := getAvailableDrafts(ctx, repoFilter, projByID)

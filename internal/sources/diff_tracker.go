@@ -17,11 +17,16 @@ import (
 	"github.com/pcr-developers/cli/internal/store"
 )
 
-// DiffTracker polls each registered project every pollInterval and records a
+// DiffTracker polls Cursor-registered projects every pollInterval and records a
 // DiffEvent whenever file content changes (tracked modifications AND new
 // untracked files). It uses git status --porcelain to get the full list of
 // dirty/new files, then hashes each file's diff to detect changes to
 // already-dirty files between polls.
+//
+// Only projects registered via RegisterProject are polled — the Cursor watcher
+// calls this when it discovers an active session. Claude Code does not use
+// diff_events (it snapshots git diff at parse time), so Claude-only projects
+// are never polled.
 //
 // State is persisted to disk across restarts so that files already dirty when
 // pcr start was last stopped are never re-attributed as newly changed. Only
@@ -32,20 +37,33 @@ type DiffTracker struct {
 	pollInterval time.Duration
 	startedAt    time.Time // when this pcr start instance began — used as attribution floor
 
-	mu         sync.Mutex
-	prevState  map[string]map[string]string // projectPath → relFile → diffHash
-	freshStart bool                          // true on every startup → silent first poll to avoid restart bursts
+	mu                sync.Mutex
+	prevState         map[string]map[string]string // projectPath → relFile → diffHash
+	watchedProjectIDs map[string]bool              // only poll these; empty = nothing yet
+	freshStart        bool                         // true on every startup → silent first poll to avoid restart bursts
 }
 
 func NewDiffTracker(interval time.Duration) *DiffTracker {
 	t := &DiffTracker{
-		pollInterval: interval,
-		startedAt:    time.Now(),
-		prevState:    map[string]map[string]string{},
-		freshStart:   true, // always silent on first poll regardless of saved state
+		pollInterval:      interval,
+		startedAt:         time.Now(),
+		prevState:         map[string]map[string]string{},
+		watchedProjectIDs: map[string]bool{}, // nothing polled until Cursor registers
+		freshStart:        true,
 	}
 	t.loadState()
 	return t
+}
+
+// RegisterProject adds a project to the poll list. Called by the Cursor
+// PromptScanner when it discovers an active session for a project.
+func (t *DiffTracker) RegisterProject(id string) {
+	if id == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.watchedProjectIDs[id] = true
 }
 
 // StartedAt returns the time this DiffTracker instance started.
@@ -67,7 +85,7 @@ func (t *DiffTracker) Start() {
 	// previous run and may include restart bursts or stale dirty files.
 	// Do NOT clear changed_files — those were set by the PromptScanner at
 	// save time with correct attribution and must survive restarts.
-	_ = store.PruneDiffEventsBefore(t.startedAt)
+	_ = store.PruneDiffEvents(t.startedAt)
 
 	ticker := time.NewTicker(t.pollInterval)
 	for range ticker.C {
@@ -76,18 +94,34 @@ func (t *DiffTracker) Start() {
 }
 
 func (t *DiffTracker) poll() {
+	// Snapshot watched project IDs under lock so we don't hold it during I/O.
+	t.mu.Lock()
+	watchedIDs := make(map[string]bool, len(t.watchedProjectIDs))
+	for id := range t.watchedProjectIDs {
+		watchedIDs[id] = true
+	}
+	t.mu.Unlock()
+
+	if len(watchedIDs) == 0 {
+		// No Cursor sessions discovered yet — nothing to poll.
+		t.mu.Lock()
+		t.freshStart = false
+		t.mu.Unlock()
+		return
+	}
+
 	projs := projects.Load()
 	now := time.Now()
 
 	for _, p := range projs {
-		if p.Path == "" || p.ProjectID == "" {
+		if p.Path == "" || p.ProjectID == "" || !watchedIDs[p.ProjectID] {
 			continue
 		}
 
 		current := t.getDirtyHashes(p.Path)
 
 		t.mu.Lock()
-		prev := t.prevState[p.Path]
+		prev, knownProject := t.prevState[p.Path]
 
 		// A file is "newly changed" only if its hash differs from the last known
 		// state — which may come from a previous pcr start run (via persisted
@@ -102,7 +136,11 @@ func (t *DiffTracker) poll() {
 		t.prevState[p.Path] = current
 		t.mu.Unlock()
 
-		if t.freshStart {
+		// Skip recording if this is the global freshStart poll or if this is the
+		// first time we've seen this project (no prevState baseline yet). In both
+		// cases we silently establish the baseline so the next poll only records
+		// genuine new changes.
+		if t.freshStart || !knownProject {
 			continue
 		}
 
@@ -114,11 +152,14 @@ func (t *DiffTracker) poll() {
 		}
 	}
 
-	// After the first silent poll on a fresh start, clear the flag so all
-	// subsequent polls record events normally.
+	// After the first silent poll, clear freshStart so subsequent polls record normally.
 	t.mu.Lock()
 	t.freshStart = false
 	t.mu.Unlock()
+
+	// Prune diff_events older than 1 hour as a backstop for any events not
+	// consumed by a Cursor turn (e.g. if a session was abandoned mid-turn).
+	_ = store.PruneDiffEvents(now.Add(-1 * time.Hour))
 
 	t.saveState()
 }

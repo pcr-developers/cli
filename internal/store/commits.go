@@ -298,21 +298,6 @@ func ListPushedCommits() ([]PromptCommit, error) {
 	return ListCommits(&t, nil, nil)
 }
 
-// GetCommitBySha finds a commit by its git HEAD SHA.
-func GetCommitBySha(headSha string) (*PromptCommit, error) {
-	db := Open()
-	rows, err := db.Query("SELECT * FROM prompt_commits WHERE head_sha = ?", headSha)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	commits, err := scanCommitRows(rows)
-	if err != nil || len(commits) == 0 {
-		return nil, err
-	}
-	return &commits[0], nil
-}
-
 // UnmarkPushed resets a pushed commit back to unpushed so it can be re-pushed.
 func UnmarkPushed(commitID string) error {
 	db := Open()
@@ -332,13 +317,6 @@ func UnmarkPushed(commitID string) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-// RelinkCommit updates a commit's HEAD SHA (for git amend).
-func RelinkCommit(commitID, newHeadSha string) error {
-	db := Open()
-	_, err := db.Exec("UPDATE prompt_commits SET head_sha = ? WHERE id = ?", newHeadSha, commitID)
-	return err
 }
 
 // GetCommitWithItems fetches a commit and its associated drafts.
