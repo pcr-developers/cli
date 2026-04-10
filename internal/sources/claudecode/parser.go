@@ -217,7 +217,7 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 			// Skip auxiliary message types (attachment, file-history-snapshot, etc.)
 			// that don't represent conversation boundaries.
 			if next.Type == "system" {
-				break
+				continue
 			}
 		}
 

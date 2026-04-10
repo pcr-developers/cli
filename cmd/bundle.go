@@ -351,7 +351,6 @@ Examples:
 	},
 }
 
-// forced poll test - final cli
 // runBundleCreate creates a new sealed bundle from selected drafts.
 // repoFilter, if set, narrows the draft pool to only prompts that touched that repo.
 // Draft numbers shown in the overview always correspond to the (possibly filtered) pool.
