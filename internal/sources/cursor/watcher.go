@@ -260,6 +260,17 @@ func (s *PromptScanner) saveCompletedTurn(
 		// Non-agent turn or no events: use best-candidate attribution.
 		if len(candidates) == 1 {
 			proj = &candidates[0]
+		} else if len(candidates) > 1 {
+			// Multi-repo workspace: pick the first registered candidate as the
+			// primary project so the draft has a non-empty project_name and is
+			// visible in `pcr bundle`. Tag all candidate IDs in touched_project_ids
+			// so the draft also surfaces when browsing from any sub-repo.
+			proj = &candidates[0]
+			for _, c := range candidates {
+				if c.ProjectID != "" {
+					touchedIDs = append(touchedIDs, c.ProjectID)
+				}
+			}
 		} else {
 			proj = &projects.Project{}
 		}
