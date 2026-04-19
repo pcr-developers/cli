@@ -270,6 +270,7 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		if w.dedup.IsDuplicate(p.SessionID, hash) {
 			_ = store.UpdateDraftResponse(p.SessionID, p.PromptText, p.ResponseText)
 			_ = store.UpdateDraftToolCalls(p.SessionID, p.PromptText, p.ToolCalls)
+			_ = store.UpdateDraftPermissionMode(p.SessionID, p.PromptText, p.PermissionMode)
 			if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
 				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, map[string]any{"repo_snapshots": snaps})
 			}
@@ -284,16 +285,26 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			w.dedup.Mark(p.SessionID, hash)
 			_ = store.UpdateDraftResponse(p.SessionID, p.PromptText, p.ResponseText)
 			_ = store.UpdateDraftToolCalls(p.SessionID, p.PromptText, p.ToolCalls)
+			_ = store.UpdateDraftPermissionMode(p.SessionID, p.PromptText, p.PermissionMode)
 			fc := map[string]any{}
 			if snaps := repoSnapshots(p.ToolCalls, p.ProjectID); len(snaps) > 0 {
 				fc["repo_snapshots"] = snaps
 			}
-			if ids := touchedProjectIDs(p.ToolCalls, projByID); len(ids) > 0 {
-				fc["touched_project_ids"] = ids
+			ids := touchedProjectIDs(p.ToolCalls, projByID)
+			if p.ProjectID != "" {
+				hasPrimary := false
+				for _, id := range ids {
+					if id == p.ProjectID {
+						hasPrimary = true
+						break
+					}
+				}
+				if !hasPrimary {
+					ids = append([]string{p.ProjectID}, ids...)
+				}
 			}
-			if len(fc) > 0 {
-				_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, fc)
-			}
+			fc["touched_project_ids"] = ids
+			_ = store.MergeDraftFileContext(p.SessionID, p.PromptText, fc)
 			// Backfill git_diff if it was empty when the draft was first saved.
 			if gd := getGitData(p.ProjectID); gd.gitDiff != "" {
 				_ = store.UpdateDraftGitDiff(p.SessionID, p.PromptText, gd.gitDiff, gd.headSha)
@@ -312,11 +323,23 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		p.ProjectID = project.ProjectID
 		p.ProjectName = project.Name
 
-		// Populate touched_project_ids from tool call file paths so the draft
-		// surfaces in every repo's `pcr bundle`, not just the session's repo.
-		if ids := touchedProjectIDs(p.ToolCalls, projByID); len(ids) > 0 {
-			merged["touched_project_ids"] = ids
+		// Populate touched_project_ids: always include the primary project plus any
+		// secondary repos whose files appear in tool call paths. Having the primary
+		// in the list enables multi-repo badges in workspace view when len > 1.
+		ids := touchedProjectIDs(p.ToolCalls, projByID)
+		if p.ProjectID != "" {
+			hasPrimary := false
+			for _, id := range ids {
+				if id == p.ProjectID {
+					hasPrimary = true
+					break
+				}
+			}
+			if !hasPrimary {
+				ids = append([]string{p.ProjectID}, ids...)
+			}
 		}
+		merged["touched_project_ids"] = ids
 		p.FileContext = merged
 		newPrompts = append(newPrompts, p)
 	}

@@ -124,6 +124,9 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 		sessionModel      string
 		sessionCreatedAt  string
 		sessionUpdatedAt  string
+		lastPermMode      string   // Claude Code only writes permissionMode on change; carry forward
+		seenPermModes     = map[string]bool{} // all unique modes seen across session
+		allPermModes      []string
 	)
 
 	for i, msg := range messages {
@@ -140,10 +143,17 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 		if strings.TrimSpace(promptText) == "" {
 			continue
 		}
+		// Skip tool-response messages (contain tool_result blocks). These can
+		// carry text annotations (e.g. auto-accept confirmations) that should
+		// not be treated as new user prompts.
+		if len(extractToolResults(msg.Message.Content)) > 0 {
+			continue
+		}
 
 		var (
 			responseText    string
-			model           string
+			seenModels      = map[string]bool{}
+			models          []string
 			toolCalls       []map[string]any
 			toolResults     []map[string]any
 			thinkingContent string
@@ -154,6 +164,12 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 
 		for j := i + 1; j < len(messages); j++ {
 			next := messages[j]
+			// Track permission mode changes that occur on any message during the exchange.
+			if next.PermissionMode != "" && !seenPermModes[next.PermissionMode] {
+				lastPermMode = next.PermissionMode
+				seenPermModes[lastPermMode] = true
+				allPermModes = append(allPermModes, lastPermMode)
+			}
 			if next.Type == "assistant" {
 				chunk := extractText(next.Message.Content)
 				if chunk != "" {
@@ -170,10 +186,11 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 						thinkingContent = t
 					}
 				}
-				if model == "" && next.Message.Model != "" {
-					model = next.Message.Model
+				if next.Message.Model != "" && !seenModels[next.Message.Model] {
+					seenModels[next.Message.Model] = true
+					models = append(models, next.Message.Model)
 					if sessionModel == "" {
-						sessionModel = model
+						sessionModel = next.Message.Model
 					}
 				}
 				tools := extractToolCalls(next.Message.Content)
@@ -209,7 +226,10 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 				}
 				results := extractToolResults(next.Message.Content)
 				toolResults = append(toolResults, results...)
-				if strings.TrimSpace(extractText(next.Message.Content)) != "" {
+				// Only break for genuine next-prompt messages (no tool_result blocks).
+				// Messages with tool results are part of the current exchange even if
+				// they also carry text (e.g. auto-accept approval annotations).
+				if len(results) == 0 && strings.TrimSpace(extractText(next.Message.Content)) != "" {
 					break
 				}
 				continue
@@ -240,19 +260,28 @@ func ParseClaudeCodeSession(fileContent, projectName, filePath string) ParsedSes
 			capturedAt = time.Now().UTC().Format(time.RFC3339)
 		}
 
+		// Carry forward the last known permission mode — Claude Code only writes it on change.
+		if msg.PermissionMode != "" {
+			lastPermMode = msg.PermissionMode
+		}
+		if lastPermMode != "" && !seenPermModes[lastPermMode] {
+			seenPermModes[lastPermMode] = true
+			allPermModes = append(allPermModes, lastPermMode)
+		}
+
 		prompts = append(prompts, supabase.PromptRecord{
 			SessionID:      sessionID,
 			ProjectName:    projectName,
 			BranchName:     branch,
 			PromptText:     promptText,
 			ResponseText:   responseText,
-			Model:          model,
+			Model:          strings.Join(models, "/"),
 			Source:         "claude-code",
 			CaptureMethod:  "file-watcher",
 			ToolCalls:      toolCalls,
 			FileContext:    fileContext,
 			CapturedAt:     capturedAt,
-			PermissionMode: msg.PermissionMode,
+			PermissionMode: strings.Join(allPermModes, "/"),
 		})
 	}
 

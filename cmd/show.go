@@ -45,11 +45,14 @@ for a specific draft. Use the number shown by pcr add or pcr status.
 Examples:
   pcr show 22     # show draft #22 in full
   pcr show 1      # show the first draft`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing draft number\n\nUsage: pcr show <number>\nExample: pcr show 1")
+		}
 		n, err := strconv.Atoi(strings.TrimSpace(args[0]))
 		if err != nil || n < 1 {
-			return fmt.Errorf("invalid number %q — use the number from `pcr add` or `pcr status`", args[0])
+			return fmt.Errorf("invalid number %q — must be a positive integer", args[0])
 		}
 
 		ctx := resolveProjectContext()
@@ -162,14 +165,9 @@ Examples:
 			}
 		}
 
-		// Response — first 200 chars only (enough to see what the agent did).
 		if d.ResponseText != "" {
 			fmt.Fprintf(os.Stderr, "\n%s%sRESPONSE%s\n", bold, grn, rst)
-			resp := d.ResponseText
-			if len(resp) > 200 {
-				resp = resp[:200] + fmt.Sprintf("%s…%s", dim, rst)
-			}
-			fmt.Fprintf(os.Stderr, "%s\n", resp)
+			fmt.Fprintf(os.Stderr, "%s\n", d.ResponseText)
 		}
 
 		// Files in context (read by the agent but not necessarily changed).

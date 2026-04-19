@@ -301,33 +301,26 @@ func computeIncrementalDiffs(items []store.DraftRecord) map[string]string {
 		for i, data := range timeline {
 			var diff string
 			if i == 0 {
-				// First prompt: filter raw snapshot to tool-call files if available.
+				// First prompt: only show diff if the prompt actually touched tracked files.
 				if len(data.toolFiles) > 0 {
 					diff = filterDiffToFiles(data.gitDiff, data.toolFiles)
-				} else {
-					diff = data.gitDiff
 				}
+				// No tool files = prompt was read-only or pure analysis → no diff
 			} else {
 				prev := timeline[i-1]
-				if data.headSha != "" && prev.headSha != "" && data.headSha != prev.headSha {
+				if data.headSha != "" && prev.headSha != "" && data.headSha != prev.headSha && len(data.toolFiles) > 0 {
 					// HEAD advanced — show only committed changes for tool-call files.
-					args := []string{"-C", projectPath, "diff", prev.headSha + ".." + data.headSha}
-					if len(data.toolFiles) > 0 {
-						args = append(args, "--")
-						args = append(args, data.toolFiles...)
-					}
+					args := []string{"-C", projectPath, "diff", prev.headSha + ".." + data.headSha, "--"}
+					args = append(args, data.toolFiles...)
 					if out, err := exec.Command("git", args...).Output(); err == nil && len(out) > 0 {
 						diff = truncateDiff(string(out))
 					}
-				} else {
-					// Same HEAD — working-tree delta, scoped to tool-call files.
+				} else if len(data.toolFiles) > 0 {
+					// Same HEAD — working-tree delta, scoped to tool-call files only.
 					rawDelta := diffDelta(prev.gitDiff, data.gitDiff)
-					if len(data.toolFiles) > 0 {
-						diff = filterDiffToFiles(rawDelta, data.toolFiles)
-					} else {
-						diff = rawDelta
-					}
+					diff = filterDiffToFiles(rawDelta, data.toolFiles)
 				}
+				// No tool files = prompt didn't write anything → no diff
 			}
 
 			if diff == "" {
@@ -359,8 +352,20 @@ func computeIncrementalDiffs(items []store.DraftRecord) map[string]string {
 	return result
 }
 
-// tcFilesForProject returns relative file paths from tool calls that fall under
-// projectPath, deduped and in first-seen order.
+// writeToolNames is the set of tool names that produce file modifications.
+var writeToolNames = map[string]bool{
+	"write_file":                   true,
+	"create_file":                  true,
+	"edit_file":                    true,
+	"replace_string_in_file":       true,
+	"multi_replace_string_in_file": true,
+	"edit_notebook_file":           true,
+	"Write":                        true, // Claude Code
+	"Edit":                         true, // Claude Code
+}
+
+// tcFilesForProject returns relative file paths from write-oriented tool calls
+// that fall under projectPath, deduped and in first-seen order.
 func tcFilesForProject(toolCalls []map[string]any, projectPath string) []string {
 	if projectPath == "" || len(toolCalls) == 0 {
 		return nil
@@ -368,6 +373,10 @@ func tcFilesForProject(toolCalls []map[string]any, projectPath string) []string 
 	seen := map[string]bool{}
 	var files []string
 	for _, tc := range toolCalls {
+		tool, _ := tc["tool"].(string)
+		if !writeToolNames[tool] {
+			continue
+		}
 		abs := tcPath(tc)
 		if abs == "" || !strings.HasPrefix(abs, projectPath+"/") {
 			continue
