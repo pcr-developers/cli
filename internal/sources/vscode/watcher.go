@@ -241,14 +241,12 @@ func (w *Watcher) processFile(filePath string) {
 	for _, ex := range transcript.Exchanges {
 		hash := supabase.PromptContentHashV2(transcript.SessionID, ex.PromptText, ex.CapturedAt)
 		if w.dedup.IsDuplicate(transcript.SessionID, hash) {
-			_ = store.UpdateDraftResponse(transcript.SessionID, ex.PromptText, ex.ResponseText)
-			_ = store.UpdateDraftToolCalls(transcript.SessionID, ex.PromptText, ex.ToolCalls)
+			w.updateExistingDraft(transcript, ex, ws, projByPath, projByID)
 			continue
 		}
 		if store.IsDraftSavedAt(transcript.SessionID, ex.PromptText, ex.CapturedAt) {
 			w.dedup.Mark(transcript.SessionID, hash)
-			_ = store.UpdateDraftResponse(transcript.SessionID, ex.PromptText, ex.ResponseText)
-			_ = store.UpdateDraftToolCalls(transcript.SessionID, ex.PromptText, ex.ToolCalls)
+			w.updateExistingDraft(transcript, ex, ws, projByPath, projByID)
 			continue
 		}
 		w.dedup.Mark(transcript.SessionID, hash)
@@ -323,6 +321,47 @@ func (w *Watcher) processFile(filePath string) {
 			ToolCalls:     lastToolCalls,
 			ExchangeCount: newCount,
 		})
+	}
+}
+
+// updateExistingDraft enriches an already-saved draft with the latest response,
+// tool calls, file_context metadata, and git diff from the current parse.
+func (w *Watcher) updateExistingDraft(transcript ParsedTranscript, ex ParsedExchange, ws *WorkspaceMatch, projByPath map[string]int, projByID map[string]string) {
+	_ = store.UpdateDraftResponse(transcript.SessionID, ex.PromptText, ex.ResponseText)
+	_ = store.UpdateDraftToolCalls(transcript.SessionID, ex.PromptText, ex.ToolCalls)
+
+	// Merge file_context updates (duration, changed_files, etc.)
+	updates := map[string]any{}
+	if ex.DurationMs > 0 {
+		updates["response_duration_ms"] = ex.DurationMs
+	}
+	if ex.FirstResponseMs > 0 {
+		updates["first_response_ms"] = ex.FirstResponseMs
+	}
+	if len(ex.ChangedFiles) > 0 {
+		updates["changed_files"] = ex.ChangedFiles
+	}
+	if len(ex.RelevantFiles) > 0 {
+		updates["relevant_files"] = ex.RelevantFiles
+	}
+	if ex.ReasoningText != "" {
+		updates["reasoning_text"] = ex.ReasoningText
+	}
+	if len(ex.ToolCalls) > 0 {
+		updates["is_agentic"] = true
+	}
+	touchedIDs := shared.TouchedProjectIDs(ex.ToolCalls, projByID)
+	if len(touchedIDs) > 1 {
+		updates["touched_project_ids"] = touchedIDs
+	}
+	_ = store.MergeDraftFileContext(transcript.SessionID, ex.PromptText, updates)
+
+	// Update git diff if a project is now attributable
+	primary := w.projectForExchange(ex, ws.Projects, projByPath)
+	if primary != nil && primary.Path != "" {
+		gitDiff := shared.GetGitDiff(primary.Path)
+		headSha := shared.GetHeadSha(primary.Path)
+		_ = store.UpdateDraftGitDiff(transcript.SessionID, ex.PromptText, gitDiff, headSha)
 	}
 }
 
