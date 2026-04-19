@@ -117,7 +117,8 @@ func (w *Watcher) scheduleProcess(path string) {
 
 func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 	// Extract slug from ~/.claude/projects/<slug>/<session>.jsonl
-	parts := strings.Split(filePath, "/")
+	normalized := filepath.ToSlash(filePath)
+	parts := strings.Split(normalized, "/")
 	projectsIdx := -1
 	for i, p := range parts {
 		if p == "projects" {

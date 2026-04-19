@@ -3,6 +3,7 @@ package cursor
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"time"
 )
@@ -11,9 +12,21 @@ type Source struct{}
 
 func (s *Source) Name() string { return "Cursor" }
 
-func (s *Source) Start(userID string) {
+// cursorProjectsDir returns the platform-appropriate Cursor projects directory.
+func cursorProjectsDir() string {
 	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".cursor", "projects")
+	if runtime.GOOS == "windows" {
+		appData := os.Getenv("APPDATA")
+		if appData == "" {
+			appData = filepath.Join(home, "AppData", "Roaming")
+		}
+		return filepath.Join(appData, "Cursor", "projects")
+	}
+	return filepath.Join(home, ".cursor", "projects")
+}
+
+func (s *Source) Start(userID string) {
+	dir := cursorProjectsDir()
 
 	// DiffTracker: polls registered projects every 3s to record timestamped
 	// file-change events used for per-prompt attribution in agent turns.
@@ -35,8 +48,7 @@ func (s *Source) Start(userID string) {
 // files. Called by `pcr bundle` to capture any turns that haven't been picked
 // up by the background scanner yet.
 func ForceSync(userID string, maxFiles int) {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".cursor", "projects")
+	dir := cursorProjectsDir()
 
 	type entry struct {
 		path    string

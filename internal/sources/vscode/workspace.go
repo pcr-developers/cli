@@ -93,7 +93,12 @@ func uriToPath(uri string) string {
 	if err != nil {
 		return strings.TrimPrefix(uri, "file://")
 	}
-	return u.Path
+	p := u.Path
+	// On Windows url.Parse returns /C:/... — strip the leading slash.
+	if runtime.GOOS == "windows" && len(p) > 2 && p[0] == '/' && p[2] == ':' {
+		p = p[1:]
+	}
+	return p
 }
 
 // matchProjects returns all registered projects whose path is equal to or is a
@@ -108,7 +113,7 @@ func matchProjects(workspaceFolder string, allProjects []projects.Project) []pro
 		}
 		projPath := filepath.Clean(p.Path)
 		// Match if workspace IS the project, or workspace is an ancestor of the project
-		if projPath == workspaceFolder || strings.HasPrefix(projPath, workspaceFolder+"/") {
+		if projPath == workspaceFolder || strings.HasPrefix(projPath, workspaceFolder+string(filepath.Separator)) {
 			// Skip if the project path no longer exists on disk
 			if _, err := os.Stat(projPath); os.IsNotExist(err) {
 				continue
