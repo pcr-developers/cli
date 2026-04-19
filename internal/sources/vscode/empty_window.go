@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -165,9 +166,9 @@ func processJSONLSession(filePath, userID string, state *shared.FileState, dedup
 
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 
-	// Replay the mutation log to reconstruct the session state
-	var snapshot emptyWindowSnapshot
-	var modelName string
+	// Replay ALL mutations into a generic JSON tree so responses,
+	// new requests, and other property updates are not lost.
+	var tree any
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -181,29 +182,40 @@ func processJSONLSession(filePath, userID string, state *shared.FileState, dedup
 
 		switch entry.Kind {
 		case 0:
-			// Full snapshot
-			if err := json.Unmarshal(entry.Value, &snapshot); err != nil {
-				continue
-			}
-			if snapshot.InputState != nil && snapshot.InputState.SelectedModel != nil {
-				if snapshot.InputState.SelectedModel.Metadata != nil {
-					modelName = snapshot.InputState.SelectedModel.Metadata.Name
-				} else {
-					modelName = snapshot.InputState.SelectedModel.Identifier
-				}
+			// Full snapshot — replace entire tree
+			var val any
+			if err := json.Unmarshal(entry.Value, &val); err == nil {
+				tree = val
 			}
 		case 1:
-			// Property mutation
-			if len(entry.Key) >= 2 && entry.Key[0] == "inputState" && entry.Key[1] == "selectedModel" {
-				var model selectedModelInfo
-				if err := json.Unmarshal(entry.Value, &model); err == nil {
-					if model.Metadata != nil {
-						modelName = model.Metadata.Name
-					} else {
-						modelName = model.Identifier
-					}
-				}
+			// Property mutation — set value at key path
+			if tree != nil && len(entry.Key) > 0 {
+				tree = applyMutation(tree, entry.Key, entry.Value)
 			}
+		}
+	}
+
+	if tree == nil {
+		return
+	}
+
+	// Marshal reconstructed tree back to structured type
+	treeJSON, err := json.Marshal(tree)
+	if err != nil {
+		return
+	}
+
+	var snapshot emptyWindowSnapshot
+	if err := json.Unmarshal(treeJSON, &snapshot); err != nil {
+		return
+	}
+
+	var modelName string
+	if snapshot.InputState != nil && snapshot.InputState.SelectedModel != nil {
+		if snapshot.InputState.SelectedModel.Metadata != nil {
+			modelName = snapshot.InputState.SelectedModel.Metadata.Name
+		} else {
+			modelName = snapshot.InputState.SelectedModel.Identifier
 		}
 	}
 
@@ -212,6 +224,40 @@ func processJSONLSession(filePath, userID string, state *shared.FileState, dedup
 	}
 
 	saveEmptyWindowExchanges(snapshot.SessionID, snapshot.CreationDate, snapshot.Requests, modelName, "", userID, dedup)
+}
+
+// applyMutation sets a value at the given key path in a generic JSON tree.
+// Handles both map[string]any (objects) and []any (arrays).
+func applyMutation(root any, keys []string, rawValue json.RawMessage) any {
+	if len(keys) == 0 {
+		var val any
+		_ = json.Unmarshal(rawValue, &val)
+		return val
+	}
+
+	key := keys[0]
+	rest := keys[1:]
+
+	// Try to interpret key as array index
+	if idx, err := strconv.Atoi(key); err == nil && idx >= 0 {
+		arr, ok := root.([]any)
+		if !ok {
+			arr = []any{}
+		}
+		for len(arr) <= idx {
+			arr = append(arr, nil)
+		}
+		arr[idx] = applyMutation(arr[idx], rest, rawValue)
+		return arr
+	}
+
+	// Object key
+	m, ok := root.(map[string]any)
+	if !ok {
+		m = map[string]any{}
+	}
+	m[key] = applyMutation(m[key], rest, rawValue)
+	return m
 }
 
 // saveEmptyWindowExchanges converts request/response pairs into drafts.

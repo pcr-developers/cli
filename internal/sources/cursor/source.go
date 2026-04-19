@@ -3,7 +3,6 @@ package cursor
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"time"
 )
@@ -12,16 +11,9 @@ type Source struct{}
 
 func (s *Source) Name() string { return "Cursor" }
 
-// cursorProjectsDir returns the platform-appropriate Cursor projects directory.
+// cursorProjectsDir returns the Cursor projects directory.
 func cursorProjectsDir() string {
 	home, _ := os.UserHomeDir()
-	if runtime.GOOS == "windows" {
-		appData := os.Getenv("APPDATA")
-		if appData == "" {
-			appData = filepath.Join(home, "AppData", "Roaming")
-		}
-		return filepath.Join(appData, "Cursor", "projects")
-	}
 	return filepath.Join(home, ".cursor", "projects")
 }
 
