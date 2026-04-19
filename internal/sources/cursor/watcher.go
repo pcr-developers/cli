@@ -453,13 +453,14 @@ func (s *PromptScanner) watchFSNotify() {
 // ─── Path helpers ─────────────────────────────────────────────────────────────
 
 func isAgentTranscript(path string) bool {
-	return strings.HasSuffix(path, ".jsonl") &&
-		strings.Contains(path, "/agent-transcripts/") &&
-		!strings.Contains(path, "/subagents/")
+	normalized := filepath.ToSlash(path)
+	return strings.HasSuffix(normalized, ".jsonl") &&
+		strings.Contains(normalized, "/agent-transcripts/") &&
+		!strings.Contains(normalized, "/subagents/")
 }
 
 func parseTranscriptPath(filePath string) (projectSlug, sessionUUID string, ok bool) {
-	parts := strings.Split(filePath, "/")
+	parts := strings.Split(filepath.ToSlash(filePath), "/")
 	for i, p := range parts {
 		if p == "agent-transcripts" && i >= 1 {
 			projectSlug = parts[i-1]
