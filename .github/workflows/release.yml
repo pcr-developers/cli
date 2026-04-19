@@ -24,6 +24,9 @@ jobs:
           - goos: linux
             goarch: amd64
             target: pcr-linux-x64
+          - goos: windows
+            goarch: amd64
+            target: pcr-windows-x64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -81,6 +84,8 @@ jobs:
             artifacts/pcr-macos-x64/pcr-macos-x64.sha256
             artifacts/pcr-linux-x64/pcr-linux-x64
             artifacts/pcr-linux-x64/pcr-linux-x64.sha256
+            artifacts/pcr-windows-x64.exe/pcr-windows-x64.exe
+            artifacts/pcr-windows-x64.exe/pcr-windows-x64.exe.sha256
           generate_release_notes: true
 
   # ─────────────────────────────────────────────

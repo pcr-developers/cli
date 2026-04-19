@@ -23,12 +23,14 @@ const PLATFORM_MAP = {
   "darwin-arm64": "pcr-macos-arm64",
   "darwin-x64": "pcr-macos-x64",
   "linux-x64": "pcr-linux-x64",
+  "win32-x64": "pcr-windows-x64.exe",
 };
 
 const platform = os.platform(); // "darwin" | "linux" | "win32"
 const arch = os.arch();         // "arm64" | "x64"
 const key = `${platform}-${arch}`;
 const binaryName = PLATFORM_MAP[key];
+const isWindows = platform === "win32";
 
 if (!binaryName) {
   console.warn(
@@ -42,7 +44,7 @@ const downloadURL =
   `https://github.com/${REPO}/releases/download/v${VERSION}/${binaryName}`;
 
 const libDir = path.join(__dirname, "..", "lib");
-const destPath = path.join(libDir, "pcr-bin");
+const destPath = path.join(libDir, isWindows ? "pcr-bin.exe" : "pcr-bin");
 
 if (!fs.existsSync(libDir)) {
   fs.mkdirSync(libDir, { recursive: true });
