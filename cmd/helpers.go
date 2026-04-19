@@ -212,3 +212,16 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// toFloat64 coerces a JSON-decoded numeric value to float64.
+func toFloat64(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	}
+	return 0
+}

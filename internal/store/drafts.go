@@ -430,6 +430,9 @@ func GetDraftsByStatus(status DraftStatus, projectIDs, projectNames []string) ([
 		args = append(args, name)
 	}
 	if len(clauses) > 0 {
+		// Also include drafts with no project attribution (e.g. VS Code
+		// exchanges that didn't touch any registered project's files).
+		clauses = append(clauses, "(COALESCE(project_id, '') = '' AND COALESCE(project_name, '') = '')")
 		where += " AND (" + strings.Join(clauses, " OR ") + ")"
 	}
 

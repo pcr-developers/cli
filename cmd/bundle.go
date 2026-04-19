@@ -125,8 +125,8 @@ func repoBadge(d store.DraftRecord, projByID map[string]string) string {
 func filterWithChangedFiles(drafts []store.DraftRecord) []store.DraftRecord {
 	var out []store.DraftRecord
 	for _, d := range drafts {
-		// Claude Code drafts are never filtered by changed_files.
-		if d.Source == "claude-code" {
+		// Claude Code and VS Code drafts are never filtered by changed_files.
+		if d.Source == "claude-code" || d.Source == "vscode" {
 			out = append(out, d)
 			continue
 		}

@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pcr-developers/cli/internal/sources/shared"
+
 	"github.com/pcr-developers/cli/internal/config"
 	"github.com/pcr-developers/cli/internal/display"
 	"github.com/pcr-developers/cli/internal/projects"
@@ -171,7 +173,7 @@ func (t *diffTracker) getDirtyHashes(projectPath string) map[string]string {
 	}
 
 	result := map[string]string{}
-	for _, line := range filterNonEmpty(strings.Split(string(out), "\n")) {
+	for _, line := range shared.FilterNonEmpty(strings.Split(string(out), "\n")) {
 		if len(line) < 4 {
 			continue
 		}

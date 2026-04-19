@@ -3,7 +3,6 @@ package cursor
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +11,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/pcr-developers/cli/internal/display"
 	"github.com/pcr-developers/cli/internal/projects"
+	"github.com/pcr-developers/cli/internal/sources/shared"
 	"github.com/pcr-developers/cli/internal/store"
 	"github.com/pcr-developers/cli/internal/supabase"
 	"github.com/pcr-developers/cli/internal/versions"
@@ -308,7 +308,7 @@ func (s *PromptScanner) saveCompletedTurn(
 	if proj.Path != "" {
 		fullSession := GetFullSessionData(sessionID)
 		if fullSession != nil {
-			commitShas = getCommitRange(proj.Path, fullSession.SessionCreatedAt, fullSession.SessionUpdatedAt)
+			commitShas = shared.GetCommitRange(proj.Path, fullSession.SessionCreatedAt, fullSession.SessionUpdatedAt)
 
 			if s.userID != "" {
 				var startSha, endSha string
@@ -339,7 +339,7 @@ func (s *PromptScanner) saveCompletedTurn(
 				}, proj.ProjectID, s.userID)
 			}
 		}
-		gitDiff = getGitDiff(proj.Path)
+		gitDiff = shared.GetGitDiff(proj.Path)
 	}
 
 	// ── Save ───────────────────────────────────────────────────────────────
@@ -549,52 +549,6 @@ func extractChangedFiles(events []store.DiffEvent, primaryProjectID string, touc
 		}
 	}
 	return files
-}
-
-// ─── Git helpers ──────────────────────────────────────────────────────────────
-
-func getGitDiff(projectPath string) string {
-	if projectPath == "" {
-		return ""
-	}
-	cmd := exec.Command("git", "diff", "HEAD")
-	cmd.Dir = projectPath
-	out, err := cmd.Output()
-	if err != nil || len(out) == 0 {
-		return ""
-	}
-	const maxBytes = 50_000
-	if len(out) > maxBytes {
-		return string(out[:maxBytes]) + "\n[truncated]"
-	}
-	return string(out)
-}
-
-func getCommitRange(projectPath string, since, until *int64) []string {
-	args := []string{"log", "--format=%H", "--no-merges"}
-	if since != nil {
-		args = append(args, "--after="+time.UnixMilli(*since).UTC().Format(time.RFC3339))
-	}
-	if until != nil {
-		args = append(args, "--before="+time.UnixMilli(*until).UTC().Format(time.RFC3339))
-	}
-	cmd := exec.Command("git", args...)
-	cmd.Dir = projectPath
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	return filterNonEmpty(strings.Split(strings.TrimSpace(string(out)), "\n"))
-}
-
-func filterNonEmpty(lines []string) []string {
-	var result []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) != "" {
-			result = append(result, l)
-		}
-	}
-	return result
 }
 
 func truncate(s string, n int) string {

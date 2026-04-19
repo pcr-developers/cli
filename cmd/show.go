@@ -111,6 +111,16 @@ Examples:
 		if mode := draftCursorMode(d); mode != "" {
 			meta = append(meta, mode)
 		}
+		if d.Source == "vscode" {
+			if fc := d.FileContext; fc != nil {
+				if dur, ok := fc["response_duration_ms"]; ok {
+					meta = append(meta, fmt.Sprintf("%.1fs", toFloat64(dur)/1000))
+				}
+				if v, ok := fc["copilot_version"]; ok {
+					meta = append(meta, fmt.Sprintf("copilot:%v", v))
+				}
+			}
+		}
 		if d.Model != "" {
 			meta = append(meta, d.Model)
 		}
