@@ -1,2 +1,12 @@
-#!/bin/sh
-exec "$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)/../lib/pcr-bin" "$@"
+#!/usr/bin/env node
+const { spawn } = require("child_process");
+const path = require("path");
+
+const ext = process.platform === "win32" ? ".exe" : "";
+const bin = path.join(__dirname, "..", "lib", "pcr-bin" + ext);
+const child = spawn(bin, process.argv.slice(2), { stdio: "inherit" });
+
+child.on("exit", (code, signal) => {
+  if (signal) { process.kill(process.pid, signal); }
+  else { process.exit(code ?? 1); }
+});

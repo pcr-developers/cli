@@ -106,14 +106,22 @@ func uriToPath(uri string) string {
 // longer exists on disk.
 func matchProjects(workspaceFolder string, allProjects []projects.Project) []projects.Project {
 	workspaceFolder = filepath.Clean(workspaceFolder)
+	// On Windows, drive letters may differ in case (c: vs C:).
+	if runtime.GOOS == "windows" {
+		workspaceFolder = strings.ToLower(workspaceFolder)
+	}
 	var matched []projects.Project
 	for _, p := range allProjects {
 		if p.Path == "" {
 			continue
 		}
 		projPath := filepath.Clean(p.Path)
+		cmpPath := projPath
+		if runtime.GOOS == "windows" {
+			cmpPath = strings.ToLower(projPath)
+		}
 		// Match if workspace IS the project, or workspace is an ancestor of the project
-		if projPath == workspaceFolder || strings.HasPrefix(projPath, workspaceFolder+string(filepath.Separator)) {
+		if cmpPath == workspaceFolder || strings.HasPrefix(cmpPath, workspaceFolder+string(filepath.Separator)) {
 			// Skip if the project path no longer exists on disk
 			if _, err := os.Stat(projPath); os.IsNotExist(err) {
 				continue
