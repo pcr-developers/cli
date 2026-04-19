@@ -27,7 +27,7 @@ func Open() *sql.DB {
 		path := dbPath()
 		_ = os.MkdirAll(filepath.Dir(path), 0755)
 		var err error
-		db, err = sql.Open("sqlite", path+"?_journal=WAL&_timeout=5000")
+		db, err = sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 		if err != nil {
 			panic("pcr: failed to open draft store: " + err.Error())
 		}

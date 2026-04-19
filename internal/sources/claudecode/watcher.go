@@ -300,7 +300,6 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			}
 			continue
 		}
-		w.dedup.Mark(p.SessionID, hash)
 
 		merged := map[string]any{}
 		for k, v := range baseFileContext {
@@ -334,7 +333,10 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		}
 		if err := store.SaveDraft(*p, gd.commitShas, gd.gitDiff, gd.headSha); err != nil {
 			display.PrintError("claude-code", "Failed to save draft: "+err.Error())
+			continue
 		}
+		hash := supabase.PromptContentHashV2(p.SessionID, p.PromptText, p.CapturedAt)
+		w.dedup.Mark(p.SessionID, hash)
 	}
 
 	last := newPrompts[len(newPrompts)-1]

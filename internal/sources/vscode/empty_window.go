@@ -291,7 +291,6 @@ func saveEmptyWindowExchanges(sessionID string, creationDateMs int64, requests [
 			dedup.Mark(sessionID, hash)
 			continue
 		}
-		dedup.Mark(sessionID, hash)
 
 		fileContext := map[string]any{
 			"capture_schema": versions.CaptureSchemaVersion,
@@ -322,6 +321,7 @@ func saveEmptyWindowExchanges(sessionID string, creationDateMs int64, requests [
 			display.PrintError("vscode", fmt.Sprintf("Failed to save empty-window draft: %s", err.Error()))
 			continue
 		}
+		dedup.Mark(sessionID, hash)
 		newCount++
 	}
 

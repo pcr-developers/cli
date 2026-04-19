@@ -249,7 +249,6 @@ func (w *Watcher) processFile(filePath string) {
 			w.updateExistingDraft(transcript, ex, ws, projByPath, projByID)
 			continue
 		}
-		w.dedup.Mark(transcript.SessionID, hash)
 
 		// Determine the primary project for THIS exchange based on tool calls.
 		// Returns nil if no tool calls match any registered project.
@@ -295,6 +294,7 @@ func (w *Watcher) processFile(filePath string) {
 			display.PrintError("vscode", "Failed to save draft: "+err.Error())
 			continue
 		}
+		w.dedup.Mark(transcript.SessionID, hash)
 		newCount++
 		lastName = projName
 		lastPrompt = ex.PromptText
