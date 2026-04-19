@@ -152,15 +152,15 @@ func filterWithChangedFiles(drafts []store.DraftRecord) []store.DraftRecord {
 	return out
 }
 
-// draftCursorMode returns the cursor_mode stored in a draft's file_context.
+// draftMode returns the display mode for a draft — cursor_mode for Cursor,
+// permission_mode for Claude Code.
 func draftCursorMode(d store.DraftRecord) string {
-	if d.FileContext == nil {
-		return ""
+	if d.FileContext != nil {
+		if v, ok := d.FileContext["cursor_mode"].(string); ok && v != "" {
+			return v
+		}
 	}
-	if v, ok := d.FileContext["cursor_mode"].(string); ok {
-		return v
-	}
-	return ""
+	return d.PermissionMode
 }
 
 // getAvailableDrafts returns the filtered draft pool for the current context.

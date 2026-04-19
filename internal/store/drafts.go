@@ -398,16 +398,33 @@ func GetBundledDraftIDsForProject(projectID string) (map[string]bool, error) {
 	return ids, rows.Close()
 }
 
-// UpdateDraftResponse updates response_text for an existing draft, always
-// overwriting with the latest (longest) response.
+// UpdateDraftPermissionMode sets permission_mode on an existing draft if the new value is non-empty.
+// Used to backfill mode for drafts captured before the carry-forward logic was in place.
+func UpdateDraftPermissionMode(sessionID, promptText, mode string) error {
+	if mode == "" {
+		return nil
+	}
+	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
+	_, err := db.Exec(
+		"UPDATE drafts SET permission_mode = ? WHERE content_hash = ? AND (permission_mode IS NULL OR permission_mode = '')",
+		mode, hash,
+	)
+	return err
+}
+
+// UpdateDraftResponse updates the response_text for an existing draft, but only
+// if the new text is longer than what's already stored. This ensures partial
+// responses captured mid-turn get replaced once the full response is available.
 func UpdateDraftResponse(sessionID, promptText, responseText string) error {
 	if responseText == "" {
 		return nil
 	}
 	db := Open()
+	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	_, err := db.Exec(
-		"UPDATE drafts SET response_text = ? WHERE session_id = ? AND prompt_text = ? AND status = 'draft' AND (response_text IS NULL OR LENGTH(response_text) < LENGTH(?))",
-		responseText, sessionID, promptText, responseText,
+		"UPDATE drafts SET response_text = ? WHERE content_hash = ? AND length(COALESCE(response_text,'')) < length(?)",
+		responseText, hash, responseText,
 	)
 	return err
 }

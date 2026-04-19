@@ -114,7 +114,7 @@ func parseSelectionIndices(input string, max int) []int {
 	seen := map[int]bool{}
 	var result []int
 	for _, part := range strings.Split(input, ",") {
-		t := strings.TrimSpace(part)
+		t := strings.ReplaceAll(strings.TrimSpace(part), " ", "")
 		if idx := strings.Index(t, "-"); idx > 0 {
 			from, errA := strconv.Atoi(t[:idx])
 			to, errB := strconv.Atoi(t[idx+1:])
