@@ -398,17 +398,16 @@ func GetBundledDraftIDsForProject(projectID string) (map[string]bool, error) {
 	return ids, rows.Close()
 }
 
-// UpdateDraftResponse fills in response_text for an existing draft that has none.
-// Uses exact content hash match.
+// UpdateDraftResponse updates response_text for an existing draft, always
+// overwriting with the latest (longest) response.
 func UpdateDraftResponse(sessionID, promptText, responseText string) error {
 	if responseText == "" {
 		return nil
 	}
 	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	_, err := db.Exec(
-		"UPDATE drafts SET response_text = ? WHERE content_hash = ? AND (response_text IS NULL OR response_text = '')",
-		responseText, hash,
+		"UPDATE drafts SET response_text = ? WHERE session_id = ? AND prompt_text = ? AND status = 'draft' AND (response_text IS NULL OR LENGTH(response_text) < LENGTH(?))",
+		responseText, sessionID, promptText, responseText,
 	)
 	return err
 }
@@ -667,11 +666,10 @@ func UpdateDraftToolCalls(sessionID, promptText string, toolCalls []map[string]a
 		return nil
 	}
 	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	b, _ := json.Marshal(toolCalls)
 	_, err := db.Exec(
-		"UPDATE drafts SET tool_calls = ? WHERE content_hash = ? AND status = 'draft'",
-		string(b), hash,
+		"UPDATE drafts SET tool_calls = ? WHERE session_id = ? AND prompt_text = ? AND status = 'draft'",
+		string(b), sessionID, promptText,
 	)
 	return err
 }
@@ -681,11 +679,10 @@ func MergeDraftFileContext(sessionID, promptText string, updates map[string]any)
 		return nil
 	}
 	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	var fcJSON *string
 	if err := db.QueryRow(
-		"SELECT file_context FROM drafts WHERE content_hash = ? AND status = 'draft'",
-		hash,
+		"SELECT file_context FROM drafts WHERE session_id = ? AND prompt_text = ? AND status = 'draft'",
+		sessionID, promptText,
 	).Scan(&fcJSON); err != nil {
 		return nil
 	}
@@ -698,8 +695,8 @@ func MergeDraftFileContext(sessionID, promptText string, updates map[string]any)
 	}
 	b, _ := json.Marshal(current)
 	_, err := db.Exec(
-		"UPDATE drafts SET file_context = ? WHERE content_hash = ? AND status = 'draft'",
-		string(b), hash,
+		"UPDATE drafts SET file_context = ? WHERE session_id = ? AND prompt_text = ? AND status = 'draft'",
+		string(b), sessionID, promptText,
 	)
 	return err
 }
@@ -709,10 +706,9 @@ func UpdateDraftGitDiff(sessionID, promptText, gitDiff, headSha string) error {
 		return nil
 	}
 	db := Open()
-	hash := supabase.PromptContentHash(sessionID, promptText, "")
 	_, err := db.Exec(
-		"UPDATE drafts SET git_diff = ?, head_sha = COALESCE(NULLIF(head_sha,''), ?) WHERE content_hash = ? AND status = 'draft' AND (git_diff IS NULL OR git_diff = '')",
-		gitDiff, headSha, hash,
+		"UPDATE drafts SET git_diff = ?, head_sha = COALESCE(NULLIF(head_sha,''), ?) WHERE session_id = ? AND prompt_text = ? AND status = 'draft' AND (git_diff IS NULL OR git_diff = '')",
+		gitDiff, headSha, sessionID, promptText,
 	)
 	return err
 }
