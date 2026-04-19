@@ -1,9 +1,7 @@
 package claudecode
 
 import (
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -69,11 +67,12 @@ func (w *Watcher) Start() {
 			if err != nil {
 				return nil
 			}
-			lines := filterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
+			lines := shared.FilterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
 			w.state.Set(path, len(lines))
 		}
 		return nil
 	})
+
 
 	for {
 		select {
@@ -141,7 +140,7 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		return
 	}
 
-	lines := filterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
+	lines := shared.FilterNonEmpty(strings.Split(strings.TrimSpace(string(content)), "\n"))
 	prevCount := w.state.Get(filePath)
 
 	if !forceFullScan && len(lines) <= prevCount {
@@ -182,11 +181,11 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 			return d
 		}
 		d := &projectGitData{
-			gitDiff: getGitDiff(proj.Path),
-			headSha: getHeadSha(proj.Path),
+			gitDiff: shared.GetGitDiff(proj.Path),
+			headSha: shared.GetHeadSha(proj.Path),
 		}
 		if proj.Path != "" && session.SessionCreatedAt != "" {
-			d.commitShas = getCommitsSince(proj.Path, session.SessionCreatedAt)
+			d.commitShas = shared.GetCommitsSince(proj.Path, session.SessionCreatedAt)
 		}
 		gitCache[proj.Path] = d
 		return d
@@ -355,94 +354,4 @@ func (w *Watcher) processFile(filePath string, forceFullScan bool) {
 		})
 	}
 
-}
-
-func getHeadSha(projectPath string) string {
-	if projectPath == "" {
-		return ""
-	}
-	out, err := exec.Command("git", "-C", projectPath, "rev-parse", "HEAD").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
-func getGitDiff(projectPath string) string {
-	if projectPath == "" {
-		return ""
-	}
-	cmd := exec.Command("git", "diff", "HEAD")
-	cmd.Dir = projectPath
-	tracked, _ := cmd.Output()
-
-	untracked := untrackedDiff(projectPath)
-
-	combined := string(tracked) + untracked
-	if combined == "" {
-		return ""
-	}
-	const maxBytes = 50_000
-	if len(combined) > maxBytes {
-		return combined[:maxBytes] + "\n[truncated]"
-	}
-	return combined
-}
-
-// untrackedDiff generates a unified-diff representation of untracked new files
-// so they appear alongside tracked modifications in the captured diff.
-func untrackedDiff(projectPath string) string {
-	out, err := exec.Command("git", "-C", projectPath, "status", "--porcelain").Output()
-	if err != nil || len(out) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for _, line := range strings.Split(string(out), "\n") {
-		if len(line) < 4 || line[:2] != "??" {
-			continue
-		}
-		rel := strings.TrimSpace(line[3:])
-		if rel == "" || strings.HasSuffix(rel, "/") {
-			continue
-		}
-		content, err := os.ReadFile(filepath.Join(projectPath, rel))
-		if err != nil {
-			continue
-		}
-		// Skip binary files (null byte present in first 8 KB).
-		check := content
-		if len(check) > 8192 {
-			check = check[:8192]
-		}
-		if strings.ContainsRune(string(check), 0) {
-			continue
-		}
-		lines := strings.Split(strings.TrimRight(string(content), "\n"), "\n")
-		fmt.Fprintf(&sb, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1,%d @@\n",
-			rel, rel, rel, len(lines))
-		for _, l := range lines {
-			fmt.Fprintf(&sb, "+%s\n", l)
-		}
-	}
-	return sb.String()
-}
-
-func getCommitsSince(projectPath, sinceISO string) []string {
-	cmd := exec.Command("git", "log", "--format=%H", `--after=`+sinceISO)
-	cmd.Dir = projectPath
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	return filterNonEmpty(strings.Split(strings.TrimSpace(string(out)), "\n"))
-}
-
-func filterNonEmpty(lines []string) []string {
-	var result []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) != "" {
-			result = append(result, l)
-		}
-	}
-	return result
 }
