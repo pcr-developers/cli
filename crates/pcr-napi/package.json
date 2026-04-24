@@ -1,7 +1,7 @@
 {
   "name": "pcr-dev",
-  "version": "0.2.0",
-  "description": "PCR.dev CLI — capture AI coding prompts for peer review",
+  "version": "0.2.1",
+  "description": "PCR.dev CLI \u2014 capture AI coding prompts for peer review",
   "license": "Apache-2.0",
   "author": "PCR.dev",
   "homepage": "https://pcr.dev",
@@ -51,10 +51,10 @@
     }
   },
   "optionalDependencies": {
-    "pcr-dev-darwin-x64": "0.2.0",
-    "pcr-dev-darwin-arm64": "0.2.0",
-    "pcr-dev-linux-x64-gnu": "0.2.0",
-    "pcr-dev-win32-x64-msvc": "0.2.0"
+    "pcr-dev-darwin-x64": "0.2.1",
+    "pcr-dev-darwin-arm64": "0.2.1",
+    "pcr-dev-linux-x64-gnu": "0.2.1",
+    "pcr-dev-windows-x64": "0.2.1"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4"
