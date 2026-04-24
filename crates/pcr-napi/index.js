@@ -12,18 +12,6 @@ function load(triple) {
   return require(`@pcr-dev/${triple}`);
 }
 
-function isMusl() {
-  try {
-    const report = process.report && process.report.getReport();
-    if (report && report.header && report.header.glibcVersionRuntime == null) return true;
-  } catch (_) {}
-  try {
-    const { familySync } = require("detect-libc");
-    return familySync() === "musl";
-  } catch (_) {}
-  return false;
-}
-
 let addon;
 
 switch (platform) {
@@ -32,15 +20,10 @@ switch (platform) {
     else if (arch === "arm64") addon = load("darwin-arm64");
     break;
   case "linux":
-    if (arch === "x64") {
-      addon = load(isMusl() ? "linux-x64-musl" : "linux-x64-gnu");
-    } else if (arch === "arm64") {
-      addon = load("linux-arm64-gnu");
-    }
+    if (arch === "x64") addon = load("linux-x64-gnu");
     break;
   case "win32":
     if (arch === "x64") addon = load("win32-x64-msvc");
-    else if (arch === "arm64") addon = load("win32-arm64-msvc");
     break;
 }
 
