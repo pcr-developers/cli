@@ -9,7 +9,7 @@
 const { platform, arch } = process;
 
 function load(triple) {
-  return require(`@pcr-dev/${triple}`);
+  return require(`pcr-dev-${triple}`);
 }
 
 let addon;

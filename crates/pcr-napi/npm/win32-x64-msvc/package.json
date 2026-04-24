@@ -1,5 +1,5 @@
 {
-  "name": "@pcr-dev/win32-x64-msvc",
+  "name": "pcr-dev-win32-x64-msvc",
   "version": "0.2.0",
   "description": "PCR.dev CLI prebuilt binary for Windows x64",
   "license": "Apache-2.0",
