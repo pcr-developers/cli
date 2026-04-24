@@ -3,12 +3,25 @@
   "version": "0.2.0",
   "description": "PCR.dev CLI prebuilt binary for Linux x64 (glibc)",
   "license": "Apache-2.0",
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "libc": ["glibc"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
   "main": "pcr.linux-x64-gnu.node",
-  "files": ["pcr.linux-x64-gnu.node"],
+  "files": [
+    "pcr.linux-x64-gnu.node"
+  ],
   "engines": {
     "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pcr-developers/cli.git",
+    "directory": "crates/pcr-napi/npm/linux-x64-gnu"
   }
 }
