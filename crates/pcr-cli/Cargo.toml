@@ -1,0 +1,22 @@
+[package]
+name = "pcr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "PCR.dev CLI — native binary entry point (Homebrew / GitHub Release)."
+
+[[bin]]
+name = "pcr"
+path = "src/main.rs"
+
+[dependencies]
+pcr-core = { path = "../pcr-core" }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.10"
+serde_json = { workspace = true }

@@ -1,0 +1,13 @@
+{
+  "name": "@pcr-dev/darwin-arm64",
+  "version": "0.2.0",
+  "description": "PCR.dev CLI prebuilt binary for macOS arm64",
+  "license": "Apache-2.0",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "main": "pcr.darwin-arm64.node",
+  "files": ["pcr.darwin-arm64.node"],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

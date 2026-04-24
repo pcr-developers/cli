@@ -1,0 +1,44 @@
+[package]
+name = "pcr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "PCR.dev CLI core library — commands, store, sources, and TUI shared between binary and napi builds."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+owo-colors = { workspace = true }
+indicatif = { workspace = true }
+is-terminal = { workspace = true }
+inquire = { workspace = true }
+reqwest = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+serde_yaml = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+webbrowser = { workspace = true }
+ctrlc = { workspace = true }
+shell-words = { workspace = true }
+once_cell = { workspace = true }
+regex = { workspace = true }
+urlencoding = { workspace = true }
+walkdir = { workspace = true }
+humantime = { workspace = true }

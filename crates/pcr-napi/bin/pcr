@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Entry shim invoked by `npm bin` / `pcr`. Loads the platform-specific
+// `.node` addon from the optional subpackage npm resolved for this host
+// and calls its `run(argv)` export. The Rust code executes inside this
+// Node process, so Windows AppLocker never sees a second CreateProcess.
+
+const { run } = require("../index.js");
+process.exit(run(process.argv));
