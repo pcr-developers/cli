@@ -23,7 +23,7 @@ switch (platform) {
     if (arch === "x64") addon = load("linux-x64-gnu");
     break;
   case "win32":
-    if (arch === "x64") addon = load("win32-x64-msvc");
+    if (arch === "x64") addon = load("windows-x64");
     break;
 }
 

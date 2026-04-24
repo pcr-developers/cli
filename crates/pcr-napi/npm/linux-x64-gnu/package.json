@@ -1,6 +1,6 @@
 {
   "name": "pcr-dev-linux-x64-gnu",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "PCR.dev CLI prebuilt binary for Linux x64 (glibc)",
   "license": "Apache-2.0",
   "os": [
