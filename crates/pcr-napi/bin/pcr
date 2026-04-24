@@ -4,5 +4,8 @@
 // and calls its `run(argv)` export. The Rust code executes inside this
 // Node process, so Windows AppLocker never sees a second CreateProcess.
 
+// Node sets process.argv to [nodeBinary, scriptPath, ...userArgs]. The
+// Rust side uses clap which expects [programName, ...userArgs], so we
+// re-prepend "pcr" and pass only the user-supplied tail.
 const { run } = require("../index.js");
-process.exit(run(process.argv));
+process.exit(run(["pcr", ...process.argv.slice(2)]));

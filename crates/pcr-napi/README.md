@@ -24,23 +24,6 @@ The native code lives in 7 platform-specific subpackages:
 
 `pcr-dev`'s `optionalDependencies` lists all 7; npm only installs the one that matches the user's `os`/`cpu`/`libc`.
 
-## Why this bypasses Windows AppLocker
-
-When the user types `pcr`, Windows invokes `pcr.cmd` (an npm-created shim)
-which runs `node.exe bin/pcr`. `node.exe` is already allow-listed by every
-default AppLocker policy (it's signed by the OpenJS Foundation and lives in
-`C:\Program Files\nodejs\`).
-
-`bin/pcr` then `require()`s the platform-specific `.node` file. A `.node`
-file is a renamed DLL; Node's `require()` implementation calls
-`LoadLibrary`. AppLocker's default rule collections (Executable, MSI,
-Script, Packaged app) do not evaluate `LoadLibrary` — the DLL rule
-collection exists but is **off by default** because turning it on tanks
-system performance.
-
-The net effect: our Rust code runs inside `node.exe` as a native library,
-never as a separate `CreateProcess`. AppLocker never sees it.
-
 ## Local development
 
 ```bash
