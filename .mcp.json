@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "pcr": {
-      "command": "/Users/dfeng21/Desktop/pcr-developers/cli/pcr",
-      "args": ["mcp"]
-    }
-  }
-}

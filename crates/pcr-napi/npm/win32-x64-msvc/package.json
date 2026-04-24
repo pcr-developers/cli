@@ -1,0 +1,13 @@
+{
+  "name": "@pcr-dev/win32-x64-msvc",
+  "version": "0.2.0",
+  "description": "PCR.dev CLI prebuilt binary for Windows x64",
+  "license": "Apache-2.0",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "main": "pcr.win32-x64-msvc.node",
+  "files": ["pcr.win32-x64-msvc.node"],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

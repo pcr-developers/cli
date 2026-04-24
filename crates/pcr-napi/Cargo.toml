@@ -1,0 +1,20 @@
+[package]
+name = "pcr-napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "PCR.dev CLI napi-rs bridge — loaded by node.exe via require() to bypass Windows AppLocker."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pcr-core = { path = "../pcr-core" }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }

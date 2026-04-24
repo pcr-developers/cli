@@ -1,4 +1,13 @@
-pcr
-node_modules/
-dist/
+# Rust build
+/target
+Cargo.lock
+
+# napi-rs build artifacts (.node binaries and node_modules are built in CI)
+/crates/pcr-napi/npm/*/pcr*.node
+/crates/pcr-napi/npm/*/node_modules
+/crates/pcr-napi/*.node
+/crates/pcr-napi/node_modules
+
+# Dev leftovers
 *.log
+.DS_Store

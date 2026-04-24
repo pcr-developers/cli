@@ -5,102 +5,171 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C strip=symbols"
+
 jobs:
-  # ─────────────────────────────────────────────
-  # 1. Build Go binaries (all targets, one runner)
-  # ─────────────────────────────────────────────
-  binaries:
-    name: Build binaries
+  # ─────────────────────────────────────────────────────────────────────
+  # 1. Lint + test — always, even on tag push.
+  # ─────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & test
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 2. Build per-target standalone binaries (Homebrew + GitHub Release).
+  # ─────────────────────────────────────────────────────────────────────
+  binaries:
+    name: Build ${{ matrix.asset }}
+    needs: lint
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - goos: darwin
-            goarch: arm64
-            target: pcr-macos-arm64
-          - goos: darwin
-            goarch: amd64
-            target: pcr-macos-x64
-          - goos: linux
-            goarch: amd64
-            target: pcr-linux-x64
-          - goos: windows
-            goarch: amd64
-            target: pcr-windows-x64.exe
+          - asset: pcr-macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            ext: ""
+            cross: false
+          - asset: pcr-macos-x64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            ext: ""
+            cross: false
+          - asset: pcr-linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            cross: false
+          - asset: pcr-linux-x64-musl
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ""
+            cross: true
+          - asset: pcr-linux-arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            ext: ""
+            cross: true
+          - asset: pcr-windows-x64.exe
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+            cross: false
+          - asset: pcr-windows-arm64.exe
+            runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            ext: ".exe"
+            cross: false
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: "1.22"
-          cache: true
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for musl / arm64 linux)
+        if: matrix.cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          key: ${{ matrix.target }}
 
       - name: Build
+        shell: bash
+        env:
+          PCR_VERSION: ${{ github.ref_name }}
+          PCR_BUILD_TIME: ${{ github.run_id }}
         run: |
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-          go build \
-            -ldflags="-s -w -X main.Version=${GITHUB_REF_NAME#v}" \
-            -o ${{ matrix.target }} \
-            .
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release -p pcr-cli --target ${{ matrix.target }}
+          else
+            cargo build --release -p pcr-cli --target ${{ matrix.target }}
+          fi
+          mv target/${{ matrix.target }}/release/pcr${{ matrix.ext }} ${{ matrix.asset }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.target }}
-          path: ${{ matrix.target }}
-
-  # ─────────────────────────────────────────────
-  # 2. Create GitHub Release with binaries
-  # ─────────────────────────────────────────────
-  release:
-    name: Create GitHub Release
-    needs: binaries
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
-
-      - name: Compute checksums
+      # ── Signing hook stubs — wire real signers when certs are available ──
+      - name: Sign Windows binary (TODO)
+        if: startsWith(matrix.runner, 'windows') && env.AZURE_TENANT_ID != ''
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TRUSTED_SIGNING_PROFILE: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
         run: |
-          cd artifacts
-          for dir in */; do
-            binary="${dir%/}"
-            sha256sum "$dir/$binary" | awk '{print $1}' > "$dir/$binary.sha256"
-          done
+          echo "TODO: Wire Azure Trusted Signing here once the account is provisioned."
+          echo "See https://learn.microsoft.com/azure/trusted-signing/ and the"
+          echo "azure/trusted-signing-action GitHub Action."
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Sign + notarize macOS binary (TODO)
+        if: startsWith(matrix.runner, 'macos') && env.APPLE_DEVELOPER_ID != ''
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          echo "TODO: codesign + notarytool. Requires an Apple Developer ID + App Store Connect API key."
+
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
-            artifacts/pcr-macos-arm64/pcr-macos-arm64
-            artifacts/pcr-macos-arm64/pcr-macos-arm64.sha256
-            artifacts/pcr-macos-x64/pcr-macos-x64
-            artifacts/pcr-macos-x64/pcr-macos-x64.sha256
-            artifacts/pcr-linux-x64/pcr-linux-x64
-            artifacts/pcr-linux-x64/pcr-linux-x64.sha256
-            artifacts/pcr-windows-x64.exe/pcr-windows-x64.exe
-            artifacts/pcr-windows-x64.exe/pcr-windows-x64.exe.sha256
-          generate_release_notes: true
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
 
-  # ─────────────────────────────────────────────
-  # 3. Publish npm wrapper (after release — needs binaries uploaded)
-  # ─────────────────────────────────────────────
-  npm:
-    name: Publish to npm
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    defaults:
-      run:
-        working-directory: npm
+  # ─────────────────────────────────────────────────────────────────────
+  # 3. Build per-target napi .node files for the npm subpackages.
+  # ─────────────────────────────────────────────────────────────────────
+  napi:
+    name: Build napi ${{ matrix.triple }}
+    needs: lint
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: darwin-x64
+            target: x86_64-apple-darwin
+            runner: macos-13
+          - triple: darwin-arm64
+            target: aarch64-apple-darwin
+            runner: macos-14
+          - triple: linux-x64-gnu
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - triple: linux-x64-musl
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - triple: linux-arm64-gnu
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - triple: win32-x64-msvc
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - triple: win32-arm64-msvc
+            target: aarch64-pc-windows-msvc
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -109,26 +178,149 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          key: napi-${{ matrix.target }}
+
+      - name: Install napi CLI
+        run: npm install --no-save @napi-rs/cli@2.18.4
+
+      - name: Build .node
+        working-directory: crates/pcr-napi
+        shell: bash
+        env:
+          PCR_VERSION: ${{ github.ref_name }}
+        run: |
+          npx napi build --release --platform --target ${{ matrix.target }}
+          mkdir -p npm/${{ matrix.triple }}
+          mv pcr.${{ matrix.triple }}.node npm/${{ matrix.triple }}/ || true
+          ls npm/${{ matrix.triple }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napi-${{ matrix.triple }}
+          path: crates/pcr-napi/npm/${{ matrix.triple }}/pcr.${{ matrix.triple }}.node
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 4. Publish the meta pcr-dev + 7 platform subpackages to npm.
+  # ─────────────────────────────────────────────────────────────────────
+  npm-publish:
+    name: Publish to npm
+    needs: napi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all napi artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: napi-*
+          merge-multiple: false
+
+      - name: Drop each .node into its subpackage
+        shell: bash
+        run: |
+          set -euo pipefail
+          for triple in darwin-x64 darwin-arm64 linux-x64-gnu linux-x64-musl linux-arm64-gnu win32-x64-msvc win32-arm64-msvc; do
+            src="artifacts/napi-${triple}/pcr.${triple}.node"
+            dst="crates/pcr-napi/npm/${triple}/"
+            if [[ -f "$src" ]]; then
+              cp "$src" "$dst"
+              echo "copied $src -> $dst"
+            else
+              echo "missing artifact: $src"
+              exit 1
+            fi
+          done
+
       - name: Set version from tag
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          cd crates/pcr-napi
           npm version "$VERSION" --no-git-tag-version --allow-same-version
+          for dir in npm/*/; do
+            (cd "$dir" && npm version "$VERSION" --no-git-tag-version --allow-same-version)
+          done
 
-      - name: Publish
-        run: npm publish --provenance --access public
+      - name: Publish subpackages
+        shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: crates/pcr-napi
+        run: |
+          for dir in npm/*/; do
+            (cd "$dir" && npm publish --provenance --access public)
+          done
 
-  # ─────────────────────────────────────────────
-  # 4. Update Homebrew tap
-  # ─────────────────────────────────────────────
+      - name: Publish meta pcr-dev
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: crates/pcr-napi
+        run: |
+          npm publish --provenance --access public
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 5. Create GitHub Release with all standalone binaries + sha256s.
+  # ─────────────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [binaries, napi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for dir in artifacts/pcr-*; do
+            name=$(basename "$dir")
+            path="$dir/$name"
+            if [[ -f "$path" ]]; then
+              cp "$path" "dist/$name"
+              (cd dist && sha256sum "$name" | awk '{print $1}' > "$name.sha256")
+            fi
+          done
+          ls dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 6. Nudge the homebrew tap so it re-renders the formula.
+  # ─────────────────────────────────────────────────────────────────────
   homebrew:
     name: Update Homebrew tap
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Homebrew tap update
-        uses: peter-evans/repository-dispatch@v3
+      - uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           repository: pcr-developers/homebrew-pcr
