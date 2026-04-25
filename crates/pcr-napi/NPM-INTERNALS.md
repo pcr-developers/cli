@@ -110,7 +110,8 @@ procedure. The short version:
 ## Troubleshooting
 
 - **`Unsupported platform/arch`** — your platform isn't in the table above.
-  Open an issue and we'll add a build target.
+  [Open an issue](https://github.com/pcr-developers/cli/issues) and we'll
+  add a build target.
 - **`spawn UNKNOWN` on Windows** — somehow you're getting a standalone
   binary instead of the addon path. Confirm `npm root -g` shows
   `pcr-dev/bin/pcr` (the JS shim, not a `.exe`), and that the right
