@@ -85,33 +85,16 @@ pub fn run(_mode: OutputMode, args: BundleArgs) -> ExitCode {
 
 // ─── Core flows ────────────────────────────────────────────────────────────
 
+/// Historically this filter dropped Cursor agent-mode drafts with an empty
+/// `changed_files` array, on the assumption "no edits = nothing to bundle."
+/// That assumption silently hid every analytical agent prompt (`"explain
+/// this"`, `"find the bug"`, `"summarize the test failure"`) — the user's
+/// most common questions. We now keep all drafts and let the UI render them;
+/// the watcher tags the no-edits ones with `file_context.agent_no_edits =
+/// true` so a future filter can be opt-in instead of opt-out. This is a
+/// pure passthrough today.
 fn filter_with_changed_files(drafts: Vec<DraftRecord>) -> Vec<DraftRecord> {
-    let mut out = Vec::new();
-    for d in drafts {
-        if d.source == "claude-code" || d.source == "vscode" {
-            out.push(d);
-            continue;
-        }
-        let mode = d
-            .file_context
-            .as_ref()
-            .and_then(|m| m.get("cursor_mode"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let is_agent = mode == "agent" || mode.is_empty();
-        if is_agent {
-            let Some(fc) = &d.file_context else { continue };
-            let Some(raw) = fc.get("changed_files") else {
-                continue;
-            };
-            let Some(arr) = raw.as_array() else { continue };
-            if arr.is_empty() {
-                continue;
-            }
-        }
-        out.push(d);
-    }
-    out
+    drafts
 }
 
 fn filter_by_repo(

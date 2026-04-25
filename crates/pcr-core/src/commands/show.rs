@@ -44,28 +44,11 @@ fn draft_cursor_mode(d: &DraftRecord) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Mirrors the relaxation in `bundle.rs::filter_with_changed_files`. Kept as
+/// a function (rather than removed) so future opt-in filtering has an obvious
+/// place to live. See the BUG-5 commit + audit notes.
 fn filter_with_changed_files(drafts: Vec<DraftRecord>) -> Vec<DraftRecord> {
-    let mut out = Vec::new();
-    for d in drafts {
-        if d.source == "claude-code" || d.source == "vscode" {
-            out.push(d);
-            continue;
-        }
-        let mode = draft_cursor_mode(&d).unwrap_or_default();
-        let is_agent = mode == "agent" || mode.is_empty();
-        if is_agent {
-            let Some(fc) = &d.file_context else { continue };
-            let Some(raw) = fc.get("changed_files") else {
-                continue;
-            };
-            let Some(arr) = raw.as_array() else { continue };
-            if arr.is_empty() {
-                continue;
-            }
-        }
-        out.push(d);
-    }
-    out
+    drafts
 }
 
 pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
