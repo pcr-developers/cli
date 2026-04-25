@@ -157,21 +157,21 @@ fn save_state(inner: &Arc<Mutex<Inner>>) {
     let _ = std::fs::write(state_path(), bytes);
 }
 
-/// Compute the set of relative paths that changed between two dirty-file
-/// snapshots. Iterates the union of keys so we catch all three cases
-/// (BUG-3 in the cursor-watcher audit):
+/// Compute the set of relative paths that changed between two dirty-
+/// file snapshots. Iterates the union of keys so all three cases are
+/// caught:
 ///
 /// 1. **Appeared** — present in `current` but not in `prev`. A file the
 ///    user just started editing.
-/// 2. **Modified** — present in both with different hashes. A file edited
-///    again since the last poll.
-/// 3. **Disappeared** — present in `prev` but not in `current`. The file
-///    went from dirty to clean — committed, reverted, or stashed. Without
-///    this case, agent turns whose `Bash` tool committed mid-stream lost
-///    attribution and got dropped by the empty-`changed_files` bail.
+/// 2. **Modified** — present in both with different hashes. A file
+///    edited again since the last poll.
+/// 3. **Disappeared** — present in `prev` but not in `current`. The
+///    file went from dirty to clean — committed, reverted, or stashed.
+///    Iterating only `current` would miss this case and any agent turn
+///    whose `Bash` tool committed mid-stream would lose attribution.
 ///
-/// Returns paths in deterministic order (sorted) so test snapshots are
-/// stable. Production code re-orders these via the per-event JSON encode
+/// Returns paths in sorted order so test snapshots are stable.
+/// Production callers re-order these via the per-event JSON encode
 /// anyway, so the cost of the sort is irrelevant.
 fn changed_relpaths(
     prev: &HashMap<String, String>,
@@ -232,10 +232,10 @@ fn dirty_hashes(project_path: &str) -> HashMap<String, String> {
 /// always taking the destination side for renames (`R`) and copies (`C`).
 ///
 /// `-z` is NUL-terminated and emits paths verbatim — no shell escaping,
-/// no quoting, no surprises with embedded quotes/spaces/newlines (BUG-12
-/// in the cursor-watcher audit). Each entry is `XY <SP> path<NUL>`, and
-/// rename/copy entries are TWO entries (`R  newpath<NUL>oldpath<NUL>` —
-/// new path first under -z, opposite of the human porcelain order).
+/// no quoting, no surprises with embedded quotes / spaces / newlines.
+/// Each entry is `XY <SP> path<NUL>`, and rename / copy entries are
+/// two entries (`R  newpath<NUL>oldpath<NUL>` — new path first under
+/// `-z`, opposite of the human porcelain order).
 fn parse_porcelain_z(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut iter = bytes.split(|b| *b == 0);
@@ -288,10 +288,10 @@ mod tests {
         assert_eq!(changed_relpaths(&prev, &current), vec!["src/a.rs"]);
     }
 
-    /// BUG-3 regression test. A file that was dirty in the previous poll but
-    /// is now clean (committed, reverted, or stashed) MUST appear in the
-    /// changed set so agent turns whose `Bash` tool committed mid-stream
-    /// don't lose attribution.
+    /// A file that was dirty in the previous poll but is now clean
+    /// (committed, reverted, or stashed) must appear in the changed
+    /// set — otherwise agent turns whose `Bash` tool committed mid-
+    /// stream lose attribution.
     #[test]
     fn disappeared_files_are_recorded() {
         let prev = map(&[("src/a.rs", "h1"), ("src/b.rs", "h2")]);

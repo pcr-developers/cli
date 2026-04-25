@@ -135,7 +135,7 @@ fn end_to_end_multi_repo_attribution() {
     assert_eq!(
         backend_snap.get("branch").and_then(|v| v.as_str()),
         Some("feature/auth"),
-        "branch carried through from real git repo (BR-1)"
+        "secondary repo's branch carried through from the real git repo"
     );
     assert!(
         backend_snap
@@ -212,9 +212,9 @@ fn symlinked_project_path_attributes_correctly() {
         "input": {"path": format!("{}/README.md", real.to_string_lossy())}
     })];
 
-    // EV-1 regression: must attribute even though the project was
-    // registered via a symlink. Without canonicalization on both sides,
-    // the prefix match would silently fail.
+    // The symlinked project must attribute even though it was
+    // registered via the symlink path. Without canonicalization on
+    // both sides of the comparison, the prefix match silently fails.
     let touched = touched_project_ids(&calls, &by_id, None);
     assert_eq!(
         touched,

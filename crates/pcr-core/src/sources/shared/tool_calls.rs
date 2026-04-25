@@ -1,12 +1,11 @@
 //! Tool-call utilities — extracting file paths and using them to attribute
 //! captured prompts to registered projects.
 //!
-//! All matching here goes through `shared::path_norm` so we get
-//! symlink-resolved, `~`-expanded, relative-resolved canonical paths on
-//! both sides of the comparison. The "raw prefix match" of an earlier
-//! version produced silent attribution holes for users with symlinked
-//! workspaces or tools that emitted relative paths (EV-1 in the
-//! multi-repo audit).
+//! All matching here goes through `shared::path_norm` so both sides of
+//! the comparison are symlink-resolved, `~`-expanded, and relative-
+//! resolved canonical paths. A naive `path.starts_with(project + "/")`
+//! check would miss attribution for symlinked workspaces and for tool
+//! calls that emit relative or `~`-prefixed paths.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -31,9 +30,10 @@ pub fn touched_project_ids(
 ) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     for tc in tool_calls {
-        // Iterate ALL paths in a tool call, not just the first one — multi-
-        // file edits (`apply-patch`, `replace_string_in_file`'s array form,
-        // experimental Cursor tools) used to silently under-attribute.
+        // Iterate every path in a tool call, not just the first.
+        // Multi-file shapes (`apply-patch`, `replace_string_in_file`'s
+        // array form, experimental Cursor tools) bundle several files
+        // per call; without iterating, only the first attributes.
         for raw in extract_paths_from_tool_call(tc) {
             let Some(abs) = normalize_path(&raw, cwd) else {
                 continue;
@@ -53,17 +53,19 @@ pub fn touched_project_ids(
 /// Returns git snapshots (head_sha + git_diff + branch) for every
 /// non-primary repo referenced by tool-call paths.
 ///
-/// Used by the watchers to populate `file_context.repo_snapshots`, which
-/// the push pipeline then consumes to produce per-repo incremental diffs
-/// in the review payload (`compute_incremental_diffs` in `commands/push.rs`).
+/// Watchers populate `file_context.repo_snapshots` from this; the push
+/// pipeline (`compute_incremental_diffs` in `commands/push.rs`) then
+/// emits per-repo incremental diffs in the review payload.
 ///
-/// Each snapshot is `{ head_sha, git_diff, branch }` so a reviewer can see
-/// not just *what* changed in the secondary repo but *which branch* it was
-/// on at the time of the prompt — important for users who switch branches
-/// mid-session.
+/// Each snapshot is `{ head_sha, git_diff, branch }` so reviewers see
+/// not just *what* changed in the secondary repo but *which branch* it
+/// was on at the time of the prompt. Branch matters because users
+/// frequently switch branches mid-session and the primary repo's
+/// branch alone tells reviewers nothing about where the secondary
+/// changes landed.
 ///
-/// `proj_by_id` MUST contain canonical paths (use
-/// [`super::path_norm::proj_id_to_canonical_paths`]).
+/// `proj_by_id` MUST contain canonical paths — use
+/// [`super::path_norm::proj_id_to_canonical_paths`].
 pub fn repo_snapshots(
     tool_calls: &[Value],
     primary_project_id: &str,
@@ -90,10 +92,9 @@ pub fn repo_snapshots(
                 let mut snap = serde_json::Map::new();
                 snap.insert("head_sha".into(), Value::String(get_head_sha(canon_path)));
                 snap.insert("git_diff".into(), Value::String(get_git_diff(canon_path)));
-                // Capture branch alongside the diff so reviewers see which
-                // branch the secondary repo was on. Without this, multi-repo
-                // reviews silently fall back to the primary repo's branch
-                // (BR-1 in the multi-repo audit).
+                // Reviewers need the per-secondary-repo branch — without
+                // it, multi-repo reviews show only the primary repo's
+                // branch and the secondary diffs lose their context.
                 snap.insert("branch".into(), Value::String(get_branch(canon_path)));
                 result.insert(id.clone(), Value::Object(snap));
             }
@@ -108,9 +109,9 @@ pub fn repo_snapshots(
 
 /// Like [`repo_snapshots`] but takes the secondary project IDs directly
 /// instead of deriving them from tool calls. Used by the Cursor watcher,
-/// which doesn't expose tool calls in its bubble data — secondary repos
-/// are detected via the `diff_events` table instead, leaving us with a
-/// list of project IDs that need to be snapshotted.
+/// which doesn't expose tool calls in its bubble data — Cursor secondary
+/// repos are detected via the `diff_events` table, which yields a list
+/// of project IDs ready to be snapshotted.
 ///
 /// `proj_by_id_canonical` is the same map [`repo_snapshots`] takes; the
 /// primary id is skipped so the result mirrors that helper's contract
@@ -181,20 +182,21 @@ pub fn extract_path_from_tool_call(tc: &Value) -> Option<String> {
     extract_paths_from_tool_call(tc).into_iter().next()
 }
 
-/// Returns *every* file path mentioned by a tool call, not just the first
-/// one. Multi-file tool shapes seen in the wild:
+/// Returns every file path mentioned by a tool call. Multi-file shapes
+/// seen in production transcripts:
 ///
 /// - `input.path`, `input.file_path`, `input.filePath` — single-file edits.
 /// - `input.files: [{path: ...}]` — apply-patch style tool calls that
 ///   touch multiple files in a single invocation.
-/// - `input.fileNames: [...]` — VS Code's `replace_string_in_file` and a
-///   handful of newer Cursor agent tools list their target files this way.
+/// - `input.fileNames: [...]` — VS Code's `replace_string_in_file` and
+///   a handful of newer Cursor agent tools list targets this way.
 /// - `input.targets: [...]` — some experimental Cursor tools.
-/// - top-level `path` (legacy).
+/// - top-level `path` — legacy shape.
 ///
-/// Without iterating ALL paths, multi-file edits silently under-attribute
-/// (the secondary files don't tag their containing project, missing repo
-/// snapshots, missing per-prompt diffs).
+/// All attribution helpers in this module iterate every path returned
+/// here. A single-path extractor would silently miss the trailing files
+/// in a multi-file edit, leaving secondary projects untagged and their
+/// snapshots / per-prompt diffs absent from review.
 pub fn extract_paths_from_tool_call(tc: &Value) -> Vec<String> {
     let mut out = Vec::new();
     let mut push_if_nonempty = |s: Option<&str>| {
@@ -268,9 +270,9 @@ mod tests {
 
     #[test]
     fn touched_project_ids_does_not_match_partial_segments() {
-        // EV-1 regression: registered project `/repo/p1`, tool call against
-        // `/repo/p1-fork/foo`. Naive starts_with would match. Canonical
-        // path_is_under requires the trailing-slash boundary.
+        // Registered project `/repo/p1`, tool call against
+        // `/repo/p1-fork/foo`: a naive `starts_with` would match.
+        // `path_is_under` requires the trailing-slash boundary.
         let mut by_id = BTreeMap::new();
         by_id.insert("p1".to_string(), "/repo/p1".to_string());
         let calls = vec![tc("/repo/p1-fork/foo.rs")];
@@ -410,9 +412,9 @@ mod tests {
         let snaps = result.expect("secondary should produce a snapshot entry");
         assert_eq!(snaps.len(), 1, "primary must be excluded");
         assert!(snaps.contains_key("secondary"));
-        // Each snapshot must carry head_sha + git_diff + branch keys
-        // (BR-1) so push's compute_incremental_diffs has everything it
-        // needs without re-querying anything.
+        // Each snapshot must carry head_sha + git_diff + branch so push's
+        // compute_incremental_diffs has everything it needs without re-
+        // querying anything live.
         let snap = snaps.get("secondary").unwrap().as_object().unwrap();
         assert!(snap.contains_key("head_sha"));
         assert!(snap.contains_key("git_diff"));

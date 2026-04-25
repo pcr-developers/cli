@@ -233,14 +233,13 @@ pub fn get_session_meta(session_id: &str) -> Option<SessionMeta> {
         .ok()
         .flatten()
         .unwrap_or_default();
-    // Cursor sometimes writes `composerId` equal to the session id, and some
-    // sessions omit the field entirely (older schemas, corrupted rows). When
-    // it's missing, fall back to the session id rather than dropping every
-    // bubble in the session — the bubble keys are
-    // `bubbleId:<composerId>:<bubbleId>`, so without a composer id every
-    // bubble lookup produces NULL and the whole session silently disappears
-    // (BUG-2 in the cursor-watcher audit). The first time we hit this for
-    // a given session id we emit a verbose event so `--verbose` users know.
+    // Cursor sometimes writes `composerId` equal to the session id, and
+    // some sessions omit the field entirely (older schemas, corrupted
+    // rows). Fall back to the session id when missing — the bubble keys
+    // are `bubbleId:<composerId>:<bubbleId>`, so without a composer id
+    // every bubble lookup produces NULL and the entire session silently
+    // disappears. The first time we hit this for a given session id we
+    // emit a verbose event so `--verbose` users see what happened.
     let composer_id = if composer_id_raw.is_empty() {
         warn_missing_composer_id_once(session_id);
         session_id.to_string()

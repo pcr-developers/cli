@@ -1,30 +1,33 @@
 //! Path normalization helpers for tool-call → project attribution.
 //!
 //! Tool calls captured from Cursor / Claude Code / VS Code arrive as raw
-//! file path strings. The naive prefix-match (`path.starts_with(project +
-//! "/")`) used to fail in three real-world ways:
+//! file-path strings, in any of three forms that a naive
+//! `path.starts_with(project + "/")` would fail to match:
 //!
 //! 1. **Symlinks.** A user opens `/Users/me/dev/proj` (a symlink to
-//!    `/Volumes/Data/me/dev/proj`). The tool call uses the canonical path,
-//!    the registered project uses the symlink path — no match.
+//!    `/Volumes/Data/me/dev/proj`). The tool call uses the canonical
+//!    path, the registered project uses the symlink path — no match.
 //! 2. **Relative paths.** A tool call emits `./src/main.rs` (some tools
-//!    do this for files mentioned by the user). No prefix match against an
-//!    absolute project path.
-//! 3. **`~`-prefixed paths.** A tool call emits `~/code/proj/foo.rs`. Same
-//!    failure mode.
+//!    do this for files mentioned by the user). No prefix match
+//!    against an absolute project path.
+//! 3. **`~`-prefixed paths.** A tool call emits `~/code/proj/foo.rs`.
+//!    Same failure mode.
 //!
-//! The fix is to normalize both sides to the same canonical form before
-//! comparing. We do this lazily and best-effort:
+//! Both sides of every comparison go through this module so they end up
+//! in the same canonical form. The work is lazy and best-effort:
 //!
 //! - `normalize_path(raw, base_cwd)` turns a tool-call string into an
-//!   absolute, symlink-resolved path. Falls back to the textually-cleaned
-//!   absolute path when the file no longer exists (deleted/renamed since
-//!   capture).
-//! - `canonicalize_project_path(p)` does the same for a registered project
-//!   path. Falls back to the literal path on failure so attribution still
-//!   works for projects on a network mount that's currently offline.
-//! - `path_is_under(abs, project_canonical)` does the comparison itself,
-//!   handling exact-equality and trailing-slash edge cases.
+//!   absolute, symlink-resolved path. Walks up to the deepest existing
+//!   ancestor when the leaf doesn't exist (deleted, renamed, or
+//!   about-to-be-created), then re-appends the missing tail — so
+//!   symlinked-ancestor cases like macOS `/tmp` → `/private/tmp` keep
+//!   working even for files that aren't on disk yet.
+//! - `canonicalize_project_path(p)` does the same for a registered
+//!   project path. Falls back to the literal path on failure so
+//!   attribution still produces a key for projects on a network mount
+//!   that's currently offline.
+//! - `path_is_under(abs, project_canonical)` does the comparison
+//!   itself, handling exact-equality and trailing-slash boundaries.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -34,9 +37,18 @@ use crate::projects::Project;
 
 /// Normalize a raw tool-call path into an absolute, symlink-resolved form.
 ///
-/// Returns `None` only when the input is empty or genuinely cannot be made
-/// absolute (relative path with no `base_cwd`). Every other case produces
-/// some form of absolute path so attribution always has a chance to match.
+/// Returns `None` only when the input is empty or genuinely cannot be
+/// made absolute (relative path with no `base_cwd`). Every other case
+/// produces some form of absolute path so attribution always has a
+/// chance to match.
+///
+/// Results are cached per-process keyed on `(raw, base_cwd)`. A
+/// high-volume session can submit thousands of tool-call paths per
+/// minute through here; without the cache, each one is a syscall
+/// (~50µs–1ms). The cache is monotonic — file moves between captures
+/// only matter if the same `raw` reappears later, in which case stale
+/// data is strictly better than the file-was-deleted fallback we'd
+/// produce live.
 pub fn normalize_path(raw: &str, base_cwd: Option<&str>) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

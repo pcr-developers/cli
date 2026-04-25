@@ -276,9 +276,9 @@ fn process_file(
         return;
     }
 
-    // Canonical project path map for symlink-resilient attribution
-    // (EV-1 in the multi-repo audit). proj_id_to_canonical_paths skips
-    // entries without a project_id or a path.
+    // Canonical project path map for symlink-resilient attribution.
+    // `proj_id_to_canonical_paths` skips entries without a project_id
+    // or a path.
     let registered_projects = projects::load();
     let proj_by_id: BTreeMap<String, String> = proj_id_to_canonical_paths(&registered_projects);
     let mut proj_by_path: HashMap<String, usize> = HashMap::new();
@@ -356,10 +356,10 @@ fn process_file(
                 Value::Array(touched.iter().map(|s| Value::String(s.clone())).collect()),
             );
         }
-        // MR-2: capture per-secondary-repo head_sha + git_diff + branch
-        // so the push pipeline can emit complete multi-repo diffs in the
-        // review payload. Without this, multi-repo VS Code sessions show
-        // only the primary repo's diff in review.
+        // Capture per-secondary-repo head_sha + git_diff + branch so the
+        // push pipeline can emit complete multi-repo diffs in review.
+        // Without these snapshots a multi-repo VS Code session shows
+        // only the primary repo's diff.
         if let Some(snaps) = repo_snapshots(&ex.tool_calls, &proj_id, &proj_by_id, prompt_cwd) {
             fc.insert("repo_snapshots".into(), Value::Object(snaps));
         }
@@ -376,15 +376,15 @@ fn process_file(
             if !transcript.start_time.is_empty() {
                 commit_shas = get_commits_since(&canon_proj_path, &transcript.start_time);
             }
-            // GD-2: tag drafts captured against directories that aren't a
-            // git repo so reviewers see why the diff is empty.
+            // Tag drafts captured against directories that aren't a git
+            // repo so the empty diff in review reads as "no git data
+            // available" rather than "no changes".
             if !is_git_repo(&canon_proj_path) {
                 fc.insert("git_unavailable".into(), Value::Bool(true));
             }
         }
-        // BR-1: re-read branch at save time. The earlier `get_branch` call
-        // happened above for `branch`, but we already used it; nothing extra
-        // to do here — VS Code already captures branch per-prompt.
+        // VS Code already captures `branch` per-prompt above; no
+        // re-read needed here.
 
         if let Err(e) = store::save_draft(&record, &commit_shas, &git_diff, &head_sha) {
             display::print_error("vscode", &format!("Failed to save draft: {e}"));
@@ -484,9 +484,9 @@ fn update_existing_draft(
             Value::Array(touched.iter().map(|s| Value::String(s.clone())).collect()),
         );
     }
-    // MR-2: keep `repo_snapshots` in sync as we re-process exchanges so
-    // a session that gained a secondary-repo touch on a later prompt
-    // still ends up with the secondary diff in review.
+    // Re-emit `repo_snapshots` on enrichment so a session that gained a
+    // secondary-repo touch on a later prompt still ends up with the
+    // secondary diff in review.
     let primary_id = primary.map(|p| p.project_id.as_str()).unwrap_or("");
     if let Some(snaps) = repo_snapshots(&ex.tool_calls, primary_id, proj_by_id, prompt_cwd) {
         updates.insert("repo_snapshots".into(), Value::Object(snaps));

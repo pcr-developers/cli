@@ -44,9 +44,9 @@ fn draft_cursor_mode(d: &DraftRecord) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Mirrors the relaxation in `bundle.rs::filter_with_changed_files`. Kept as
-/// a function (rather than removed) so future opt-in filtering has an obvious
-/// place to live. See the BUG-5 commit + audit notes.
+/// Mirrors `bundle.rs::filter_with_changed_files`: a passthrough today,
+/// kept as a function so any future opt-in "hide agent turns with no
+/// edits" filter has an obvious place to live.
 fn filter_with_changed_files(drafts: Vec<DraftRecord>) -> Vec<DraftRecord> {
     drafts
 }
