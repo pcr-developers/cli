@@ -77,12 +77,12 @@ fn run_plain() -> ExitCode {
     if pushed.is_empty() && unpushed.is_empty() && drafts.is_empty() {
         if ctx.name.is_empty() {
             display::eprintln(
-                "PCR: Nothing to show. Run `pcr init` in your project directory first.",
+                "PCR: Nothing to show — no project is registered for this directory.",
             );
+            display::print_hint("run `pcr init` to register the current git repo");
         } else {
-            display::eprintln(
-                "PCR: Nothing to show for this project. Run `pcr start` to capture prompts.",
-            );
+            display::eprintln("PCR: Nothing to show for this project yet.");
+            display::print_hint("run `pcr start` and send a prompt in your editor to capture one");
         }
         return ExitCode::Success;
     }

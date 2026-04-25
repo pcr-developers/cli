@@ -17,7 +17,8 @@ use crate::util::text::plural;
 
 pub fn run(_mode: OutputMode) -> ExitCode {
     let Some(a) = auth::load() else {
-        display::eprintln("PCR: Not logged in. Run `pcr login`.");
+        display::eprintln("PCR: Not logged in.");
+        display::print_hint("run `pcr login` — opens your browser to grab a CLI token");
         return ExitCode::AuthRequired;
     };
 
@@ -29,9 +30,9 @@ pub fn run(_mode: OutputMode) -> ExitCode {
         }
     };
     if all_unpushed.is_empty() {
-        display::eprintln(
-            "PCR: No prompt bundles to push. Run `pcr bundle \"name\" --select all` first.",
-        );
+        display::eprintln("PCR: No prompt bundles to push.");
+        display::print_hint("create one first: `pcr bundle \"name\" --select all`");
+        display::print_hint("or run `pcr status` to see where your drafts are in the pipeline");
         return ExitCode::Success;
     }
 

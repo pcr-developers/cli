@@ -1,7 +1,8 @@
-//! One module per subcommand. Mirrors `cli/cmd/*.go` one-for-one.
+//! One module per subcommand.
 
 pub mod bundle;
 pub mod gc;
+pub mod help;
 pub mod helpers;
 pub mod hook;
 pub mod init;

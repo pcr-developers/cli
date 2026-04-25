@@ -228,6 +228,7 @@ fn run_bundle_create(name: &str, select_arg: &str, repo_filter: Option<&str>) ->
     };
     if selected.is_empty() {
         display::eprintln("PCR: No valid selection — nothing bundled.");
+        display::print_hint("examples:  --select 1-5   --select 1,3,7   --select all");
         return ExitCode::Success;
     }
 
@@ -387,6 +388,7 @@ fn run_bundle_list() -> ExitCode {
     };
     if unpushed.is_empty() {
         display::eprintln("PCR: No unpushed bundles — everything is pushed.");
+        display::print_hint("create a new bundle: `pcr bundle \"name\" --select all`");
         return ExitCode::Success;
     }
     display::eprintln(&format!(

@@ -33,9 +33,8 @@ pub fn run(_mode: OutputMode) -> ExitCode {
     let user_id = match supabase::validate_cli_token(&token) {
         Ok(u) if !u.is_empty() => u,
         _ => {
-            display::eprintln(&format!(
-                "PCR: Invalid token — please check your token at {settings_url}"
-            ));
+            display::eprintln("PCR: That token isn't valid.");
+            display::print_hint(&format!("create a fresh one at {settings_url}"));
             return ExitCode::AuthRequired;
         }
     };

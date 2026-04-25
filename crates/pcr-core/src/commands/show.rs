@@ -72,13 +72,8 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
     let n: usize = match args.number.trim().parse() {
         Ok(n) if n >= 1 => n,
         _ => {
-            display::print_error(
-                "show",
-                &format!(
-                    "invalid number {:?} — use the number from `pcr add` or `pcr status`",
-                    args.number
-                ),
-            );
+            display::print_error("show", &format!("invalid number {:?}", args.number));
+            display::print_hint("draft numbers come from `pcr log` or `pcr bundle`");
             return ExitCode::Usage;
         }
     };
@@ -93,6 +88,7 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
 
     if all.is_empty() {
         display::eprintln("PCR: No draft prompts.");
+        display::print_hint("run `pcr start` and send a prompt in your editor to capture one");
         return ExitCode::Success;
     }
     if n > all.len() {

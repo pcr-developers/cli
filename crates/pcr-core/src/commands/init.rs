@@ -55,7 +55,7 @@ pub fn run(_mode: OutputMode, args: InitArgs) -> ExitCode {
 
     if found.is_empty() {
         display::eprintln("PCR: No git repositories found in the current directory.");
-        display::eprintln("     Run `pcr init` inside a git repo directory.");
+        display::print_hint("cd into a git repo (`git status` should work) and try again");
         return ExitCode::Success;
     }
 
