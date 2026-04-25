@@ -53,11 +53,11 @@ pub fn run(_mode: OutputMode) -> ExitCode {
     }
 
     let mut pushed = 0usize;
-    // BR-2: don't query the *current* branch — that's where the user
-    // happens to be when running `pcr push`, not where the prompts were
-    // captured. We pass it as a last-ditch fallback only. Use
-    // `current_branch()` so detached-HEAD becomes empty rather than the
-    // literal string "HEAD".
+    // The cwd's current branch is wherever the user happens to be when
+    // they run `pcr push` — not where the prompts were captured. Pass
+    // it as a last-ditch fallback only; per-bundle and per-prompt
+    // attribution prefer the captured branches. `current_branch()`
+    // normalizes detached-HEAD to empty.
     let cwd_branch_fallback = crate::commands::helpers::current_branch();
     for commit in &commits {
         pushed += push_bundle(&commit.id, &cwd_branch_fallback, &a.user_id);
@@ -120,10 +120,10 @@ fn push_bundle(local_id: &str, cwd_branch_fallback: &str, user_id: &str) -> usiz
     }
 
     let review_url = format!("{}/review/{}", config::APP_URL, remote_id);
-    // BR-2: prefer the captured branch (most-common across the bundle's
+    // Prefer the captured branch (most-common across the bundle's
     // drafts, then the bundle's own branch_name) over wherever the user
-    // happens to be when running `pcr push`. Fall back to the cwd branch
-    // only when nothing was captured at all (rare — an empty bundle).
+    // happens to be when running `pcr push`. Fall back to the cwd
+    // branch only when nothing was captured at all — an empty bundle.
     let branch = best_captured_branch(&c).unwrap_or_else(|| cwd_branch_fallback.to_string());
     display::eprintln(&format!(
         "PCR: Pushed {:?} ({} prompt{})",
@@ -211,10 +211,12 @@ fn collect_touched_projects(
         .into_iter()
         .enumerate()
         .map(|(i, (id, _count))| {
-            // BR-2: prefer the branch captured at prompt time (per-repo) over
-            // re-querying current. Only fall back to the live working tree
-            // when no capture-time data exists for this project — which only
-            // happens for legacy drafts written before BR-1 landed.
+            // Prefer the per-prompt branch captured at the time the
+            // edits ran. Re-querying live would mistakenly attribute
+            // every touched project to whatever branch each one happens
+            // to be on right now. Fall back to the live working tree
+            // only when no capture-time data exists — drafts written
+            // before per-prompt branch capture was added.
             let branch = items
                 .iter()
                 .find_map(|item| captured_branch_for(item, &id))
@@ -324,8 +326,8 @@ fn compute_incremental_diffs(items: &[DraftRecord]) -> BTreeMap<String, String> 
     use std::collections::HashMap;
 
     // Canonical project path lookup so `git diff <prev>..<curr>` runs
-    // against the real on-disk repo even when the registered project path
-    // is a symlink (EV-1 in the multi-repo audit).
+    // against the real on-disk repo even when the registered project
+    // path is a symlink — git won't follow the symlink for us.
     let registered = projects::load();
     let canonical_map = proj_id_to_canonical_paths(&registered);
     let mut proj_by_id: HashMap<String, String> = HashMap::new();
@@ -662,7 +664,7 @@ mod tests {
         }
     }
 
-    // ── BR-2 regression: branch comes from captured drafts, not cwd ──────
+    // ── best_captured_branch ───────────────────────────────────────────
 
     #[test]
     fn best_captured_branch_picks_most_common_draft_branch() {
@@ -672,15 +674,16 @@ mod tests {
             draft("d3", "p1", "main", None),
         ];
         // Bundle-level branch is "main" but most drafts were on the
-        // feature branch — the most-common-draft-branch wins, which is the
-        // honest answer to "what branch were the prompts on".
+        // feature branch — the most-common-draft-branch wins, which is
+        // the honest answer to "what branch were the prompts on".
         let c = commit_with(items, "main");
         assert_eq!(best_captured_branch(&c), Some("feature/auth".into()));
     }
 
     #[test]
     fn best_captured_branch_falls_back_to_commit_branch() {
-        // Drafts have no captured branch (legacy / cursor pre-BR-1).
+        // Drafts with no captured branch fall through to the bundle row's
+        // branch_name.
         let items = vec![draft("d1", "p1", "", None), draft("d2", "p1", "", None)];
         let c = commit_with(items, "feature/x");
         assert_eq!(best_captured_branch(&c), Some("feature/x".into()));
@@ -704,8 +707,8 @@ mod tests {
 
     #[test]
     fn captured_branch_for_uses_repo_snapshots_for_secondary() {
-        // BR-1: secondary repo's branch was captured at prompt time and
-        // stored under file_context.repo_snapshots[id].branch.
+        // Secondary repo's branch was captured at prompt time and stored
+        // under file_context.repo_snapshots[id].branch.
         let snaps = json!({
             "p-secondary": {
                 "head_sha": "abc",
@@ -728,9 +731,9 @@ mod tests {
 
     #[test]
     fn captured_branch_for_returns_none_for_empty_branch_in_snapshot() {
-        // Defensive: an older draft with `repo_snapshots` (BR-1 not yet
-        // shipped) might have a snapshot without `branch`. Don't return ""
-        // — let the caller fall through to the live-query fallback.
+        // Defensive: an older draft might have `repo_snapshots` without
+        // a `branch` key. Don't return "" — let the caller fall through
+        // to the live-query fallback.
         let snaps = json!({
             "p-secondary": {
                 "head_sha": "abc",

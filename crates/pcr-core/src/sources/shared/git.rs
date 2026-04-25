@@ -105,10 +105,11 @@ pub fn get_git_diff(project_path: &str) -> String {
 }
 
 fn untracked_diff(project_path: &str) -> String {
-    // BUG-12 fix: switch to NUL-terminated porcelain so filenames with
-    // spaces, quotes, or newlines round-trip correctly. Without -z, git
-    // emits shell-escaped paths and our naive `line[3..].trim()` produces
-    // a literal `\"foo bar.rs\"` string that subsequently fails to read.
+    // NUL-terminated porcelain so filenames with spaces, quotes, or
+    // newlines round-trip verbatim. Without `-z`, git shell-escapes
+    // problem paths and a naive `line[3..].trim()` parser would
+    // produce literal `"foo bar.rs"` strings that fail every later
+    // file read.
     let cmd = std::process::Command::new("git")
         .args(["-C", project_path, "status", "--porcelain=v1", "-z"])
         .output();

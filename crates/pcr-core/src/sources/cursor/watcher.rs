@@ -286,11 +286,11 @@ impl PromptScanner {
         }
         let proj = proj.unwrap();
 
-        // Note: previously we dropped agent turns with empty `changed_files`
-        // (BUG-5). That silently lost analytical agent prompts ("explain this",
-        // "find the bug", "summarize this codebase") that legitimately edit
-        // nothing. We now keep them and annotate `agent_no_edits: true` so the
-        // bundle/show UIs can label or filter them.
+        // Agent turns that don't edit any file are still real prompts —
+        // analytical questions like "explain this", "find the bug",
+        // "summarize this codebase". Save them and annotate
+        // `agent_no_edits: true` so the bundle / show UIs can label or
+        // filter them on demand.
         let agent_no_edits = is_agent_turn && changed_files.is_empty();
 
         let mut file_context = serde_json::Map::new();
@@ -351,8 +351,8 @@ impl PromptScanner {
         let mut git_diff = String::new();
         let mut head_sha = String::new();
         let mut branch = String::new();
-        // Use the canonical primary path for git ops so symlinked workspaces
-        // diff against the real on-disk repo (EV-1 in the multi-repo audit).
+        // Canonical primary path so symlinked workspaces diff against the
+        // real on-disk repo, not a symlink alias that git wouldn't follow.
         let primary_canon = canonicalize_project_path(&proj.path);
         if !proj.path.is_empty() {
             if let Some(full_session) = get_full_session_data(session_id) {
@@ -405,26 +405,28 @@ impl PromptScanner {
                 }
             }
             git_diff = get_git_diff(&primary_canon);
-            // GD-1: previously this was hardcoded "" when the watcher saved
-            // drafts, which disabled the `git diff prev..curr` path in
-            // `compute_incremental_diffs` at push time and forced the textual
-            // delta fallback. Reading head_sha here gives reviewers accurate
-            // per-prompt diffs for Cursor sessions, matching Claude Code.
+            // head_sha must be set so push's `compute_incremental_diffs`
+            // can do `git diff prev..curr` between turns. Without it,
+            // push falls back to a textual delta of two `git diff HEAD`
+            // outputs — strictly less accurate (loses rename detection,
+            // misses commits made mid-session).
             head_sha = get_head_sha(&primary_canon);
-            // BR-1: re-read branch at save time. Cursor's session-level
-            // `activeBranch` is stale once the user switches branches
-            // mid-session; the working-tree branch is the truth.
+            // Cursor's session-level `activeBranch` reflects the branch
+            // when the session started; refresh from the working tree at
+            // save time so prompts after a mid-session checkout get the
+            // branch the work actually landed on.
             let fresh_branch = get_branch(&primary_canon);
             if !fresh_branch.is_empty() {
                 branch = fresh_branch;
             }
         }
 
-        // MR-1: snapshot every secondary touched repo (head_sha + git_diff
-        // + branch). The Cursor watcher doesn't have tool_calls in its
-        // bubble data — secondary repos are detected via the `diff_events`
-        // table — so we use the id-based variant of repo_snapshots. Push's
-        // `compute_incremental_diffs` consumes file_context.repo_snapshots.
+        // Snapshot every secondary touched repo (head_sha + git_diff +
+        // branch). Cursor's bubble data doesn't expose tool calls;
+        // secondary repos are detected via the `diff_events` table, which
+        // hands us a list of project IDs ready for the id-based variant
+        // of repo_snapshots. Push's `compute_incremental_diffs` consumes
+        // `file_context.repo_snapshots`.
         let proj_by_id_canonical: std::collections::BTreeMap<String, String> = {
             let registered = crate::projects::load();
             proj_id_to_canonical_paths(&registered)
@@ -434,10 +436,9 @@ impl PromptScanner {
         if let Some(snaps) = secondary_snaps {
             file_context.insert("repo_snapshots".into(), serde_json::Value::Object(snaps));
         }
-        // GD-2: tag drafts whose primary path isn't actually a git repo so
-        // reviewers see the diff is empty by design (no git available),
-        // not by failure (git ran but found no changes). Cheap one-call
-        // check; result not cached because this fires once per turn.
+        // Tag drafts whose primary path isn't a git repo so reviewers
+        // see the diff is empty by design (no git available), not by
+        // failure (git ran and found nothing).
         if !primary_canon.is_empty() && !is_git_repo(&primary_canon) {
             file_context.insert("git_unavailable".into(), serde_json::Value::Bool(true));
         }
@@ -449,9 +450,9 @@ impl PromptScanner {
             session_id: session_id.to_string(),
             project_id: proj.project_id.clone(),
             project_name: proj.name.clone(),
-            // BR-1: persist the per-prompt branch on the draft row
-            // (previously left empty for Cursor — only the bundle row had a
-            // branch via the supabase cursor_session upsert path).
+            // Persist the per-prompt branch on the draft row so push and
+            // the dashboard can attribute each prompt to the branch it
+            // was actually authored on (not just the bundle's branch).
             branch_name: branch.clone(),
             prompt_text: user_bubble.text.clone(),
             response_text: response_text.to_string(),
@@ -464,9 +465,9 @@ impl PromptScanner {
             ..Default::default()
         };
 
-        // GD-1: pass real head_sha (was previously "") so push's
-        // incremental-diff pipeline can produce `git diff prev..curr`
-        // rather than the lossy textual-delta fallback.
+        // head_sha must be passed through; push's incremental-diff
+        // pipeline keys on it for `git diff prev..curr`. An empty
+        // head_sha forces the lossy textual-delta fallback.
         if let Err(e) = store::save_draft(&record, &commit_shas, &git_diff, &head_sha) {
             display::print_error("cursor", &format!("Failed to save draft: {e}"));
             return;
@@ -617,12 +618,11 @@ pub fn force_sync(user_id: &str, max_files: usize) {
     let scanner = Arc::new(PromptScanner::new(dir, user_id.to_string(), None));
     for (path, _) in &files {
         if let Some((slug, sid)) = parse_transcript_path(path) {
-            // BUG-4: `pcr bundle` calls `force_sync` to pull in late-arriving
-            // prompts, but `get_session_meta` caches results for 60 s. Without
-            // explicit invalidation, a prompt the user sent seconds before
-            // running `pcr bundle` would still be missing from the next list.
-            // Drop the cache for each session we're about to re-process so the
-            // re-read sees the latest bubbles.
+            // `get_session_meta` caches per session for 60s. `pcr bundle`
+            // calls `force_sync` precisely to surface late-arriving
+            // prompts, so we must drop the cache before re-processing —
+            // otherwise the user sees a stale list missing the prompt
+            // they just sent.
             super::db::invalidate_session_cache(&sid);
             scanner.process_session(&slug, &sid);
         }
@@ -642,11 +642,12 @@ pub(crate) fn parse_transcript_path(path: &Path) -> Option<(String, String)> {
     for (i, p) in parts.iter().enumerate() {
         if *p == "agent-transcripts" && i >= 1 {
             let slug = parts[i - 1].to_string();
-            // Reject paths with an empty slug position — e.g.
-            // `/agent-transcripts/sid/sid.jsonl`. With slug=="" the downstream
-            // `get_all_projects_for_cursor_slug("")` ancestor-matches every
-            // registered project and falsely attributes the session.
-            // (BUG-8 in the cursor-watcher audit.)
+            // Reject paths with an empty slug position (e.g.
+            // `/agent-transcripts/sid/sid.jsonl`). With `slug == ""` the
+            // downstream `get_all_projects_for_cursor_slug("")` falls
+            // through to the ancestor-match branch and tags every
+            // registered project, which would silently misattribute the
+            // session.
             if slug.is_empty() {
                 return None;
             }
@@ -762,22 +763,23 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{take}…")
 }
 
-/// Picks which `diff_event` rows this turn is allowed to consume.
+/// Picks which `diff_event` rows this turn is allowed to consume and
+/// delete from the events table.
 ///
-/// **Why a filter exists at all** (BUG-1 in the cursor-watcher audit): the
-/// previous version consumed every event in the time window unconditionally,
-/// then deleted them. With multiple Cursor projects open in parallel, that
-/// meant project A's turn would delete project B's and C's pending diff
-/// events — and B/C would silently lose their `changed_files` attribution.
+/// **Why a filter is required.** With multiple Cursor projects open in
+/// parallel, an unfiltered consumer would let project A's completing
+/// turn delete project B's and C's pending diff events — and B/C would
+/// silently lose their `changed_files` attribution.
 ///
-/// Scope to the candidates the session was attributed to. We use the full
-/// `candidates` set rather than just `(proj + touched_ids)` so a project
-/// that's legitimately part of this Cursor session — but didn't happen to
-/// be hit by *this specific turn* — doesn't have its events bleed into the
-/// next session's bookkeeping.
+/// We scope to the session's `candidates` rather than just
+/// `(proj + touched_ids)` so a project that's part of this Cursor
+/// session — but didn't happen to be hit by *this specific turn* —
+/// doesn't have its events bleed into the next session's bookkeeping.
 ///
-/// Empty-filter fallback (no candidate has a Supabase `project_id`) takes
-/// every event, preserving prior behavior for not-yet-linked projects.
+/// When no candidate has a Supabase `project_id` (a session whose
+/// projects have been initialised locally but not yet pushed to the
+/// dashboard), the empty-filter branch consumes every event so the
+/// table doesn't accumulate orphaned rows forever.
 fn pick_consumed_event_ids(events: &[DiffEvent], candidates: &[Project]) -> Vec<i64> {
     let candidate_filter: HashSet<String> = candidates
         .iter()
@@ -816,7 +818,7 @@ mod tests {
         }
     }
 
-    // ── BUG-1 regression ────────────────────────────────────────────────────
+    // ── pick_consumed_event_ids ────────────────────────────────────────────
 
     #[test]
     fn pick_consumed_event_ids_filters_to_attributed_projects() {
@@ -834,8 +836,8 @@ mod tests {
     #[test]
     fn pick_consumed_event_ids_takes_all_when_candidates_have_no_project_id() {
         let events = vec![ev(1, "p1", &["x"]), ev(2, "p2", &["y"])];
-        // Local-only projects (not yet linked to Supabase): empty-filter
-        // fallback consumes everything, matching pre-BUG-1 behavior.
+        // Local-only projects (not yet linked to Supabase): the empty-
+        // filter branch consumes everything so events don't accumulate.
         let ids = pick_consumed_event_ids(&events, &[proj("", "p1", "/repo/p1")]);
         assert_eq!(ids, vec![1, 2]);
     }

@@ -85,14 +85,12 @@ pub fn run(_mode: OutputMode, args: BundleArgs) -> ExitCode {
 
 // ─── Core flows ────────────────────────────────────────────────────────────
 
-/// Historically this filter dropped Cursor agent-mode drafts with an empty
-/// `changed_files` array, on the assumption "no edits = nothing to bundle."
-/// That assumption silently hid every analytical agent prompt (`"explain
-/// this"`, `"find the bug"`, `"summarize the test failure"`) — the user's
-/// most common questions. We now keep all drafts and let the UI render them;
-/// the watcher tags the no-edits ones with `file_context.agent_no_edits =
-/// true` so a future filter can be opt-in instead of opt-out. This is a
-/// pure passthrough today.
+/// Passthrough: every captured draft surfaces in the bundle list. The
+/// watcher tags Cursor agent turns that didn't edit any file with
+/// `file_context.agent_no_edits = true`, so any future "hide no-edit
+/// agent turns" filter can read that flag — but we ship opt-in, not
+/// opt-out, since analytical prompts ("explain this", "find the bug")
+/// are legitimate work and the user's most common questions.
 fn filter_with_changed_files(drafts: Vec<DraftRecord>) -> Vec<DraftRecord> {
     drafts
 }

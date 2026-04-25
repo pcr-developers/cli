@@ -211,8 +211,7 @@ pub fn process_file(
         }
     }
     // Canonical paths so symlinked / aliased project paths attribute
-    // correctly when tool calls use the resolved path (EV-1 in the
-    // multi-repo audit).
+    // correctly when tool calls use the resolved path.
     let proj_by_id_path: BTreeMap<String, String> =
         proj_id_to_canonical_paths(&registered_projects);
     // Claude Code tool calls are absolute in practice, but we pass a cwd
@@ -228,7 +227,7 @@ pub fn process_file(
     ) -> &'a GitData {
         if !cache.contains_key(path) {
             // Use the canonical path for git ops so symlinked workspaces
-            // produce diffs against the real on-disk repo (EV-1).
+            // produce diffs against the real on-disk repo.
             let canon = canonicalize_project_path(path);
             let git_diff = get_git_diff(&canon);
             let head_sha = get_head_sha(&canon);
@@ -292,9 +291,9 @@ pub fn process_file(
                 fc.insert("repo_snapshots".into(), Value::Object(snaps));
             }
             let ids = touched_project_ids(&p.tool_calls, &proj_by_id_path, cwd);
-            // Only store touched_project_ids when there's >1 — when it's
-            // just the primary, project_id already carries the info and
-            // the redundancy bloats the row. (TP-1/TP-2 consistency.)
+            // Only store touched_project_ids when there's >1. When it's
+            // just the primary, project_id already carries that fact;
+            // the redundant array bloats the row for no benefit.
             if ids.len() > 1 {
                 fc.insert(
                     "touched_project_ids".into(),
@@ -334,7 +333,7 @@ pub fn process_file(
         p.project_name = project.name.clone();
 
         let ids = touched_project_ids(&p.tool_calls, &proj_by_id_path, cwd);
-        // Multi-touched only — see TP comment above.
+        // Multi-touched only — see comment above on storage gating.
         if ids.len() > 1 {
             merged.insert(
                 "touched_project_ids".into(),
@@ -366,18 +365,18 @@ pub fn process_file(
             let fc = p.file_context.get_or_insert_with(serde_json::Map::new);
             fc.insert("repo_snapshots".into(), Value::Object(snaps));
         }
-        // GD-2: tag drafts captured against directories that aren't actually
-        // git repos so reviewers see why the diff is empty (vs. silently
-        // attributing an empty diff to "no changes"). Cheap one-call check;
-        // result cached by GitData.
+        // Tag drafts captured against directories that aren't git repos
+        // so reviewers see the empty diff is by-design (no git available)
+        // rather than by-failure (git ran and found no changes).
         if !resolved_path.is_empty() && !is_git_repo(&resolved_path) {
             let fc = p.file_context.get_or_insert_with(serde_json::Map::new);
             fc.insert("git_unavailable".into(), Value::Bool(true));
         }
-        // BR-1: re-read the branch at save time so prompts in long sessions
-        // where the user switched branches get the right attribution. The
-        // session-level branch (from cwd at session start) is preserved on
-        // the bundle row but each prompt records its own branch_name.
+        // Re-read branch at save time so prompts in long sessions that
+        // crossed a `git switch` get attributed to the branch they
+        // actually landed on. The session-level branch (cwd at session
+        // start) is still on the bundle row, but each prompt records
+        // its own branch_name.
         if !resolved_path.is_empty() {
             let fresh_branch = get_branch(&resolved_path);
             if !fresh_branch.is_empty() {
