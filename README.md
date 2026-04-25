@@ -31,8 +31,6 @@
 - [Team workflow](#-team-workflow)
 - [Privacy and security](#-privacy-and-security)
 - [Use inside agents and CI](#-use-inside-agents-and-ci)
-- [Pricing & plans](#-pricing--plans)
-- [Comparisons](#-comparisons)
 - [Frequently asked questions](#-frequently-asked-questions)
 - [Build from source](#-build-from-source)
 - [Contributing](#-contributing)
@@ -322,28 +320,6 @@ pcr --json status                     # parse the pipeline state
 pcr --plain log                       # get every prompt as plain text
 pcr --plain bundle "agent run" --select all && pcr --plain push
 ```
-
----
-
-## 💸 Pricing & plans
-
-The `pcr` CLI is and will always be **free and open source under Apache 2.0**.
-
-The team dashboard at [pcr.dev](https://pcr.dev) has paid plans for teams
-that want shared review, role-based access, GitHub PR integration, and
-enterprise SSO. See [pcr.dev/pricing](https://pcr.dev/pricing) for current
-tiers. Solo developers can use the dashboard free indefinitely.
-
----
-
-## 📊 Comparisons
-
-| Tool | What it does | Where PCR is different |
-|---|---|---|
-| **GitHub Copilot Reviews** | AI reviews diffs | PCR puts *humans* in the loop on the *prompts that wrote the diff* — not the diff itself. |
-| **Cursor / Claude Code session history** | Local browse-only history | PCR aggregates, attributes to git refs, and makes prompts shareable / reviewable across a team. |
-| **Generic logging tools (Datadog, Logflare)** | Stream all events somewhere | PCR is purpose-built around the *review* loop: bundles, comments, PR linking, threading, model badges. |
-| **DIY bash scripts that grep `~/.cursor/`** | Brittle one-offs | PCR is a maintained, schema-versioned local store with a real watcher per source and a stable upgrade path. |
 
 ---
 
