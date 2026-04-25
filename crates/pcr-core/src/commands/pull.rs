@@ -11,7 +11,8 @@ use crate::util::text::{parse_first_index, plural};
 
 pub fn run(_mode: OutputMode, args: PullArgs) -> ExitCode {
     let Some(a) = auth::load() else {
-        display::eprintln("not logged in — run `pcr login`");
+        display::eprintln("PCR: not logged in.");
+        display::print_hint("run `pcr login` first");
         return ExitCode::AuthRequired;
     };
 
@@ -27,6 +28,7 @@ pub fn run(_mode: OutputMode, args: PullArgs) -> ExitCode {
         };
         if pushed.is_empty() {
             display::eprintln("PCR: No pushed prompt bundles found.");
+            display::print_hint("nothing to pull until someone pushes a bundle from PCR.dev");
             return ExitCode::Success;
         }
         display::eprintln("Pushed prompt bundles:\n");
@@ -41,7 +43,7 @@ pub fn run(_mode: OutputMode, args: PullArgs) -> ExitCode {
         display::eprintln("");
         if !agent::is_interactive_terminal() {
             display::eprintln("PCR: Interactive mode not available in this terminal.");
-            display::eprintln("     Use flags: pcr pull <bundle-id>");
+            display::print_hint("pass the bundle ID directly: `pcr pull <bundle-id>`");
             return ExitCode::InteractiveUnavailable;
         }
         display::eprint("Select bundle to pull [number]: ");

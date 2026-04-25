@@ -24,7 +24,12 @@ impl CaptureSource for Source {
     }
     fn start(&self, user_id: &str) {
         let dir = workspace::workspace_storage_dir();
-        display::print_watcher_ready("VS Code", &dir.display().to_string());
+        display::print_watcher_initializing("VS Code");
+        if !dir.exists() {
+            display::print_watcher_missing("VS Code", &dir.display().to_string());
+        } else {
+            display::print_watcher_ready("VS Code", &dir.display().to_string());
+        }
         watcher::run(user_id, &dir);
     }
 }

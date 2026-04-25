@@ -71,12 +71,8 @@ pub fn run(_mode: OutputMode, args: GcArgs) -> ExitCode {
             match raw.parse::<i64>() {
                 Ok(n) if n > 0 => n,
                 _ => {
-                    display::print_error(
-                        "gc",
-                        &format!(
-                            "invalid --older-than value: {s:?}. Expected e.g. \"30d\" or \"7\""
-                        ),
-                    );
+                    display::print_error("gc", &format!("invalid --older-than value: {s:?}"));
+                    display::print_hint("examples:  --older-than 30d   --older-than 7");
                     return ExitCode::Usage;
                 }
             }

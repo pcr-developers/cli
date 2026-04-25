@@ -31,16 +31,12 @@ pub fn run(user_id: &str, dir: &Path) {
     let dedup = Deduplicator::new();
     let dir = dir.to_path_buf();
 
+    display::print_watcher_initializing("Claude Code");
     if !dir.exists() {
-        display::print_error(
-            "claude-code",
-            &format!(
-                "Directory not found: {}. Will activate when it appears.",
-                dir.display()
-            ),
-        );
+        display::print_watcher_missing("Claude Code", &dir.display().to_string());
+    } else {
+        display::print_watcher_ready("Claude Code", &dir.display().to_string());
     }
-    display::print_watcher_ready("Claude Code", &dir.display().to_string());
 
     // Initial walk: register baselines for every existing .jsonl.
     for entry in WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {

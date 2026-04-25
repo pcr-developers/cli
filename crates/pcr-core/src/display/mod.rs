@@ -1,8 +1,28 @@
-//! Colored line-based output. Mirrors `cli/internal/display/display.go`
-//! byte-for-byte when `agent::colors_enabled(..)` is true — this is the
-//! "plain" output path that agents, scripts, and CI see.
+//! Colored line-based output **and** structured event broadcasting.
 //!
-//! All output goes to stderr so it never interferes with MCP stdio.
+//! The display module has two output paths:
+//!
+//! 1. **Line mode (default)** — every `print_*` writes to stderr. Output is
+//!    byte-compatible with the Go CLI when colors are enabled, and downgrades
+//!    cleanly when stdout/stderr isn't a TTY, `NO_COLOR` is set, etc. This is
+//!    what scripts, CI, and agentic IDEs see.
+//!
+//! 2. **TUI mode** — `pcr start` (and other ratatui commands) calls
+//!    [`install_sink`] before entering the alternate screen. Once a sink is
+//!    installed, every `print_*` routes its content through that
+//!    [`mpsc::Sender<DisplayEvent>`] **instead of** stderr. The TUI's main
+//!    loop drains the channel and renders events into widgets without any
+//!    bytes ever reaching the terminal directly.
+//!
+//! This split is what stops watcher threads from corrupting the alternate
+//! screen — pre-refactor, every `display::print_watcher_ready` call from a
+//! background thread interleaved raw ANSI into ratatui's framebuffer.
+
+pub mod events;
+pub mod sink;
+
+pub use events::{DisplayEvent, SourceState};
+pub use sink::{install_sink, sink_active, take_sink, with_sink};
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -28,6 +48,7 @@ const DIM: &str = "\x1b[2m";
 const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
 const MAGENTA: &str = "\x1b[35m";
 const GRAY: &str = "\x1b[90m";
 
@@ -39,8 +60,26 @@ fn c(code: &str, text: &str) -> String {
     }
 }
 
-/// Startup banner. Matches `display.PrintStartupBanner`.
+// ─── Line-mode writers ───────────────────────────────────────────────────────
+//
+// Each writer first checks for an installed sink; if one is present the
+// content goes through the structured [`DisplayEvent`] path, otherwise it
+// falls through to stderr (the historical Go-compatible output).
+
+/// Startup banner. Matches `display.PrintStartupBanner` in line mode; when a
+/// sink is active it sends a [`DisplayEvent::Banner`] so the TUI can render
+/// it inside its own header instead of leaking ANSI into the alt screen.
 pub fn print_startup_banner(version: &str, build_time: &str, project_count: usize) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::Banner {
+            version: version.to_string(),
+            build_time: build_time.to_string(),
+            project_count,
+        });
+    }) {
+        return;
+    }
+
     let w = 56;
     let line: String = "─".repeat(w);
     let mut version_str = format!("v{version}");
@@ -124,8 +163,26 @@ fn shrink_preview(text: &str, n: usize) -> String {
     s
 }
 
-/// Print a successfully-captured exchange. Matches `display.PrintCaptured`.
+/// Print a successfully-captured exchange. Routes to the sink in TUI mode,
+/// otherwise renders the canonical Go-compatible block to stderr.
 pub fn print_captured(opts: &CaptureDisplayOptions<'_>) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::Captured {
+            project_name: opts.project_name.to_string(),
+            branch: opts.branch.to_string(),
+            model: opts.model.to_string(),
+            prompt_text: opts.prompt_text.to_string(),
+            tool_summary: summarize_tools(opts.tool_calls),
+            input_tokens: opts.input_tokens,
+            output_tokens: opts.output_tokens,
+            exchange_count: opts.exchange_count,
+            project_url: opts.project_url.to_string(),
+            timestamp: local_hms(),
+        });
+    }) {
+        return;
+    }
+
     let ts = local_hms();
     let branch_str = if opts.branch.is_empty() {
         String::new()
@@ -200,8 +257,20 @@ pub struct DraftDisplayOptions<'a> {
     pub exchange_count: u64,
 }
 
-/// Print a locally-saved draft. Matches `display.PrintDrafted`.
+/// Print a locally-saved draft.
 pub fn print_drafted(opts: &DraftDisplayOptions<'_>) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::Drafted {
+            project_name: opts.project_name.to_string(),
+            branch: opts.branch.to_string(),
+            prompt_text: opts.prompt_text.to_string(),
+            exchange_count: opts.exchange_count,
+            timestamp: local_hms(),
+        });
+    }) {
+        return;
+    }
+
     let ts = local_hms();
     let branch_str = if opts.branch.is_empty() {
         String::new()
@@ -235,7 +304,21 @@ pub fn print_drafted(opts: &DraftDisplayOptions<'_>) {
     let _ = writeln!(err);
 }
 
+/// Announce that a watcher is up and watching `dir`. In TUI mode this becomes
+/// a [`SourceState::Ready`] update so the dashboard's watcher table reflects
+/// real state instead of a hardcoded "ready" string.
 pub fn print_watcher_ready(source_name: &str, dir: &str) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::SourceState {
+            source: source_name.to_string(),
+            state: SourceState::Ready {
+                dir: dir.to_string(),
+            },
+        });
+    }) {
+        return;
+    }
+
     let stderr = io::stderr();
     let mut err = stderr.lock();
     let _ = writeln!(
@@ -246,11 +329,53 @@ pub fn print_watcher_ready(source_name: &str, dir: &str) {
     );
 }
 
+/// Announce that a watcher is initializing. Has no line-mode counterpart by
+/// design — the legacy CLI didn't emit anything here, and we don't want to
+/// introduce noise in plain mode.
+pub fn print_watcher_initializing(source_name: &str) {
+    let _ = with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::SourceState {
+            source: source_name.to_string(),
+            state: SourceState::Initializing,
+        });
+    });
+}
+
+/// Announce that a watcher discovered its target directory is missing. In
+/// line mode we still emit the historical warning via [`print_error`].
+pub fn print_watcher_missing(source_name: &str, dir: &str) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::SourceState {
+            source: source_name.to_string(),
+            state: SourceState::Missing {
+                dir: dir.to_string(),
+            },
+        });
+    }) {
+        return;
+    }
+    print_error(
+        source_name,
+        &format!("Directory not found: {dir}. Will activate when it appears."),
+    );
+}
+
 pub fn print_verbose_event(source: &str, msg: &str) {
     if !is_verbose() {
         return;
     }
+
     let ts = local_hms();
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::Verbose {
+            source: source.to_string(),
+            msg: msg.to_string(),
+            timestamp: ts.clone(),
+        });
+    }) {
+        return;
+    }
+
     let stderr = io::stderr();
     let mut err = stderr.lock();
     let _ = writeln!(
@@ -263,18 +388,54 @@ pub fn print_verbose_event(source: &str, msg: &str) {
 }
 
 pub fn print_error(context: &str, msg: &str) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::Error {
+            context: context.to_string(),
+            msg: msg.to_string(),
+            timestamp: local_hms(),
+        });
+    }) {
+        return;
+    }
+
     let stderr = io::stderr();
     let mut err = stderr.lock();
     let _ = writeln!(err, "  {} {}", c(YELLOW, &format!("⚠  {context}:")), msg);
 }
 
+/// Append a "next action" hint after an error or empty-state message.
+/// Phase 3 wires this into every command so users always know what to type.
+pub fn print_hint(msg: &str) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::Hint {
+            msg: msg.to_string(),
+        });
+    }) {
+        return;
+    }
+
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let _ = writeln!(err, "  {} {}", c(CYAN, "→"), c(DIM, msg));
+}
+
 pub fn eprintln(msg: &str) {
+    if with_sink(|tx| {
+        let _ = tx.send(DisplayEvent::Line {
+            msg: msg.to_string(),
+        });
+    }) {
+        return;
+    }
+
     let stderr = io::stderr();
     let mut err = stderr.lock();
     let _ = writeln!(err, "{msg}");
 }
 
 pub fn eprint(msg: &str) {
+    // Bare prompts (no newline) are interactive — they only make sense in
+    // line mode. We never route these through the sink.
     let stderr = io::stderr();
     let mut err = stderr.lock();
     let _ = write!(err, "{msg}");
@@ -289,6 +450,7 @@ pub fn cstr(code_kind: Color, text: &str) -> String {
         Color::Cyan => CYAN,
         Color::Green => GREEN,
         Color::Yellow => YELLOW,
+        Color::Red => RED,
         Color::Magenta => MAGENTA,
         Color::Gray => GRAY,
     };
@@ -303,6 +465,7 @@ pub enum Color {
     Cyan,
     Green,
     Yellow,
+    Red,
     Magenta,
     Gray,
 }

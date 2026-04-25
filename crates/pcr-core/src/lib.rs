@@ -32,6 +32,7 @@ pub mod config;
 pub mod display;
 pub mod entry;
 pub mod exit;
+pub mod help;
 pub mod mcp;
 pub mod projects;
 pub mod sources;

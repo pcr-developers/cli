@@ -42,7 +42,12 @@ impl PromptScanner {
     }
 
     pub fn start(self: Arc<Self>) {
-        display::print_watcher_ready("Cursor", &self.dir.display().to_string());
+        display::print_watcher_initializing("Cursor");
+        if !self.dir.exists() {
+            display::print_watcher_missing("Cursor", &self.dir.display().to_string());
+        } else {
+            display::print_watcher_ready("Cursor", &self.dir.display().to_string());
+        }
         // Initial silent scan.
         self.scan();
         if let Ok(mut flag) = self.initial_scan.lock() {
