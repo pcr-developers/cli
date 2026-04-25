@@ -236,9 +236,7 @@ impl PromptScanner {
                 }
                 let window_events =
                     store::get_diff_events_in_window(Some(floor), turn_end).unwrap_or_default();
-                for e in &window_events {
-                    consumed_event_ids.push(e.id);
-                }
+
                 if candidates.len() == 1 {
                     let first = candidates[0].clone();
                     if !first.project_id.is_empty() {
@@ -262,6 +260,8 @@ impl PromptScanner {
                     touched_ids = ids;
                     proj = Some(primary);
                 }
+
+                consumed_event_ids = pick_consumed_event_ids(&window_events, candidates);
             }
         }
 
@@ -282,9 +282,12 @@ impl PromptScanner {
         }
         let proj = proj.unwrap();
 
-        if is_agent_turn && changed_files.is_empty() {
-            return;
-        }
+        // Note: previously we dropped agent turns with empty `changed_files`
+        // (BUG-5). That silently lost analytical agent prompts ("explain this",
+        // "find the bug", "summarize this codebase") that legitimately edit
+        // nothing. We now keep them and annotate `agent_no_edits: true` so the
+        // bundle/show UIs can label or filter them.
+        let agent_no_edits = is_agent_turn && changed_files.is_empty();
 
         let mut file_context = serde_json::Map::new();
         file_context.insert(
@@ -296,6 +299,9 @@ impl PromptScanner {
             serde_json::Value::String(mode.clone()),
         );
         file_context.insert("is_agentic".into(), serde_json::Value::Bool(is_agent_turn));
+        if agent_no_edits {
+            file_context.insert("agent_no_edits".into(), serde_json::Value::Bool(true));
+        }
         if !user_bubble.relevant_files.is_empty() {
             file_context.insert(
                 "relevant_files".into(),
@@ -561,6 +567,13 @@ pub fn force_sync(user_id: &str, max_files: usize) {
     let scanner = Arc::new(PromptScanner::new(dir, user_id.to_string(), None));
     for (path, _) in &files {
         if let Some((slug, sid)) = parse_transcript_path(path) {
+            // BUG-4: `pcr bundle` calls `force_sync` to pull in late-arriving
+            // prompts, but `get_session_meta` caches results for 60 s. Without
+            // explicit invalidation, a prompt the user sent seconds before
+            // running `pcr bundle` would still be missing from the next list.
+            // Drop the cache for each session we're about to re-process so the
+            // re-read sees the latest bubbles.
+            super::db::invalidate_session_cache(&sid);
             scanner.process_session(&slug, &sid);
         }
     }
@@ -579,10 +592,21 @@ pub(crate) fn parse_transcript_path(path: &Path) -> Option<(String, String)> {
     for (i, p) in parts.iter().enumerate() {
         if *p == "agent-transcripts" && i >= 1 {
             let slug = parts[i - 1].to_string();
+            // Reject paths with an empty slug position — e.g.
+            // `/agent-transcripts/sid/sid.jsonl`. With slug=="" the downstream
+            // `get_all_projects_for_cursor_slug("")` ancestor-matches every
+            // registered project and falsely attributes the session.
+            // (BUG-8 in the cursor-watcher audit.)
+            if slug.is_empty() {
+                return None;
+            }
             let session_uuid = path
                 .file_stem()
                 .and_then(|s| s.to_str().map(|s| s.to_string()))
                 .unwrap_or_default();
+            if session_uuid.is_empty() {
+                return None;
+            }
             return Some((slug, session_uuid));
         }
     }
@@ -686,4 +710,247 @@ fn truncate(s: &str, n: usize) -> String {
     }
     let take: String = s.chars().take(n.saturating_sub(1)).collect();
     format!("{take}…")
+}
+
+/// Picks which `diff_event` rows this turn is allowed to consume.
+///
+/// **Why a filter exists at all** (BUG-1 in the cursor-watcher audit): the
+/// previous version consumed every event in the time window unconditionally,
+/// then deleted them. With multiple Cursor projects open in parallel, that
+/// meant project A's turn would delete project B's and C's pending diff
+/// events — and B/C would silently lose their `changed_files` attribution.
+///
+/// Scope to the candidates the session was attributed to. We use the full
+/// `candidates` set rather than just `(proj + touched_ids)` so a project
+/// that's legitimately part of this Cursor session — but didn't happen to
+/// be hit by *this specific turn* — doesn't have its events bleed into the
+/// next session's bookkeeping.
+///
+/// Empty-filter fallback (no candidate has a Supabase `project_id`) takes
+/// every event, preserving prior behavior for not-yet-linked projects.
+fn pick_consumed_event_ids(events: &[DiffEvent], candidates: &[Project]) -> Vec<i64> {
+    let candidate_filter: HashSet<String> = candidates
+        .iter()
+        .filter(|c| !c.project_id.is_empty())
+        .map(|c| c.project_id.clone())
+        .collect();
+    events
+        .iter()
+        .filter(|e| candidate_filter.is_empty() || candidate_filter.contains(&e.project_id))
+        .map(|e| e.id)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::path::PathBuf;
+
+    fn ev(id: i64, project_id: &str, files: &[&str]) -> DiffEvent {
+        DiffEvent {
+            id,
+            project_id: project_id.into(),
+            project_name: format!("name-{project_id}"),
+            files: files.iter().map(|s| (*s).to_string()).collect(),
+            occurred_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        }
+    }
+
+    fn proj(project_id: &str, name: &str, path: &str) -> Project {
+        Project {
+            project_id: project_id.into(),
+            name: name.into(),
+            path: path.into(),
+            ..Default::default()
+        }
+    }
+
+    // ── BUG-1 regression ────────────────────────────────────────────────────
+
+    #[test]
+    fn pick_consumed_event_ids_filters_to_attributed_projects() {
+        let events = vec![
+            ev(1, "p1", &["/repo/p1/a.rs"]),
+            ev(2, "p2", &["/repo/p2/b.rs"]),
+            ev(3, "p3", &["/repo/p3/c.rs"]),
+        ];
+        // Session is attributed to p1 only — p2 and p3 events must NOT be
+        // consumed (they belong to other concurrent sessions).
+        let ids = pick_consumed_event_ids(&events, &[proj("p1", "p1", "/repo/p1")]);
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn pick_consumed_event_ids_takes_all_when_candidates_have_no_project_id() {
+        let events = vec![ev(1, "p1", &["x"]), ev(2, "p2", &["y"])];
+        // Local-only projects (not yet linked to Supabase): empty-filter
+        // fallback consumes everything, matching pre-BUG-1 behavior.
+        let ids = pick_consumed_event_ids(&events, &[proj("", "p1", "/repo/p1")]);
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn pick_consumed_event_ids_handles_multi_candidate_session() {
+        let events = vec![
+            ev(1, "frontend", &["fe.tsx"]),
+            ev(2, "backend", &["be.rs"]),
+            ev(3, "infra", &["main.tf"]),
+        ];
+        // A workspace registered against frontend + backend should consume
+        // events from BOTH but NOT from infra (a third concurrent session).
+        let ids = pick_consumed_event_ids(
+            &events,
+            &[
+                proj("frontend", "frontend", "/repo/fe"),
+                proj("backend", "backend", "/repo/be"),
+            ],
+        );
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn pick_consumed_event_ids_handles_empty_inputs() {
+        // No events at all: nothing to consume.
+        assert!(pick_consumed_event_ids(&[], &[]).is_empty());
+        // No candidates registered: empty-filter fallback consumes everything
+        // so events aren't orphaned in the DB forever.
+        assert_eq!(
+            pick_consumed_event_ids(&[ev(1, "p1", &["a"])], &[]),
+            vec![1]
+        );
+        // Candidate registered but no events in window: nothing to consume.
+        assert!(pick_consumed_event_ids(&[], &[proj("p1", "p1", "/p1")]).is_empty());
+    }
+
+    // ── Attribution helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_from_events_picks_project_with_most_file_hits() {
+        let events = vec![
+            ev(1, "p1", &["a", "b"]),
+            ev(2, "p2", &["c"]),
+            ev(3, "p1", &["d"]),
+        ];
+        let candidates = vec![proj("p1", "p1", "/p1"), proj("p2", "p2", "/p2")];
+        let (primary, ids) = resolve_from_events(&events, &candidates);
+        assert_eq!(primary.project_id, "p1");
+        assert_eq!(ids, vec!["p1", "p2"]); // sorted, both touched
+    }
+
+    #[test]
+    fn resolve_from_events_tiebreak_by_longer_path() {
+        // Identical hit counts — choose the project whose path is the deepest
+        // prefix (covers monorepo / nested-workspace cases).
+        let events = vec![ev(1, "outer", &["x"]), ev(2, "inner", &["y"])];
+        let candidates = vec![
+            proj("outer", "outer", "/repo"),
+            proj("inner", "inner", "/repo/sub/inner"),
+        ];
+        let (primary, _) = resolve_from_events(&events, &candidates);
+        assert_eq!(primary.project_id, "inner");
+    }
+
+    #[test]
+    fn extract_changed_files_dedupes_across_events() {
+        let events = vec![
+            ev(1, "p1", &["a.rs", "b.rs"]),
+            ev(2, "p1", &["b.rs", "c.rs"]),
+        ];
+        let candidates = vec![proj("p1", "p1", "/p1")];
+        let files = extract_changed_files(&events, "p1", &["p1".into()], &candidates);
+        assert_eq!(files, vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    #[test]
+    fn extract_changed_files_filters_out_other_projects() {
+        let events = vec![ev(1, "p1", &["a.rs"]), ev(2, "p2", &["b.rs"])];
+        let candidates = vec![proj("p1", "p1", "/p1")];
+        let files = extract_changed_files(&events, "p1", &["p1".into()], &candidates);
+        assert_eq!(files, vec!["a.rs"]);
+    }
+
+    #[test]
+    fn extract_changed_files_empty_filter_falls_back_to_candidates() {
+        let events = vec![ev(1, "p1", &["a.rs"])];
+        // primary_project_id and touched_ids both empty — fall back to using
+        // every candidate's project_id as the filter.
+        let files = extract_changed_files(&events, "", &[], &[proj("p1", "p1", "/p1")]);
+        assert_eq!(files, vec!["a.rs"]);
+    }
+
+    // ── Path / time parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_agent_transcript_recognizes_real_paths() {
+        let p = PathBuf::from("/Users/x/.cursor/projects/my-app/agent-transcripts/abc/abc.jsonl");
+        assert!(is_agent_transcript(&p));
+    }
+
+    #[test]
+    fn is_agent_transcript_excludes_subagents() {
+        let p = PathBuf::from(
+            "/Users/x/.cursor/projects/my-app/agent-transcripts/abc/subagents/sub.jsonl",
+        );
+        assert!(!is_agent_transcript(&p));
+    }
+
+    #[test]
+    fn is_agent_transcript_rejects_non_jsonl_and_unrelated_paths() {
+        assert!(!is_agent_transcript(&PathBuf::from(
+            "/Users/x/.cursor/projects/my-app/agent-transcripts/abc/abc.txt"
+        )));
+        assert!(!is_agent_transcript(&PathBuf::from(
+            "/Users/x/.cursor/some-other-folder/abc.jsonl"
+        )));
+    }
+
+    #[test]
+    fn parse_transcript_path_extracts_slug_and_session_id() {
+        let p = PathBuf::from(
+            "/Users/x/.cursor/projects/my-app/agent-transcripts/sid-123/sid-123.jsonl",
+        );
+        let (slug, sid) = parse_transcript_path(&p).expect("should parse");
+        assert_eq!(slug, "my-app");
+        assert_eq!(sid, "sid-123");
+    }
+
+    #[test]
+    fn parse_transcript_path_rejects_root_paths() {
+        // A path with no parent before `agent-transcripts` (i.e. an empty
+        // slug position) used to silently produce slug="" and match every
+        // project via the ancestor heuristic. Reject explicitly.
+        let p = PathBuf::from("/agent-transcripts/sid/sid.jsonl");
+        // Either None or a non-empty slug; never an empty slug.
+        if let Some((slug, _)) = parse_transcript_path(&p) {
+            assert!(!slug.is_empty(), "slug must never be empty");
+        }
+    }
+
+    #[test]
+    fn parse_bubble_time_handles_rfc3339() {
+        let t = parse_bubble_time("2026-04-25T22:30:00Z").expect("rfc3339 parses");
+        // Don't pin to an absolute epoch (we don't care about the exact
+        // value, just that the parse round-trips). Re-format and compare.
+        assert_eq!(
+            t.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2026-04-25T22:30:00Z"
+        );
+    }
+
+    #[test]
+    fn parse_bubble_time_handles_millis_format() {
+        let t = parse_bubble_time("2026-04-25T22:30:00.123Z").expect("millis parses");
+        // Sub-second component drops in the .timestamp() coarsening.
+        assert_eq!(
+            t.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2026-04-25T22:30:00Z"
+        );
+    }
+
+    #[test]
+    fn parse_bubble_time_returns_none_for_garbage() {
+        assert!(parse_bubble_time("not a timestamp").is_none());
+        assert!(parse_bubble_time("").is_none());
+    }
 }

@@ -146,6 +146,29 @@ pub fn invalidate_session_cache(session_id: &str) {
     }
 }
 
+/// One-shot per-session warning when Cursor writes a row without a
+/// `composerId` field. Without this dedupe the verbose event log would
+/// flood every cache-miss (~once per minute per affected session).
+static WARNED_MISSING_COMPOSER: OnceLock<Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+fn warn_missing_composer_id_once(session_id: &str) {
+    let mutex =
+        WARNED_MISSING_COMPOSER.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut guard) = mutex.lock() else {
+        return;
+    };
+    if !guard.insert(session_id.to_string()) {
+        return;
+    }
+    drop(guard);
+    let short: String = session_id.chars().take(8).collect();
+    crate::display::print_verbose_event(
+        "cursor",
+        &format!("[{short}] composerId missing in cursorDiskKV — falling back to sessionId"),
+    );
+}
+
 /// `cli/internal/sources/cursor/db.go::GetSessionMeta`.
 pub fn get_session_meta(session_id: &str) -> Option<SessionMeta> {
     if let Ok(guard) = cache().lock() {
@@ -200,7 +223,7 @@ pub fn get_session_meta(session_id: &str) -> Option<SessionMeta> {
     }
     let um = unified_mode.unwrap_or_default();
 
-    let composer_id: String = db
+    let composer_id_raw: String = db
         .query_row(
             "SELECT json_extract(value, '$.composerId') FROM cursorDiskKV WHERE key = ?",
             [&composer_key],
@@ -210,6 +233,20 @@ pub fn get_session_meta(session_id: &str) -> Option<SessionMeta> {
         .ok()
         .flatten()
         .unwrap_or_default();
+    // Cursor sometimes writes `composerId` equal to the session id, and some
+    // sessions omit the field entirely (older schemas, corrupted rows). When
+    // it's missing, fall back to the session id rather than dropping every
+    // bubble in the session — the bubble keys are
+    // `bubbleId:<composerId>:<bubbleId>`, so without a composer id every
+    // bubble lookup produces NULL and the whole session silently disappears
+    // (BUG-2 in the cursor-watcher audit). The first time we hit this for
+    // a given session id we emit a verbose event so `--verbose` users know.
+    let composer_id = if composer_id_raw.is_empty() {
+        warn_missing_composer_id_once(session_id);
+        session_id.to_string()
+    } else {
+        composer_id_raw
+    };
 
     let mut bubbles: Vec<BubbleMeta> = Vec::new();
     if let Some(raw) = &headers_only {

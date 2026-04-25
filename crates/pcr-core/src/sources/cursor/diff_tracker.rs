@@ -87,17 +87,15 @@ impl DiffTracker {
             if fresh_start || !known_project {
                 continue;
             }
-            let mut changed: Vec<String> = Vec::new();
-            for (rel, hash) in &current {
-                if prev.get(rel) != Some(hash) {
-                    changed.push(
-                        PathBuf::from(&p.path)
-                            .join(rel)
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                }
-            }
+            let changed: Vec<String> = changed_relpaths(&prev, &current)
+                .into_iter()
+                .map(|rel| {
+                    PathBuf::from(&p.path)
+                        .join(rel)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
             if !changed.is_empty() {
                 let _ = store::record_diff_event(&p.project_id, &p.name, &changed, now);
                 for f in &changed {
@@ -159,6 +157,42 @@ fn save_state(inner: &Arc<Mutex<Inner>>) {
     let _ = std::fs::write(state_path(), bytes);
 }
 
+/// Compute the set of relative paths that changed between two dirty-file
+/// snapshots. Iterates the union of keys so we catch all three cases
+/// (BUG-3 in the cursor-watcher audit):
+///
+/// 1. **Appeared** — present in `current` but not in `prev`. A file the
+///    user just started editing.
+/// 2. **Modified** — present in both with different hashes. A file edited
+///    again since the last poll.
+/// 3. **Disappeared** — present in `prev` but not in `current`. The file
+///    went from dirty to clean — committed, reverted, or stashed. Without
+///    this case, agent turns whose `Bash` tool committed mid-stream lost
+///    attribution and got dropped by the empty-`changed_files` bail.
+///
+/// Returns paths in deterministic order (sorted) so test snapshots are
+/// stable. Production code re-orders these via the per-event JSON encode
+/// anyway, so the cost of the sort is irrelevant.
+fn changed_relpaths(
+    prev: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut keys: HashSet<&String> = HashSet::new();
+    for k in current.keys() {
+        keys.insert(k);
+    }
+    for k in prev.keys() {
+        keys.insert(k);
+    }
+    let mut out: Vec<String> = keys
+        .into_iter()
+        .filter(|rel| current.get(*rel) != prev.get(*rel))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
 // ─── Git helpers ─────────────────────────────────────────────────────────────
 
 fn dirty_hashes(project_path: &str) -> HashMap<String, String> {
@@ -198,4 +232,73 @@ fn dirty_hashes(project_path: &str) -> HashMap<String, String> {
         result.insert(rel, short);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn appeared_files_are_recorded() {
+        let prev = map(&[]);
+        let current = map(&[("src/a.rs", "h1"), ("src/b.rs", "h2")]);
+        assert_eq!(
+            changed_relpaths(&prev, &current),
+            vec!["src/a.rs", "src/b.rs"]
+        );
+    }
+
+    #[test]
+    fn modified_files_are_recorded() {
+        let prev = map(&[("src/a.rs", "h1"), ("src/b.rs", "h2")]);
+        let current = map(&[("src/a.rs", "h1-new"), ("src/b.rs", "h2")]);
+        assert_eq!(changed_relpaths(&prev, &current), vec!["src/a.rs"]);
+    }
+
+    /// BUG-3 regression test. A file that was dirty in the previous poll but
+    /// is now clean (committed, reverted, or stashed) MUST appear in the
+    /// changed set so agent turns whose `Bash` tool committed mid-stream
+    /// don't lose attribution.
+    #[test]
+    fn disappeared_files_are_recorded() {
+        let prev = map(&[("src/a.rs", "h1"), ("src/b.rs", "h2")]);
+        let current = map(&[("src/a.rs", "h1")]); // b.rs got committed
+        assert_eq!(changed_relpaths(&prev, &current), vec!["src/b.rs"]);
+    }
+
+    #[test]
+    fn nothing_changes_returns_empty() {
+        let same = map(&[("src/a.rs", "h1"), ("src/b.rs", "h2")]);
+        assert!(changed_relpaths(&same, &same).is_empty());
+    }
+
+    #[test]
+    fn mixed_appearance_modification_and_disappearance() {
+        let prev = map(&[
+            ("kept.rs", "k"),
+            ("modified.rs", "m1"),
+            ("committed.rs", "c"),
+        ]);
+        let current = map(&[
+            ("kept.rs", "k"),
+            ("modified.rs", "m2"),
+            ("brand_new.rs", "n"),
+        ]);
+        let mut got = changed_relpaths(&prev, &current);
+        got.sort();
+        assert_eq!(got, vec!["brand_new.rs", "committed.rs", "modified.rs"]);
+    }
+
+    #[test]
+    fn empty_inputs_return_empty() {
+        let empty = HashMap::new();
+        assert!(changed_relpaths(&empty, &empty).is_empty());
+    }
 }
