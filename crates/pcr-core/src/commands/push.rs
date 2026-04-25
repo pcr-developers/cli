@@ -11,6 +11,9 @@ use crate::display;
 use crate::exit::ExitCode;
 use crate::projects;
 use crate::sources::shared::git;
+use crate::sources::shared::path_norm::{
+    canonicalize_project_path, normalize_path, proj_id_to_canonical_paths, strip_project_prefix,
+};
 use crate::store::{self, DraftRecord, PromptCommit};
 use crate::supabase::{self, BundleData, TouchedProject};
 use crate::util::text::plural;
@@ -50,9 +53,12 @@ pub fn run(_mode: OutputMode) -> ExitCode {
     }
 
     let mut pushed = 0usize;
-    let current_branch = git::git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    // BR-2: don't query the *current* branch — that's where the user
+    // happens to be when running `pcr push`, not where the prompts were
+    // captured. We pass it as a last-ditch fallback only.
+    let cwd_branch_fallback = git::git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
     for commit in &commits {
-        pushed += push_bundle(&commit.id, &current_branch, &a.user_id);
+        pushed += push_bundle(&commit.id, &cwd_branch_fallback, &a.user_id);
     }
     if pushed == 0 {
         display::eprintln("PCR: Nothing new pushed.");
@@ -60,13 +66,13 @@ pub fn run(_mode: OutputMode) -> ExitCode {
     ExitCode::Success
 }
 
-fn push_bundle(local_id: &str, current_branch: &str, user_id: &str) -> usize {
+fn push_bundle(local_id: &str, cwd_branch_fallback: &str, user_id: &str) -> usize {
     let Some(c) = store::get_commit_with_items(local_id).ok().flatten() else {
         return 0;
     };
 
     let source = dominant_source(&c.items);
-    let touched = collect_touched_projects(&c.items);
+    let touched = collect_touched_projects(&c.items, cwd_branch_fallback);
 
     let remote_id = match supabase::upsert_bundle(
         "",
@@ -112,11 +118,11 @@ fn push_bundle(local_id: &str, current_branch: &str, user_id: &str) -> usize {
     }
 
     let review_url = format!("{}/review/{}", config::APP_URL, remote_id);
-    let branch = if current_branch.is_empty() {
-        c.branch_name.clone()
-    } else {
-        current_branch.to_string()
-    };
+    // BR-2: prefer the captured branch (most-common across the bundle's
+    // drafts, then the bundle's own branch_name) over wherever the user
+    // happens to be when running `pcr push`. Fall back to the cwd branch
+    // only when nothing was captured at all (rare — an empty bundle).
+    let branch = best_captured_branch(&c).unwrap_or_else(|| cwd_branch_fallback.to_string());
     display::eprintln(&format!(
         "PCR: Pushed {:?} ({} prompt{})",
         c.message,
@@ -133,7 +139,52 @@ fn push_bundle(local_id: &str, current_branch: &str, user_id: &str) -> usize {
     1
 }
 
-fn collect_touched_projects(items: &[DraftRecord]) -> Vec<TouchedProject> {
+/// Pick the bundle's branch from what the watchers actually captured.
+///
+/// Order of precedence:
+/// 1. The most-common `branch_name` across the bundle's drafts. Real
+///    capture-time branches survive branch-switching mid-session.
+/// 2. The PromptCommit's own `branch_name`, set at bundle-creation time.
+/// 3. None — caller falls back to the cwd branch as a last resort.
+fn best_captured_branch(c: &PromptCommit) -> Option<String> {
+    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+    for item in &c.items {
+        if item.branch_name.is_empty() {
+            continue;
+        }
+        *counts.entry(item.branch_name.clone()).or_insert(0) += 1;
+    }
+    if let Some(top) = counts.into_iter().max_by_key(|(_, n)| *n).map(|(b, _)| b) {
+        return Some(top);
+    }
+    if !c.branch_name.is_empty() {
+        return Some(c.branch_name.clone());
+    }
+    None
+}
+
+/// Extract the per-repo branch a draft captured for a given project_id.
+/// Looks at `file_context.repo_snapshots[id].branch` for secondary repos
+/// and at `branch_name` for the primary. Returns None if neither is set.
+fn captured_branch_for(item: &DraftRecord, project_id: &str) -> Option<String> {
+    if item.project_id == project_id && !item.branch_name.is_empty() {
+        return Some(item.branch_name.clone());
+    }
+    let fc = item.file_context.as_ref()?;
+    let snaps = fc.get("repo_snapshots")?.as_object()?;
+    let snap = snaps.get(project_id)?.as_object()?;
+    let b = snap.get("branch")?.as_str()?;
+    if b.is_empty() {
+        None
+    } else {
+        Some(b.to_string())
+    }
+}
+
+fn collect_touched_projects(
+    items: &[DraftRecord],
+    cwd_branch_fallback: &str,
+) -> Vec<TouchedProject> {
     let mut hits: BTreeMap<String, i64> = BTreeMap::new();
     for item in items {
         if !item.project_id.is_empty() {
@@ -158,16 +209,23 @@ fn collect_touched_projects(items: &[DraftRecord]) -> Vec<TouchedProject> {
         .into_iter()
         .enumerate()
         .map(|(i, (id, _count))| {
-            let branch = proj_by_id
-                .get(&id)
-                .map(|path| {
-                    if path.is_empty() {
-                        String::new()
-                    } else {
-                        git::git_output_in(path, &["rev-parse", "--abbrev-ref", "HEAD"])
-                    }
-                })
-                .unwrap_or_default();
+            // BR-2: prefer the branch captured at prompt time (per-repo) over
+            // re-querying current. Only fall back to the live working tree
+            // when no capture-time data exists for this project — which only
+            // happens for legacy drafts written before BR-1 landed.
+            let branch = items
+                .iter()
+                .find_map(|item| captured_branch_for(item, &id))
+                .unwrap_or_else(|| {
+                    proj_by_id
+                        .get(&id)
+                        .filter(|path| !path.is_empty())
+                        .map(|path| {
+                            git::git_output_in(path, &["rev-parse", "--abbrev-ref", "HEAD"])
+                        })
+                        .filter(|b| !b.is_empty())
+                        .unwrap_or_else(|| cwd_branch_fallback.to_string())
+                });
             TouchedProject {
                 project_id: id,
                 branch,
@@ -265,12 +323,14 @@ fn detect_github_pr() -> Option<String> {
 fn compute_incremental_diffs(items: &[DraftRecord]) -> BTreeMap<String, String> {
     use std::collections::HashMap;
 
-    // Project path lookup.
+    // Canonical project path lookup so `git diff <prev>..<curr>` runs
+    // against the real on-disk repo even when the registered project path
+    // is a symlink (EV-1 in the multi-repo audit).
+    let registered = projects::load();
+    let canonical_map = proj_id_to_canonical_paths(&registered);
     let mut proj_by_id: HashMap<String, String> = HashMap::new();
-    for p in projects::load() {
-        if !p.project_id.is_empty() {
-            proj_by_id.insert(p.project_id, p.path);
-        }
+    for (id, canon) in canonical_map {
+        proj_by_id.insert(id, canon);
     }
 
     #[derive(Clone)]
@@ -431,21 +491,38 @@ fn compute_incremental_diffs(items: &[DraftRecord]) -> BTreeMap<String, String> 
     result
 }
 
+/// Per-project relative file list extracted from a draft's tool calls.
+/// Both sides go through canonicalization so symlinked workspaces and
+/// (rare) relative tool-call paths attribute correctly. Without this,
+/// `compute_incremental_diffs` produces empty per-project diffs for
+/// users with symlinked repo roots.
 fn tc_files_for_project(tool_calls: &[serde_json::Value], project_path: &str) -> Vec<String> {
     if project_path.is_empty() || tool_calls.is_empty() {
         return Vec::new();
     }
+    let project_canon = canonicalize_project_path(project_path);
+    if project_canon.is_empty() {
+        return Vec::new();
+    }
+    // Push has no notion of the original session cwd, so we pass the
+    // project path itself as the resolution base — the same project the
+    // tool call presumably ran against. Absolute tool-call paths are
+    // unaffected; relative ones get a sensible best-effort resolution.
+    let cwd_for_relative: Option<&str> = Some(project_canon.as_str());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut files: Vec<String> = Vec::new();
     for tc in tool_calls {
-        let Some(abs) = tc_path(tc) else { continue };
-        if !abs.starts_with(&format!("{project_path}/")) {
+        let Some(raw) = tc_path(tc) else { continue };
+        let Some(abs) = normalize_path(&raw, cwd_for_relative) else {
+            continue;
+        };
+        let Some(rel) = strip_project_prefix(&abs, &project_canon) else {
+            continue;
+        };
+        if rel.is_empty() {
             continue;
         }
-        let rel = abs
-            .strip_prefix(&format!("{project_path}/"))
-            .unwrap()
-            .to_string();
+        let rel = rel.to_string();
         if seen.insert(rel.clone()) {
             files.push(rel);
         }
@@ -561,5 +638,127 @@ fn truncate_diff(diff: &str) -> String {
         out
     } else {
         diff.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn draft(
+        id: &str,
+        project_id: &str,
+        branch: &str,
+        repo_snapshots: Option<serde_json::Value>,
+    ) -> DraftRecord {
+        let mut fc = serde_json::Map::new();
+        if let Some(snaps) = repo_snapshots {
+            fc.insert("repo_snapshots".into(), snaps);
+        }
+        DraftRecord {
+            id: id.into(),
+            project_id: project_id.into(),
+            branch_name: branch.into(),
+            file_context: if fc.is_empty() { None } else { Some(fc) },
+            ..Default::default()
+        }
+    }
+
+    fn commit_with(items: Vec<DraftRecord>, fallback_branch: &str) -> PromptCommit {
+        PromptCommit {
+            id: "bundle-1".into(),
+            message: "test".into(),
+            project_id: String::new(),
+            project_name: String::new(),
+            branch_name: fallback_branch.into(),
+            session_shas: Vec::new(),
+            head_sha: String::new(),
+            pushed_at: String::new(),
+            committed_at: String::new(),
+            bundle_status: "closed".into(),
+            items,
+            ..Default::default()
+        }
+    }
+
+    // ── BR-2 regression: branch comes from captured drafts, not cwd ──────
+
+    #[test]
+    fn best_captured_branch_picks_most_common_draft_branch() {
+        let items = vec![
+            draft("d1", "p1", "feature/auth", None),
+            draft("d2", "p1", "feature/auth", None),
+            draft("d3", "p1", "main", None),
+        ];
+        // Bundle-level branch is "main" but most drafts were on the
+        // feature branch — the most-common-draft-branch wins, which is the
+        // honest answer to "what branch were the prompts on".
+        let c = commit_with(items, "main");
+        assert_eq!(best_captured_branch(&c), Some("feature/auth".into()));
+    }
+
+    #[test]
+    fn best_captured_branch_falls_back_to_commit_branch() {
+        // Drafts have no captured branch (legacy / cursor pre-BR-1).
+        let items = vec![draft("d1", "p1", "", None), draft("d2", "p1", "", None)];
+        let c = commit_with(items, "feature/x");
+        assert_eq!(best_captured_branch(&c), Some("feature/x".into()));
+    }
+
+    #[test]
+    fn best_captured_branch_returns_none_when_nothing_captured() {
+        // Nothing on drafts AND nothing on the bundle row → caller falls
+        // back to the cwd branch.
+        let c = commit_with(vec![draft("d1", "p1", "", None)], "");
+        assert_eq!(best_captured_branch(&c), None);
+    }
+
+    // ── captured_branch_for: secondary repo branch comes from snapshot ──
+
+    #[test]
+    fn captured_branch_for_uses_branch_name_for_primary() {
+        let item = draft("d1", "p-primary", "main", None);
+        assert_eq!(captured_branch_for(&item, "p-primary"), Some("main".into()));
+    }
+
+    #[test]
+    fn captured_branch_for_uses_repo_snapshots_for_secondary() {
+        // BR-1: secondary repo's branch was captured at prompt time and
+        // stored under file_context.repo_snapshots[id].branch.
+        let snaps = json!({
+            "p-secondary": {
+                "head_sha": "abc",
+                "git_diff": "",
+                "branch": "feature/secondary",
+            }
+        });
+        let item = draft("d1", "p-primary", "main", Some(snaps));
+        assert_eq!(
+            captured_branch_for(&item, "p-secondary"),
+            Some("feature/secondary".into())
+        );
+    }
+
+    #[test]
+    fn captured_branch_for_returns_none_when_unknown() {
+        let item = draft("d1", "p-primary", "main", None);
+        assert_eq!(captured_branch_for(&item, "p-other"), None);
+    }
+
+    #[test]
+    fn captured_branch_for_returns_none_for_empty_branch_in_snapshot() {
+        // Defensive: an older draft with `repo_snapshots` (BR-1 not yet
+        // shipped) might have a snapshot without `branch`. Don't return ""
+        // — let the caller fall through to the live-query fallback.
+        let snaps = json!({
+            "p-secondary": {
+                "head_sha": "abc",
+                "git_diff": "",
+                "branch": "",
+            }
+        });
+        let item = draft("d1", "p-primary", "main", Some(snaps));
+        assert_eq!(captured_branch_for(&item, "p-secondary"), None);
     }
 }

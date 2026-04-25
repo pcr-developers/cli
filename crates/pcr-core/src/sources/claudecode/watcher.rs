@@ -16,7 +16,8 @@ use crate::display;
 use crate::projects::{self, Project};
 use crate::sources::claudecode::parser::parse_claude_code_session;
 use crate::sources::shared::{
-    git::{get_commits_since, get_git_diff, get_head_sha},
+    git::{get_branch, get_commits_since, get_git_diff, get_head_sha, is_git_repo},
+    path_norm::{canonicalize_project_path, proj_id_to_canonical_paths},
     tool_calls::{repo_snapshots, touched_project_ids},
     Deduplicator, FileState,
 };
@@ -202,18 +203,23 @@ pub fn process_file(
         head_sha: String,
     }
     let mut git_cache: HashMap<String, GitData> = HashMap::new();
+    let registered_projects = projects::load();
     let mut proj_by_id_project: HashMap<String, Project> = HashMap::new();
-    for p in projects::load() {
+    for p in &registered_projects {
         if !p.project_id.is_empty() {
-            proj_by_id_project.insert(p.project_id.clone(), p);
+            proj_by_id_project.insert(p.project_id.clone(), p.clone());
         }
     }
-    let mut proj_by_id_path: BTreeMap<String, String> = BTreeMap::new();
-    for (id, p) in &proj_by_id_project {
-        if !p.path.is_empty() {
-            proj_by_id_path.insert(id.clone(), p.path.clone());
-        }
-    }
+    // Canonical paths so symlinked / aliased project paths attribute
+    // correctly when tool calls use the resolved path (EV-1 in the
+    // multi-repo audit).
+    let proj_by_id_path: BTreeMap<String, String> =
+        proj_id_to_canonical_paths(&registered_projects);
+    // Claude Code tool calls are absolute in practice, but we pass a cwd
+    // for relative-path resilience: the primary project's path is the
+    // session's working directory in nearly every case.
+    let session_cwd: Option<String> = (!project.path.is_empty()).then(|| project.path.clone());
+    let cwd = session_cwd.as_deref();
 
     fn ensure_git_data<'a>(
         cache: &'a mut HashMap<String, GitData>,
@@ -221,10 +227,13 @@ pub fn process_file(
         session_created_at: &str,
     ) -> &'a GitData {
         if !cache.contains_key(path) {
-            let git_diff = get_git_diff(path);
-            let head_sha = get_head_sha(path);
-            let commit_shas = if !path.is_empty() && !session_created_at.is_empty() {
-                get_commits_since(path, session_created_at)
+            // Use the canonical path for git ops so symlinked workspaces
+            // produce diffs against the real on-disk repo (EV-1).
+            let canon = canonicalize_project_path(path);
+            let git_diff = get_git_diff(&canon);
+            let head_sha = get_head_sha(&canon);
+            let commit_shas = if !canon.is_empty() && !session_created_at.is_empty() {
+                get_commits_since(&canon, session_created_at)
             } else {
                 Vec::new()
             };
@@ -247,7 +256,8 @@ pub fn process_file(
             // Already processed in this run — enrich only.
             let _ = store::update_draft_response(&p.session_id, &p.prompt_text, &p.response_text);
             let _ = store::update_draft_tool_calls(&p.session_id, &p.prompt_text, &p.tool_calls);
-            if let Some(snaps) = repo_snapshots(&p.tool_calls, &p.project_id, &proj_by_id_path) {
+            if let Some(snaps) = repo_snapshots(&p.tool_calls, &p.project_id, &proj_by_id_path, cwd)
+            {
                 let mut updates = serde_json::Map::new();
                 updates.insert("repo_snapshots".into(), Value::Object(snaps));
                 let _ = store::merge_draft_file_context(&p.session_id, &p.prompt_text, &updates);
@@ -277,11 +287,15 @@ pub fn process_file(
             let _ = store::update_draft_response(&p.session_id, &p.prompt_text, &p.response_text);
             let _ = store::update_draft_tool_calls(&p.session_id, &p.prompt_text, &p.tool_calls);
             let mut fc = serde_json::Map::new();
-            if let Some(snaps) = repo_snapshots(&p.tool_calls, &p.project_id, &proj_by_id_path) {
+            if let Some(snaps) = repo_snapshots(&p.tool_calls, &p.project_id, &proj_by_id_path, cwd)
+            {
                 fc.insert("repo_snapshots".into(), Value::Object(snaps));
             }
-            let ids = touched_project_ids(&p.tool_calls, &proj_by_id_path);
-            if !ids.is_empty() {
+            let ids = touched_project_ids(&p.tool_calls, &proj_by_id_path, cwd);
+            // Only store touched_project_ids when there's >1 — when it's
+            // just the primary, project_id already carries the info and
+            // the redundancy bloats the row. (TP-1/TP-2 consistency.)
+            if ids.len() > 1 {
                 fc.insert(
                     "touched_project_ids".into(),
                     Value::Array(ids.iter().map(|s| Value::String(s.clone())).collect()),
@@ -319,8 +333,9 @@ pub fn process_file(
         p.project_id = project.project_id.clone();
         p.project_name = project.name.clone();
 
-        let ids = touched_project_ids(&p.tool_calls, &proj_by_id_path);
-        if !ids.is_empty() {
+        let ids = touched_project_ids(&p.tool_calls, &proj_by_id_path, cwd);
+        // Multi-touched only — see TP comment above.
+        if ids.len() > 1 {
             merged.insert(
                 "touched_project_ids".into(),
                 Value::Array(ids.iter().map(|s| Value::String(s.clone())).collect()),
@@ -347,9 +362,27 @@ pub fn process_file(
         };
         let gd = ensure_git_data(&mut git_cache, &resolved_path, &session.session_created_at);
 
-        if let Some(snaps) = repo_snapshots(&p.tool_calls, &p.project_id, &proj_by_id_path) {
+        if let Some(snaps) = repo_snapshots(&p.tool_calls, &p.project_id, &proj_by_id_path, cwd) {
             let fc = p.file_context.get_or_insert_with(serde_json::Map::new);
             fc.insert("repo_snapshots".into(), Value::Object(snaps));
+        }
+        // GD-2: tag drafts captured against directories that aren't actually
+        // git repos so reviewers see why the diff is empty (vs. silently
+        // attributing an empty diff to "no changes"). Cheap one-call check;
+        // result cached by GitData.
+        if !resolved_path.is_empty() && !is_git_repo(&resolved_path) {
+            let fc = p.file_context.get_or_insert_with(serde_json::Map::new);
+            fc.insert("git_unavailable".into(), Value::Bool(true));
+        }
+        // BR-1: re-read the branch at save time so prompts in long sessions
+        // where the user switched branches get the right attribution. The
+        // session-level branch (from cwd at session start) is preserved on
+        // the bundle row but each prompt records its own branch_name.
+        if !resolved_path.is_empty() {
+            let fresh_branch = get_branch(&resolved_path);
+            if !fresh_branch.is_empty() {
+                p.branch_name = fresh_branch;
+            }
         }
         if let Err(e) = store::save_draft(p, &gd.commit_shas, &gd.git_diff, &gd.head_sha) {
             display::print_error("claude-code", &format!("Failed to save draft: {e}"));
