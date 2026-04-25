@@ -40,7 +40,7 @@
 
 ---
 
-## 🟢 What is PCR.dev?
+## ❯ What is PCR.dev?
 
 **PCR.dev is the human review layer for AI-assisted software development.** When
 your team ships code that an AI helped write, the diff alone doesn't tell the
@@ -66,7 +66,7 @@ Honorable Mention).
 
 ---
 
-## 🧭 Why Prompt & Code Reviews
+## ❯ Why Prompt & Code Reviews
 
 Code review answers *"is this diff correct?"* It can't answer:
 
@@ -92,7 +92,7 @@ libraries of good code.
 
 ---
 
-## ⚙️ How it works
+## ❯ How it works
 
 ```text
    Cursor / Claude Code / VS Code Copilot
@@ -127,7 +127,7 @@ Everything lives only in `~/.pcr-dev/` until you explicitly run `pcr push`.
 
 ---
 
-## 📥 What gets captured
+## ❯ What gets captured
 
 | Source | Captured | How |
 |---|---|---|
@@ -145,7 +145,7 @@ Each captured exchange is annotated with:
 
 ---
 
-## 🚀 Quickstart
+## ❯ Quickstart
 
 ```bash
 # 1. Install
@@ -173,7 +173,7 @@ Open [pcr.dev](https://pcr.dev) and your bundles are waiting for your team.
 
 ---
 
-## 📦 Install
+## ❯ Install
 
 | Platform | Method | Command |
 |---|---|---|
@@ -195,7 +195,7 @@ details.
 
 ---
 
-## 🔧 Commands
+## ❯ Commands
 
 | Command | What it does |
 |---|---|
@@ -218,7 +218,7 @@ table, so the two never drift.
 
 ---
 
-## 🖥 The live dashboard
+## ❯ The live dashboard
 
 `pcr start` runs a full-screen [ratatui](https://ratatui.rs) dashboard
 showing capture sources, registered projects, the live event log, and a
@@ -253,7 +253,7 @@ information falls back to plain stderr lines.
 
 ---
 
-## 👥 Team workflow
+## ❯ Team workflow
 
 PCR is designed to fit the rhythm your team already has, not replace it.
 
@@ -272,29 +272,29 @@ agent, no daemon, no hook into your editor.
 
 ---
 
-## 🔒 Privacy and security
+## ❯ Privacy and security
 
 PCR is **passive, local-first, and open**:
 
-- ✅ Reads session files that Cursor / Claude Code / Copilot already write
+- **`✓`** Reads session files that Cursor / Claude Code / Copilot already write
   to disk on your machine. No clipboard access, no keylogging, no editor
   hooks, no patches to your AI tool.
-- ✅ Stores everything locally in `~/.pcr-dev/` until you explicitly run
+- **`✓`** Stores everything locally in `~/.pcr-dev/` until you explicitly run
   `pcr push`. You can `pcr log`, `pcr show`, edit which drafts go into a
   bundle, or throw the lot away with `pcr gc --unpushed` — without anything
   leaving your laptop.
-- ✅ Open source under [Apache 2.0](LICENSE) so you can read every line of
+- **`✓`** Open source under [Apache 2.0](LICENSE) so you can read every line of
   the capture and ship logic.
-- ✅ TLS-only push (`reqwest` + `rustls`), per-user CLI tokens, RLS-protected
+- **`✓`** TLS-only push (`reqwest` + `rustls`), per-user CLI tokens, RLS-protected
   rows on the server side.
-- ✅ No telemetry beyond what you explicitly push.
+- **`✓`** No telemetry beyond what you explicitly push.
 
 A push is opt-in, per-bundle. Until you type `pcr push`, your prompts never
 leave your machine.
 
 ---
 
-## 🤖 Use inside agents and CI
+## ❯ Use inside agents and CI
 
 `pcr` is built to behave correctly whether a human or an LLM is driving the
 terminal:
@@ -323,7 +323,7 @@ pcr --plain bundle "agent run" --select all && pcr --plain push
 
 ---
 
-## ❓ Frequently asked questions
+## ❯ Frequently asked questions
 
 <details>
 <summary><b>Does PCR work without an internet connection?</b></summary>
@@ -393,7 +393,7 @@ for the technical reason.
 
 ---
 
-## 🛠 Build from source
+## ❯ Build from source
 
 You'll need Rust ≥ 1.82 (the `rust-toolchain.toml` pins the exact version).
 
@@ -425,7 +425,7 @@ cli/
 
 ---
 
-## 🤝 Contributing
+## ❯ Contributing
 
 Issues and PRs welcome. Please read [AGENTS.md](AGENTS.md) first — it
 codifies output discipline (line mode must stay byte-stable for golden
@@ -438,7 +438,7 @@ Architectural changes should start with a discussion thread before a PR.
 
 ---
 
-## 📚 Research
+## ❯ Research
 
 PCR is grounded in peer-reviewed research at CHI 2026:
 
@@ -451,7 +451,7 @@ practice and evaluates it with 20 software engineers.
 
 ---
 
-## 💬 Community & support
+## ❯ Community & support
 
 - **Issues** — [github.com/pcr-developers/cli/issues](https://github.com/pcr-developers/cli/issues)
 - **Discussions** — [github.com/pcr-developers/cli/discussions](https://github.com/pcr-developers/cli/discussions)
@@ -460,7 +460,7 @@ practice and evaluates it with 20 software engineers.
 
 ---
 
-## 📜 License
+## ❯ License
 
 [Apache 2.0](LICENSE). Use it freely in any project, commercial or otherwise.
 
