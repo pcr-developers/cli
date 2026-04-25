@@ -1,6 +1,6 @@
 {
   "name": "pcr-dev-darwin-arm64",
-  "version": "0.2.2",
+  "version": "0.2.5",
   "description": "PCR.dev CLI prebuilt binary for macOS arm64",
   "license": "Apache-2.0",
   "os": [
