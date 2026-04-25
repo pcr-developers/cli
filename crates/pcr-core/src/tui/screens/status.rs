@@ -319,13 +319,9 @@ fn draw_projects(frame: &mut ratatui::Frame, area: Rect, snap: &StatusSnapshot) 
 }
 
 fn branch_for(path: &str) -> String {
-    let b =
-        crate::sources::shared::git::git_output_in(path, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    if b == "HEAD" {
-        String::new()
-    } else {
-        b
-    }
+    // Detached HEAD comes back as the literal "HEAD"; `get_branch`
+    // normalizes that to empty string.
+    crate::sources::shared::git::get_branch(path)
 }
 
 fn draw_next_action(frame: &mut ratatui::Frame, area: Rect, snap: &StatusSnapshot) {

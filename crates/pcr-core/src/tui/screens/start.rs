@@ -154,13 +154,8 @@ impl DashboardState {
 }
 
 fn shortest_branch_for_project(path: &str) -> String {
-    let b =
-        crate::sources::shared::git::git_output_in(path, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    if b == "HEAD" {
-        String::new()
-    } else {
-        b
-    }
+    // Detached HEAD becomes empty string via `get_branch`'s normalization.
+    crate::sources::shared::git::get_branch(path)
 }
 
 pub fn run(_project_count: usize) -> Result<()> {

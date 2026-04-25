@@ -55,8 +55,10 @@ pub fn run(_mode: OutputMode) -> ExitCode {
     let mut pushed = 0usize;
     // BR-2: don't query the *current* branch — that's where the user
     // happens to be when running `pcr push`, not where the prompts were
-    // captured. We pass it as a last-ditch fallback only.
-    let cwd_branch_fallback = git::git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    // captured. We pass it as a last-ditch fallback only. Use
+    // `current_branch()` so detached-HEAD becomes empty rather than the
+    // literal string "HEAD".
+    let cwd_branch_fallback = crate::commands::helpers::current_branch();
     for commit in &commits {
         pushed += push_bundle(&commit.id, &cwd_branch_fallback, &a.user_id);
     }
@@ -220,9 +222,7 @@ fn collect_touched_projects(
                     proj_by_id
                         .get(&id)
                         .filter(|path| !path.is_empty())
-                        .map(|path| {
-                            git::git_output_in(path, &["rev-parse", "--abbrev-ref", "HEAD"])
-                        })
+                        .map(|path| git::get_branch(path))
                         .filter(|b| !b.is_empty())
                         .unwrap_or_else(|| cwd_branch_fallback.to_string())
                 });
@@ -493,10 +493,10 @@ fn compute_incremental_diffs(items: &[DraftRecord]) -> BTreeMap<String, String> 
 
 /// Per-project relative file list extracted from a draft's tool calls.
 /// Both sides go through canonicalization so symlinked workspaces and
-/// (rare) relative tool-call paths attribute correctly. Without this,
-/// `compute_incremental_diffs` produces empty per-project diffs for
-/// users with symlinked repo roots.
+/// (rare) relative tool-call paths attribute correctly. Iterates ALL
+/// paths in each tool call so multi-file edits don't under-attribute.
 fn tc_files_for_project(tool_calls: &[serde_json::Value], project_path: &str) -> Vec<String> {
+    use crate::sources::shared::tool_calls::extract_paths_from_tool_call;
     if project_path.is_empty() || tool_calls.is_empty() {
         return Vec::new();
     }
@@ -512,43 +512,23 @@ fn tc_files_for_project(tool_calls: &[serde_json::Value], project_path: &str) ->
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut files: Vec<String> = Vec::new();
     for tc in tool_calls {
-        let Some(raw) = tc_path(tc) else { continue };
-        let Some(abs) = normalize_path(&raw, cwd_for_relative) else {
-            continue;
-        };
-        let Some(rel) = strip_project_prefix(&abs, &project_canon) else {
-            continue;
-        };
-        if rel.is_empty() {
-            continue;
-        }
-        let rel = rel.to_string();
-        if seen.insert(rel.clone()) {
-            files.push(rel);
+        for raw in extract_paths_from_tool_call(tc) {
+            let Some(abs) = normalize_path(&raw, cwd_for_relative) else {
+                continue;
+            };
+            let Some(rel) = strip_project_prefix(&abs, &project_canon) else {
+                continue;
+            };
+            if rel.is_empty() {
+                continue;
+            }
+            let rel = rel.to_string();
+            if seen.insert(rel.clone()) {
+                files.push(rel);
+            }
         }
     }
     files
-}
-
-fn tc_path(tc: &serde_json::Value) -> Option<String> {
-    if let Some(input) = tc.get("input").and_then(|v| v.as_object()) {
-        if let Some(s) = input.get("path").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-        if let Some(s) = input.get("file_path").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    if let Some(s) = tc.get("path").and_then(|v| v.as_str()) {
-        if !s.is_empty() {
-            return Some(s.to_string());
-        }
-    }
-    None
 }
 
 fn filter_diff_to_files(diff: &str, rel_files: &[String]) -> String {

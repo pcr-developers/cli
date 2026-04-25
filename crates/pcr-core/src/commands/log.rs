@@ -4,7 +4,6 @@ use crate::agent::OutputMode;
 use crate::commands::project_context::resolve;
 use crate::display::{self, Color};
 use crate::exit::ExitCode;
-use crate::sources::shared::git;
 use crate::store;
 use crate::util::text::{plural, prompt_preview};
 use crate::util::time::fmt_time;
@@ -55,7 +54,7 @@ fn run_plain() -> ExitCode {
     let drafts = store::get_drafts_by_status(store::DraftStatus::Draft, &ctx.ids, &ctx.names)
         .unwrap_or_default();
 
-    let branch = git::git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let branch = crate::commands::helpers::current_branch();
     if !ctx.name.is_empty() {
         if !branch.is_empty() && branch != "HEAD" {
             display::eprintln(&format!(

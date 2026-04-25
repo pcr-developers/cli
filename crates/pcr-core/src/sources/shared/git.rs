@@ -16,14 +16,26 @@ pub fn get_head_sha(project_path: &str) -> String {
     run(&["-C", project_path, "rev-parse", "HEAD"], None)
 }
 
+/// Returns the current branch name for `project_path`, or empty string
+/// when the working tree is in a detached-HEAD state.
+///
+/// `git rev-parse --abbrev-ref HEAD` returns the literal string "HEAD"
+/// when detached, which downstream display / push code would mistake for
+/// a real branch named "HEAD". Filter it here once instead of at every
+/// call site.
 pub fn get_branch(project_path: &str) -> String {
     if project_path.is_empty() {
         return String::new();
     }
-    run(
+    let raw = run(
         &["-C", project_path, "rev-parse", "--abbrev-ref", "HEAD"],
         None,
-    )
+    );
+    if raw == "HEAD" {
+        String::new()
+    } else {
+        raw
+    }
 }
 
 /// Returns true when `project_path` is inside a git working tree. Used by
@@ -34,15 +46,40 @@ pub fn get_branch(project_path: &str) -> String {
 ///
 /// Empty paths return false (vacuous — not even attempted). A successful
 /// `git rev-parse --is-inside-work-tree` writes "true" to stdout.
+///
+/// Result is cached per-process — projects don't move between
+/// "is a git repo" and "isn't a git repo" within a watcher's lifetime,
+/// and the watchers call this on every save.
 pub fn is_git_repo(project_path: &str) -> bool {
     if project_path.is_empty() {
         return false;
+    }
+    if let Some(cached) = lookup_is_git_repo_cache(project_path) {
+        return cached;
     }
     let out = run(
         &["-C", project_path, "rev-parse", "--is-inside-work-tree"],
         None,
     );
-    out.trim() == "true"
+    let result = out.trim() == "true";
+    insert_is_git_repo_cache(project_path.to_string(), result);
+    result
+}
+
+fn is_git_repo_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lookup_is_git_repo_cache(key: &str) -> Option<bool> {
+    is_git_repo_cache().lock().ok()?.get(key).copied()
+}
+
+fn insert_is_git_repo_cache(key: String, value: bool) {
+    if let Ok(mut g) = is_git_repo_cache().lock() {
+        g.insert(key, value);
+    }
 }
 
 /// `git diff HEAD` combined with a synthetic diff of untracked files.
@@ -68,16 +105,28 @@ pub fn get_git_diff(project_path: &str) -> String {
 }
 
 fn untracked_diff(project_path: &str) -> String {
-    let out = run(&["-C", project_path, "status", "--porcelain"], None);
-    if out.is_empty() {
+    // BUG-12 fix: switch to NUL-terminated porcelain so filenames with
+    // spaces, quotes, or newlines round-trip correctly. Without -z, git
+    // emits shell-escaped paths and our naive `line[3..].trim()` produces
+    // a literal `\"foo bar.rs\"` string that subsequently fails to read.
+    let cmd = std::process::Command::new("git")
+        .args(["-C", project_path, "status", "--porcelain=v1", "-z"])
+        .output();
+    let Ok(output) = cmd else {
+        return String::new();
+    };
+    if !output.status.success() || output.stdout.is_empty() {
         return String::new();
     }
     let mut sb = String::new();
-    for line in out.split('\n') {
-        if line.len() < 4 || &line[..2] != "??" {
+    let bytes = &output.stdout;
+    for field in bytes.split(|b| *b == 0) {
+        if field.len() < 4 || &field[..2] != b"??" {
             continue;
         }
-        let rel = line[3..].trim();
+        let Ok(rel) = std::str::from_utf8(&field[3..]) else {
+            continue;
+        };
         if rel.is_empty() || rel.ends_with('/') {
             continue;
         }
