@@ -26,6 +26,25 @@ pub fn get_branch(project_path: &str) -> String {
     )
 }
 
+/// Returns true when `project_path` is inside a git working tree. Used by
+/// the watchers to distinguish "no diff because there's nothing to diff"
+/// from "no diff because git isn't available". The latter ends up tagged
+/// in `file_context.git_unavailable: true` so reviewers see why the diff
+/// is empty instead of being misled.
+///
+/// Empty paths return false (vacuous — not even attempted). A successful
+/// `git rev-parse --is-inside-work-tree` writes "true" to stdout.
+pub fn is_git_repo(project_path: &str) -> bool {
+    if project_path.is_empty() {
+        return false;
+    }
+    let out = run(
+        &["-C", project_path, "rev-parse", "--is-inside-work-tree"],
+        None,
+    );
+    out.trim() == "true"
+}
+
 /// `git diff HEAD` combined with a synthetic diff of untracked files.
 /// Capped at 50 KB. Matches `shared.GetGitDiff`.
 pub fn get_git_diff(project_path: &str) -> String {

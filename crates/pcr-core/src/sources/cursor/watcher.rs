@@ -17,7 +17,11 @@ use crate::sources::cursor::db::{
     get_full_session_data, get_session_meta, BubbleMeta, SessionMeta,
 };
 use crate::sources::cursor::diff_tracker::DiffTracker;
-use crate::sources::shared::git::{get_commit_range, get_git_diff};
+use crate::sources::shared::git::{
+    get_branch, get_commit_range, get_git_diff, get_head_sha, is_git_repo,
+};
+use crate::sources::shared::path_norm::{canonicalize_project_path, proj_id_to_canonical_paths};
+use crate::sources::shared::tool_calls::repo_snapshots_for_ids;
 use crate::store::{self, DiffEvent};
 use crate::supabase::{self, CursorSessionData, PromptRecord};
 use crate::versions;
@@ -345,11 +349,15 @@ impl PromptScanner {
 
         let mut commit_shas: Vec<String> = Vec::new();
         let mut git_diff = String::new();
+        let mut head_sha = String::new();
         let mut branch = String::new();
+        // Use the canonical primary path for git ops so symlinked workspaces
+        // diff against the real on-disk repo (EV-1 in the multi-repo audit).
+        let primary_canon = canonicalize_project_path(&proj.path);
         if !proj.path.is_empty() {
             if let Some(full_session) = get_full_session_data(session_id) {
                 commit_shas = get_commit_range(
-                    &proj.path,
+                    &primary_canon,
                     full_session.session_created_at,
                     full_session.session_updated_at,
                 );
@@ -396,7 +404,42 @@ impl PromptScanner {
                     );
                 }
             }
-            git_diff = get_git_diff(&proj.path);
+            git_diff = get_git_diff(&primary_canon);
+            // GD-1: previously this was hardcoded "" when the watcher saved
+            // drafts, which disabled the `git diff prev..curr` path in
+            // `compute_incremental_diffs` at push time and forced the textual
+            // delta fallback. Reading head_sha here gives reviewers accurate
+            // per-prompt diffs for Cursor sessions, matching Claude Code.
+            head_sha = get_head_sha(&primary_canon);
+            // BR-1: re-read branch at save time. Cursor's session-level
+            // `activeBranch` is stale once the user switches branches
+            // mid-session; the working-tree branch is the truth.
+            let fresh_branch = get_branch(&primary_canon);
+            if !fresh_branch.is_empty() {
+                branch = fresh_branch;
+            }
+        }
+
+        // MR-1: snapshot every secondary touched repo (head_sha + git_diff
+        // + branch). The Cursor watcher doesn't have tool_calls in its
+        // bubble data — secondary repos are detected via the `diff_events`
+        // table — so we use the id-based variant of repo_snapshots. Push's
+        // `compute_incremental_diffs` consumes file_context.repo_snapshots.
+        let proj_by_id_canonical: std::collections::BTreeMap<String, String> = {
+            let registered = crate::projects::load();
+            proj_id_to_canonical_paths(&registered)
+        };
+        let secondary_snaps =
+            repo_snapshots_for_ids(&proj.project_id, &touched_ids, &proj_by_id_canonical);
+        if let Some(snaps) = secondary_snaps {
+            file_context.insert("repo_snapshots".into(), serde_json::Value::Object(snaps));
+        }
+        // GD-2: tag drafts whose primary path isn't actually a git repo so
+        // reviewers see the diff is empty by design (no git available),
+        // not by failure (git ran but found no changes). Cheap one-call
+        // check; result not cached because this fires once per turn.
+        if !primary_canon.is_empty() && !is_git_repo(&primary_canon) {
+            file_context.insert("git_unavailable".into(), serde_json::Value::Bool(true));
         }
 
         let hash = supabase::prompt_content_hash_v2(session_id, &user_bubble.text, &captured_at);
@@ -406,6 +449,10 @@ impl PromptScanner {
             session_id: session_id.to_string(),
             project_id: proj.project_id.clone(),
             project_name: proj.name.clone(),
+            // BR-1: persist the per-prompt branch on the draft row
+            // (previously left empty for Cursor — only the bundle row had a
+            // branch via the supabase cursor_session upsert path).
+            branch_name: branch.clone(),
             prompt_text: user_bubble.text.clone(),
             response_text: response_text.to_string(),
             model: model_name,
@@ -417,7 +464,10 @@ impl PromptScanner {
             ..Default::default()
         };
 
-        if let Err(e) = store::save_draft(&record, &commit_shas, &git_diff, "") {
+        // GD-1: pass real head_sha (was previously "") so push's
+        // incremental-diff pipeline can produce `git diff prev..curr`
+        // rather than the lossy textual-delta fallback.
+        if let Err(e) = store::save_draft(&record, &commit_shas, &git_diff, &head_sha) {
             display::print_error("cursor", &format!("Failed to save draft: {e}"));
             return;
         }

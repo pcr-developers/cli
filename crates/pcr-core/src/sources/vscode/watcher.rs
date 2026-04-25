@@ -14,8 +14,9 @@ use serde_json::Value;
 use crate::display;
 use crate::projects::{self, Project};
 use crate::sources::shared::{
-    git::{get_branch, get_commits_since, get_git_diff, get_head_sha},
-    tool_calls::touched_project_ids,
+    git::{get_branch, get_commits_since, get_git_diff, get_head_sha, is_git_repo},
+    path_norm::{canonicalize_project_path, proj_id_to_canonical_paths},
+    tool_calls::{repo_snapshots, touched_project_ids},
     Deduplicator, FileState,
 };
 use crate::sources::vscode::parser::{
@@ -275,12 +276,11 @@ fn process_file(
         return;
     }
 
-    let mut proj_by_id: BTreeMap<String, String> = BTreeMap::new();
-    for p in projects::load() {
-        if !p.project_id.is_empty() && !p.path.is_empty() {
-            proj_by_id.insert(p.project_id, p.path);
-        }
-    }
+    // Canonical project path map for symlink-resilient attribution
+    // (EV-1 in the multi-repo audit). proj_id_to_canonical_paths skips
+    // entries without a project_id or a path.
+    let registered_projects = projects::load();
+    let proj_by_id: BTreeMap<String, String> = proj_id_to_canonical_paths(&registered_projects);
     let mut proj_by_path: HashMap<String, usize> = HashMap::new();
     for (i, p) in ws.projects.iter().enumerate() {
         if !p.path.is_empty() {
@@ -343,24 +343,48 @@ fn process_file(
             );
         }
 
-        let touched = touched_project_ids(&ex.tool_calls, &proj_by_id);
+        // Resolve relative tool-call paths against the workspace root.
+        let prompt_cwd: Option<&str> = if proj_path.is_empty() {
+            None
+        } else {
+            Some(proj_path.as_str())
+        };
+        let touched = touched_project_ids(&ex.tool_calls, &proj_by_id, prompt_cwd);
         if touched.len() > 1 {
             fc.insert(
                 "touched_project_ids".into(),
                 Value::Array(touched.iter().map(|s| Value::String(s.clone())).collect()),
             );
         }
+        // MR-2: capture per-secondary-repo head_sha + git_diff + branch
+        // so the push pipeline can emit complete multi-repo diffs in the
+        // review payload. Without this, multi-repo VS Code sessions show
+        // only the primary repo's diff in review.
+        if let Some(snaps) = repo_snapshots(&ex.tool_calls, &proj_id, &proj_by_id, prompt_cwd) {
+            fc.insert("repo_snapshots".into(), Value::Object(snaps));
+        }
 
+        // Use the canonical primary path for git ops so symlinked workspaces
+        // produce diffs against the real on-disk repo.
+        let canon_proj_path = canonicalize_project_path(&proj_path);
         let mut git_diff = String::new();
         let mut head_sha = String::new();
         let mut commit_shas: Vec<String> = Vec::new();
-        if !proj_path.is_empty() {
-            git_diff = get_git_diff(&proj_path);
-            head_sha = get_head_sha(&proj_path);
+        if !canon_proj_path.is_empty() {
+            git_diff = get_git_diff(&canon_proj_path);
+            head_sha = get_head_sha(&canon_proj_path);
             if !transcript.start_time.is_empty() {
-                commit_shas = get_commits_since(&proj_path, &transcript.start_time);
+                commit_shas = get_commits_since(&canon_proj_path, &transcript.start_time);
+            }
+            // GD-2: tag drafts captured against directories that aren't a
+            // git repo so reviewers see why the diff is empty.
+            if !is_git_repo(&canon_proj_path) {
+                fc.insert("git_unavailable".into(), Value::Bool(true));
             }
         }
+        // BR-1: re-read branch at save time. The earlier `get_branch` call
+        // happened above for `branch`, but we already used it; nothing extra
+        // to do here — VS Code already captures branch per-prompt.
 
         if let Err(e) = store::save_draft(&record, &commit_shas, &git_diff, &head_sha) {
             display::print_error("vscode", &format!("Failed to save draft: {e}"));
@@ -451,19 +475,29 @@ fn update_existing_draft(
     if !ex.tool_calls.is_empty() {
         updates.insert("is_agentic".into(), Value::Bool(true));
     }
-    let touched = touched_project_ids(&ex.tool_calls, proj_by_id);
+    let primary = project_for_exchange(ex, &ws.projects, proj_by_path);
+    let prompt_cwd: Option<&str> = primary.map(|p| p.path.as_str()).filter(|s| !s.is_empty());
+    let touched = touched_project_ids(&ex.tool_calls, proj_by_id, prompt_cwd);
     if touched.len() > 1 {
         updates.insert(
             "touched_project_ids".into(),
             Value::Array(touched.iter().map(|s| Value::String(s.clone())).collect()),
         );
     }
+    // MR-2: keep `repo_snapshots` in sync as we re-process exchanges so
+    // a session that gained a secondary-repo touch on a later prompt
+    // still ends up with the secondary diff in review.
+    let primary_id = primary.map(|p| p.project_id.as_str()).unwrap_or("");
+    if let Some(snaps) = repo_snapshots(&ex.tool_calls, primary_id, proj_by_id, prompt_cwd) {
+        updates.insert("repo_snapshots".into(), Value::Object(snaps));
+    }
     let _ = store::merge_draft_file_context(&transcript.session_id, &ex.prompt_text, &updates);
 
-    if let Some(primary) = project_for_exchange(ex, &ws.projects, proj_by_path) {
+    if let Some(primary) = primary {
         if !primary.path.is_empty() {
-            let git_diff = get_git_diff(&primary.path);
-            let head_sha = get_head_sha(&primary.path);
+            let canon = canonicalize_project_path(&primary.path);
+            let git_diff = get_git_diff(&canon);
+            let head_sha = get_head_sha(&canon);
             let _ = store::update_draft_git_diff(
                 &transcript.session_id,
                 &ex.prompt_text,
