@@ -455,8 +455,7 @@ practice and evaluates it with 20 software engineers.
 
 - **Issues** — [github.com/pcr-developers/cli/issues](https://github.com/pcr-developers/cli/issues)
 - **Discussions** — [github.com/pcr-developers/cli/discussions](https://github.com/pcr-developers/cli/discussions)
-- **Email** — [hello@pcr.dev](mailto:hello@pcr.dev)
-- **Twitter/X** — [@pcrdev](https://twitter.com/pcrdev)
+- **Email** — [hello@pcr.dev](mailto:bhayun@ethz.ch)
 
 ---
 
