@@ -240,6 +240,16 @@ jobs:
             (cd "$dir" && npm publish --provenance --access public)
           done
 
+      # npm always packs the README.md sitting next to package.json,
+      # regardless of the `files` array. Ship the user-facing project
+      # README so npmjs.com renders the right landing page instead of
+      # the internal NPM-INTERNALS.md.
+      - name: Stage user-facing README for npm
+        shell: bash
+        run: |
+          cp README.md crates/pcr-napi/README.md
+          cp LICENSE   crates/pcr-napi/LICENSE
+
       - name: Publish meta pcr-dev
         shell: bash
         env:

@@ -190,8 +190,8 @@ loaded into `node.exe`), not a standalone `.exe`. This means it works under
 Windows AppLocker / WDAC policies that would normally block unsigned
 executables in user-writable directories — no admin rights, no code-signing
 certificate, no `winget` or `Chocolatey` required. See
-[`crates/pcr-napi/README.md`](crates/pcr-napi/README.md) for the technical
-details.
+[`crates/pcr-napi/NPM-INTERNALS.md`](crates/pcr-napi/NPM-INTERNALS.md) for the
+technical details.
 
 ---
 
@@ -387,7 +387,7 @@ those — TypeScript, Rust, Python, Go, Swift, Kotlin, SQL — is covered.
 
 Yes — and unlike many AI-dev CLIs, it works on locked-down managed
 Windows machines too, because it ships as a Node native addon rather than
-a standalone executable. See the [npm distribution README](crates/pcr-napi/README.md)
+a standalone executable. See the [npm distribution internals doc](crates/pcr-napi/NPM-INTERNALS.md)
 for the technical reason.
 </details>
 

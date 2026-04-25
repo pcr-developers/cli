@@ -1,11 +1,17 @@
-# `pcr-dev` — npm distribution
+# `pcr-dev` — npm distribution internals
 
 Published as [`pcr-dev`](https://www.npmjs.com/package/pcr-dev). This is the
 package you get from `npm install -g pcr-dev`.
 
-For everything `pcr` does as a tool, see the [main README](../../../README.md).
+For everything `pcr` does as a tool, see the [main README](../../README.md).
 This file documents how the npm distribution is shaped, why, and how to
 rebuild it locally.
+
+> **Note:** the user-facing README that ships on npmjs.com is the project's
+> top-level [`README.md`](../../README.md). The release workflow copies it
+> into this directory at publish time (see step in
+> [`.github/workflows/release.yml`](../../.github/workflows/release.yml)).
+> This file (`NPM-INTERNALS.md`) stays repo-only and is not published.
 
 ## Why the npm distribution exists at all
 
