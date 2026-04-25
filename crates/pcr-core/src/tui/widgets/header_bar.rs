@@ -35,7 +35,14 @@ impl HeaderBar {
             Span::raw("  "),
             Span::styled(format!("· {} ·", self.command), theme::dim()),
             Span::raw("  "),
-            Span::styled(format!("v{}", self.version), theme::chrome()),
+            // Strip a leading `v` if the version string already has one
+            // — release CI passes `v0.2.3` (from the git tag) while local
+            // dev gets `0.2.3` from CARGO_PKG_VERSION. Without this we'd
+            // render "vv0.2.3".
+            Span::styled(
+                format!("v{}", self.version.trim_start_matches('v')),
+                theme::chrome(),
+            ),
         ];
         if let Some(u) = &self.user {
             if area.width > 60 {
