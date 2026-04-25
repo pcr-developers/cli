@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://pcr.dev/og.png" alt="PCR.dev — Prompt & Code Reviews for AI-native teams" width="640" />
+<a href="https://pcr.dev"><img src="https://pcr.dev/og.png" alt="PCR.dev — Prompt & Code Reviews for AI-native teams" width="640" /></a>
 
 # PCR — Prompt & Code Review for AI-native engineering teams
 
