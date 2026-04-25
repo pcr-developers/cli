@@ -200,7 +200,8 @@ fn dirty_hashes(project_path: &str) -> HashMap<String, String> {
         .arg("-C")
         .arg(project_path)
         .arg("status")
-        .arg("--porcelain")
+        .arg("--porcelain=v1")
+        .arg("-z")
         .output();
     let Ok(output) = out else {
         return HashMap::new();
@@ -209,14 +210,7 @@ fn dirty_hashes(project_path: &str) -> HashMap<String, String> {
         return HashMap::new();
     }
     let mut result: HashMap<String, String> = HashMap::new();
-    for line in String::from_utf8_lossy(&output.stdout).split('\n') {
-        if line.len() < 4 {
-            continue;
-        }
-        let mut rel = line[3..].trim().to_string();
-        if rel.len() >= 2 && rel.starts_with('"') && rel.ends_with('"') {
-            rel = rel[1..rel.len() - 1].to_string();
-        }
+    for rel in parse_porcelain_z(&output.stdout) {
         if rel.is_empty() || rel.ends_with('/') {
             continue;
         }
@@ -232,6 +226,38 @@ fn dirty_hashes(project_path: &str) -> HashMap<String, String> {
         result.insert(rel, short);
     }
     result
+}
+
+/// Parse `git status --porcelain=v1 -z` output into a list of file paths,
+/// always taking the destination side for renames (`R`) and copies (`C`).
+///
+/// `-z` is NUL-terminated and emits paths verbatim — no shell escaping,
+/// no quoting, no surprises with embedded quotes/spaces/newlines (BUG-12
+/// in the cursor-watcher audit). Each entry is `XY <SP> path<NUL>`, and
+/// rename/copy entries are TWO entries (`R  newpath<NUL>oldpath<NUL>` —
+/// new path first under -z, opposite of the human porcelain order).
+fn parse_porcelain_z(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = bytes.split(|b| *b == 0);
+    while let Some(field) = iter.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        // First two bytes are the XY status code, then a space, then the
+        // path (which under -z runs to the NUL terminator with no quoting).
+        let xy = &field[..2];
+        let path_bytes = &field[3..];
+        let Ok(path) = std::str::from_utf8(path_bytes) else {
+            continue;
+        };
+        out.push(path.to_string());
+        // For renames (R) and copies (C), the next field is the source
+        // path. Skip it — we only want the destination.
+        if xy[0] == b'R' || xy[0] == b'C' {
+            iter.next();
+        }
+    }
+    out
 }
 
 #[cfg(test)]

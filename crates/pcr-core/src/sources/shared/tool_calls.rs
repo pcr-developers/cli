@@ -31,15 +31,17 @@ pub fn touched_project_ids(
 ) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     for tc in tool_calls {
-        let Some(raw) = extract_path_from_tool_call(tc) else {
-            continue;
-        };
-        let Some(abs) = normalize_path(&raw, cwd) else {
-            continue;
-        };
-        for (id, canon_path) in proj_by_id {
-            if path_is_under(&abs, canon_path) {
-                seen.insert(id.clone());
+        // Iterate ALL paths in a tool call, not just the first one — multi-
+        // file edits (`apply-patch`, `replace_string_in_file`'s array form,
+        // experimental Cursor tools) used to silently under-attribute.
+        for raw in extract_paths_from_tool_call(tc) {
+            let Some(abs) = normalize_path(&raw, cwd) else {
+                continue;
+            };
+            for (id, canon_path) in proj_by_id {
+                if path_is_under(&abs, canon_path) {
+                    seen.insert(id.clone());
+                }
             }
         }
     }
@@ -71,31 +73,30 @@ pub fn repo_snapshots(
     use super::git::{get_branch, get_git_diff, get_head_sha};
     let mut result = serde_json::Map::new();
     for tc in tool_calls {
-        let Some(raw) = extract_path_from_tool_call(tc) else {
-            continue;
-        };
-        let Some(abs) = normalize_path(&raw, cwd) else {
-            continue;
-        };
-        for (id, canon_path) in proj_by_id {
-            if id == primary_project_id || canon_path.is_empty() {
+        for raw in extract_paths_from_tool_call(tc) {
+            let Some(abs) = normalize_path(&raw, cwd) else {
                 continue;
+            };
+            for (id, canon_path) in proj_by_id {
+                if id == primary_project_id || canon_path.is_empty() {
+                    continue;
+                }
+                if !path_is_under(&abs, canon_path) {
+                    continue;
+                }
+                if result.contains_key(id) {
+                    continue;
+                }
+                let mut snap = serde_json::Map::new();
+                snap.insert("head_sha".into(), Value::String(get_head_sha(canon_path)));
+                snap.insert("git_diff".into(), Value::String(get_git_diff(canon_path)));
+                // Capture branch alongside the diff so reviewers see which
+                // branch the secondary repo was on. Without this, multi-repo
+                // reviews silently fall back to the primary repo's branch
+                // (BR-1 in the multi-repo audit).
+                snap.insert("branch".into(), Value::String(get_branch(canon_path)));
+                result.insert(id.clone(), Value::Object(snap));
             }
-            if !path_is_under(&abs, canon_path) {
-                continue;
-            }
-            if result.contains_key(id) {
-                continue;
-            }
-            let mut snap = serde_json::Map::new();
-            snap.insert("head_sha".into(), Value::String(get_head_sha(canon_path)));
-            snap.insert("git_diff".into(), Value::String(get_git_diff(canon_path)));
-            // Capture branch alongside the diff so reviewers see which
-            // branch the secondary repo was on. Without this, multi-repo
-            // reviews silently fall back to the primary repo's branch
-            // (BR-1 in the multi-repo audit).
-            snap.insert("branch".into(), Value::String(get_branch(canon_path)));
-            result.insert(id.clone(), Value::Object(snap));
         }
     }
     if result.is_empty() {
@@ -177,21 +178,69 @@ pub fn changed_files_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
 }
 
 pub fn extract_path_from_tool_call(tc: &Value) -> Option<String> {
+    extract_paths_from_tool_call(tc).into_iter().next()
+}
+
+/// Returns *every* file path mentioned by a tool call, not just the first
+/// one. Multi-file tool shapes seen in the wild:
+///
+/// - `input.path`, `input.file_path`, `input.filePath` — single-file edits.
+/// - `input.files: [{path: ...}]` — apply-patch style tool calls that
+///   touch multiple files in a single invocation.
+/// - `input.fileNames: [...]` — VS Code's `replace_string_in_file` and a
+///   handful of newer Cursor agent tools list their target files this way.
+/// - `input.targets: [...]` — some experimental Cursor tools.
+/// - top-level `path` (legacy).
+///
+/// Without iterating ALL paths, multi-file edits silently under-attribute
+/// (the secondary files don't tag their containing project, missing repo
+/// snapshots, missing per-prompt diffs).
+pub fn extract_paths_from_tool_call(tc: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_if_nonempty = |s: Option<&str>| {
+        if let Some(s) = s.filter(|x| !x.is_empty()) {
+            out.push(s.to_string());
+        }
+    };
+
     if let Some(input) = tc.get("input").and_then(|v| v.as_object()) {
-        for key in ["path", "file_path", "filePath"] {
-            if let Some(p) = input.get(key).and_then(|v| v.as_str()) {
-                if !p.is_empty() {
-                    return Some(p.to_string());
+        // Single-file scalar shapes.
+        for key in ["path", "file_path", "filePath", "fileName", "filename"] {
+            push_if_nonempty(input.get(key).and_then(|v| v.as_str()));
+        }
+        // Array-of-strings shapes.
+        for key in ["fileNames", "filenames", "files", "paths", "targets"] {
+            if let Some(arr) = input.get(key).and_then(|v| v.as_array()) {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        push_if_nonempty(Some(s));
+                    } else if let Some(obj) = v.as_object() {
+                        // [{path: ...}] / [{file_path: ...}] / [{file: ...}]
+                        for inner_key in ["path", "file_path", "filePath", "file"] {
+                            push_if_nonempty(obj.get(inner_key).and_then(|v| v.as_str()));
+                        }
+                    }
+                }
+            }
+        }
+        // VS Code apply-patch sometimes uses `input.changes: [{file: ...}]`.
+        if let Some(arr) = input.get("changes").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(obj) = v.as_object() {
+                    for inner_key in ["file", "path", "file_path", "filePath"] {
+                        push_if_nonempty(obj.get(inner_key).and_then(|v| v.as_str()));
+                    }
                 }
             }
         }
     }
-    if let Some(p) = tc.get("path").and_then(|v| v.as_str()) {
-        if !p.is_empty() {
-            return Some(p.to_string());
-        }
-    }
-    None
+    // Top-level `path` (legacy).
+    push_if_nonempty(tc.get("path").and_then(|v| v.as_str()));
+
+    // Dedupe in-place — many tool shapes set both `path` and `file_path`.
+    let mut seen: HashSet<String> = HashSet::new();
+    out.retain(|s| seen.insert(s.clone()));
+    out
 }
 
 #[cfg(test)]
@@ -248,6 +297,69 @@ mod tests {
         by_id.insert("p1".to_string(), "/proj".to_string());
         let calls = vec![tc("/proj/a.rs"), tc("/proj/b.rs"), tc("/proj/c.rs")];
         assert_eq!(touched_project_ids(&calls, &by_id, None), vec!["p1"]);
+    }
+
+    #[test]
+    fn extract_paths_handles_multi_file_arrays() {
+        // `input.files: [{path: ...}]` (apply-patch shape)
+        let v = json!({
+            "tool": "ApplyPatch",
+            "input": {
+                "files": [
+                    {"path": "/repo/a.rs"},
+                    {"path": "/repo/b.rs"},
+                ]
+            }
+        });
+        let paths = extract_paths_from_tool_call(&v);
+        assert_eq!(paths, vec!["/repo/a.rs", "/repo/b.rs"]);
+    }
+
+    #[test]
+    fn extract_paths_handles_filename_array() {
+        // `input.fileNames: [...]` shape
+        let v = json!({
+            "tool": "MultiEdit",
+            "input": {"fileNames": ["/repo/a.rs", "/repo/b.rs", "/repo/c.rs"]}
+        });
+        assert_eq!(
+            extract_paths_from_tool_call(&v),
+            vec!["/repo/a.rs", "/repo/b.rs", "/repo/c.rs"]
+        );
+    }
+
+    #[test]
+    fn extract_paths_handles_changes_array() {
+        // VS Code apply-patch `input.changes: [{file: ...}]` shape
+        let v = json!({
+            "tool": "ApplyPatch",
+            "input": {"changes": [{"file": "/a"}, {"file": "/b"}]}
+        });
+        assert_eq!(extract_paths_from_tool_call(&v), vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn extract_paths_dedupes_redundant_keys() {
+        // Some tool schemas set both `path` and `file_path` to the same
+        // string. Duplicate output would inflate hit counts.
+        let v = json!({
+            "input": {"path": "/a", "file_path": "/a"}
+        });
+        assert_eq!(extract_paths_from_tool_call(&v), vec!["/a"]);
+    }
+
+    #[test]
+    fn touched_project_ids_uses_all_paths_in_multi_file_calls() {
+        // Multi-file tool call touching p1 AND p2 must tag both, not
+        // just the first path's project.
+        let mut by_id = BTreeMap::new();
+        by_id.insert("p1".to_string(), "/repo/p1".to_string());
+        by_id.insert("p2".to_string(), "/repo/p2".to_string());
+        let calls = vec![json!({
+            "tool": "ApplyPatch",
+            "input": {"files": [{"path": "/repo/p1/a.rs"}, {"path": "/repo/p2/b.rs"}]}
+        })];
+        assert_eq!(touched_project_ids(&calls, &by_id, None), vec!["p1", "p2"]);
     }
 
     #[test]

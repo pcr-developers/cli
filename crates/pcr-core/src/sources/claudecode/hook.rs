@@ -181,7 +181,13 @@ fn hook_create_new_bundle(
 }
 
 fn git_branch() -> String {
-    git_output(&["rev-parse", "--abbrev-ref", "HEAD"])
+    // Detached-HEAD becomes empty string instead of the literal "HEAD".
+    let b = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    if b == "HEAD" {
+        String::new()
+    } else {
+        b
+    }
 }
 
 fn draft_ids(drafts: &[DraftRecord]) -> Vec<String> {

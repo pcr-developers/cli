@@ -14,8 +14,10 @@ pub fn draft_ids(drafts: &[DraftRecord]) -> Vec<String> {
     drafts.iter().map(|d| d.id.clone()).collect()
 }
 
-/// Returns a non-empty branch name or empty string. Called by commands
-/// that want to attach the current working branch to new commits/bundles.
+/// Returns the current working-tree's branch name, or empty string when
+/// detached. Now a thin wrapper over `shared::git::get_branch("")` —
+/// kept as its own helper so call sites don't have to think about the
+/// detached-HEAD normalization.
 pub fn current_branch() -> String {
     let b = crate::sources::shared::git::git_output(&["rev-parse", "--abbrev-ref", "HEAD"]);
     if b == "HEAD" {
