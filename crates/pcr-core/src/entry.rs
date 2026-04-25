@@ -51,8 +51,11 @@ struct Cli {
     #[command(flatten)]
     global: GlobalArgs,
 
+    /// Subcommand. When omitted, `pcr` opens the interactive command
+    /// browser (same as `pcr help`) on a TTY, or prints the long-form
+    /// help to stderr when piped / `--plain` / `CI` / `NO_COLOR`.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -203,20 +206,25 @@ pub fn run(argv: Vec<String>) -> i32 {
     };
     let mode = cli.global.output_mode();
     let code: ExitCode = match cli.command {
-        Command::Login => crate::commands::login::run(mode),
-        Command::Logout => crate::commands::logout::run(mode),
-        Command::Init(a) => crate::commands::init::run(mode, a),
-        Command::Start(a) => crate::commands::start::run(mode, a),
-        Command::Mcp => crate::mcp::run_stub(),
-        Command::Status => crate::commands::status::run(mode),
-        Command::Bundle(a) => crate::commands::bundle::run(mode, a),
-        Command::Push => crate::commands::push::run(mode),
-        Command::Log => crate::commands::log::run(mode),
-        Command::Show(a) => crate::commands::show::run(mode, a),
-        Command::Pull(a) => crate::commands::pull::run(mode, a),
-        Command::Gc(a) => crate::commands::gc::run(mode, a),
-        Command::Help => crate::commands::help::run(mode),
-        Command::Hook => crate::commands::hook::run(mode),
+        // No subcommand → open the interactive command browser. On a non-
+        // TTY / `--plain` / `--json` / `CI` / `NO_COLOR`, the help command
+        // gracefully degrades to a line dump of every entry, so this stays
+        // useful for scripts and agents that just want to discover commands.
+        None => crate::commands::help::run(mode),
+        Some(Command::Login) => crate::commands::login::run(mode),
+        Some(Command::Logout) => crate::commands::logout::run(mode),
+        Some(Command::Init(a)) => crate::commands::init::run(mode, a),
+        Some(Command::Start(a)) => crate::commands::start::run(mode, a),
+        Some(Command::Mcp) => crate::mcp::run_stub(),
+        Some(Command::Status) => crate::commands::status::run(mode),
+        Some(Command::Bundle(a)) => crate::commands::bundle::run(mode, a),
+        Some(Command::Push) => crate::commands::push::run(mode),
+        Some(Command::Log) => crate::commands::log::run(mode),
+        Some(Command::Show(a)) => crate::commands::show::run(mode, a),
+        Some(Command::Pull(a)) => crate::commands::pull::run(mode, a),
+        Some(Command::Gc(a)) => crate::commands::gc::run(mode, a),
+        Some(Command::Help) => crate::commands::help::run(mode),
+        Some(Command::Hook) => crate::commands::hook::run(mode),
     };
     code.as_i32()
 }
