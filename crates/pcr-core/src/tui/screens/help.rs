@@ -1,8 +1,14 @@
 //! `pcr help` — interactive command index.
 //!
 //! Two panes: the command list on the left, the formatted help entry on
-//! the right. `j/k` to move, `enter` to focus the right pane (for scroll),
-//! `q` to quit.
+//! the right.
+//!
+//! Keybinds:
+//!   j/k     move
+//!   g/G     top/bottom
+//!   enter   run the selected command (or print its example if it
+//!           needs args you can't infer from the help table)
+//!   q/Esc   quit
 
 use std::time::Duration;
 
@@ -12,7 +18,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::help::{HelpEntry, HELP};
+use crate::help::{HelpEntry, Runnable, HELP};
 use crate::tui::app::{restore_terminal, setup_terminal};
 use crate::tui::events::{Event, EventSource};
 use crate::tui::theme::{self, glyphs};
@@ -20,18 +26,26 @@ use crate::tui::widgets::header_bar::HeaderBar;
 use crate::util::time::local_hms;
 use crate::VERSION;
 
-pub fn run() -> Result<()> {
+/// Result of a help session — what the caller should do next.
+pub enum Selection {
+    /// User dismissed the screen with `q` / `Esc` — return to shell.
+    Quit,
+    /// User pressed `Enter` on a command. Caller dispatches accordingly.
+    Run(&'static str),
+}
+
+pub fn run() -> Result<Selection> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
     let mut focus = 0usize;
     let mut state = ListState::default();
     state.select(Some(0));
 
-    loop {
+    let result = loop {
         term.draw(|f| draw(f, focus, &mut state))?;
         match events.rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Event::Key(KeyEvent { code, .. })) => match code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('q') | KeyCode::Esc => break Selection::Quit,
                 KeyCode::Down | KeyCode::Char('j') => {
                     focus = (focus + 1).min(HELP.len() - 1);
                     state.select(Some(focus));
@@ -48,15 +62,24 @@ pub fn run() -> Result<()> {
                     focus = HELP.len() - 1;
                     state.select(Some(focus));
                 }
+                KeyCode::Enter => {
+                    let entry = &HELP[focus];
+                    // Hidden commands ignore Enter. Everything else
+                    // (Direct + NeedsArgs) returns control to the caller,
+                    // which dispatches based on `entry.runnable`.
+                    if !matches!(entry.runnable, Runnable::Hidden) {
+                        break Selection::Run(entry.command);
+                    }
+                }
                 _ => {}
             },
             Ok(_) => {}
             Err(_) => {}
         }
-    }
+    };
 
     restore_terminal()?;
-    Ok(())
+    Ok(result)
 }
 
 fn draw(frame: &mut ratatui::Frame, focus: usize, list_state: &mut ListState) {
@@ -85,7 +108,7 @@ fn draw(frame: &mut ratatui::Frame, focus: usize, list_state: &mut ListState) {
 
     draw_command_list(frame, cols[0], focus, list_state);
     draw_entry(frame, cols[1], &HELP[focus]);
-    draw_footer(frame, chunks[2]);
+    draw_footer(frame, chunks[2], &HELP[focus]);
 }
 
 fn draw_command_list(
@@ -181,15 +204,33 @@ fn draw_entry(frame: &mut ratatui::Frame, area: Rect, entry: &HelpEntry) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_footer(frame: &mut ratatui::Frame, area: Rect) {
-    let hints = vec![
+fn draw_footer(frame: &mut ratatui::Frame, area: Rect, entry: &HelpEntry) {
+    // The Enter affordance changes per-command so users always know what
+    // pressing it will do *right now*. Hidden commands hide the hint.
+    let enter_hint: Vec<Span<'_>> = match entry.runnable {
+        Runnable::Direct => vec![
+            Span::styled("enter", theme::accent()),
+            Span::styled(format!(" run `pcr {}`  ", entry.command), theme::dim()),
+        ],
+        Runnable::NeedsArgs => vec![
+            Span::styled("enter", theme::accent()),
+            Span::styled(
+                format!(" exit + show `pcr {}` example  ", entry.command),
+                theme::dim(),
+            ),
+        ],
+        Runnable::Hidden => vec![],
+    };
+
+    let mut hints = enter_hint;
+    hints.extend([
         Span::styled("j/k", theme::accent()),
         Span::styled(" move  ", theme::dim()),
         Span::styled("g/G", theme::accent()),
         Span::styled(" top/bottom  ", theme::dim()),
         Span::styled("q", theme::accent()),
         Span::styled(" quit", theme::dim()),
-    ];
+    ]);
     frame.render_widget(Paragraph::new(Line::from(hints)), area);
 }
 

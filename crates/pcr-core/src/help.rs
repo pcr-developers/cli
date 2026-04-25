@@ -16,6 +16,28 @@ pub struct HelpEntry {
     pub when_to_use: &'static str,
     pub examples: &'static [(&'static str, &'static str)],
     pub see_also: &'static [&'static str],
+    /// What `Enter` should do for this command in the interactive
+    /// `pcr help` TUI. See [`Runnable`] for the possible behaviours.
+    pub runnable: Runnable,
+}
+
+/// What pressing `Enter` on a command in `pcr help` does.
+///
+/// The `pcr help` TUI uses this to decide whether it can launch a
+/// command directly or whether it should hand the user back to their
+/// shell with a copyable example.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Runnable {
+    /// Safe to launch in-process with no arguments. `Enter` quits help
+    /// and runs the command immediately (e.g. `pcr status` opens the
+    /// status TUI; `pcr login` runs the interactive login flow).
+    Direct,
+    /// Command needs a positional argument that we can't infer.
+    /// `Enter` exits help and prints the first example so the user can
+    /// edit it in their shell. Used by `pcr show <n>`.
+    NeedsArgs,
+    /// Internal / hidden command. `Enter` is a no-op.
+    Hidden,
 }
 
 pub const HELP: &[HelpEntry] = &[
@@ -29,6 +51,7 @@ pub const HELP: &[HelpEntry] = &[
             ("echo $TOKEN | pcr login", "scripted — read token from stdin"),
         ],
         see_also: &["logout", "status"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "logout",
@@ -37,6 +60,7 @@ pub const HELP: &[HelpEntry] = &[
         when_to_use: "Switching accounts, lending your laptop, or rotating a leaked token.",
         examples: &[("pcr logout", "remove credentials")],
         see_also: &["login"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "init",
@@ -49,6 +73,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr init --unregister", "stop tracking the current directory"),
         ],
         see_also: &["status", "start"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "start",
@@ -61,6 +86,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr start --plain", "no full-screen TUI — line output only (good for CI / agents)"),
         ],
         see_also: &["status", "log", "show"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "status",
@@ -72,6 +98,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr --json status", "machine-readable output for scripts"),
         ],
         see_also: &["log", "bundle", "push"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "log",
@@ -83,6 +110,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr --json log", "JSON for tooling"),
         ],
         see_also: &["status", "show", "bundle"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "show",
@@ -94,6 +122,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr --plain show 3", "print to stderr instead of the TUI"),
         ],
         see_also: &["log", "bundle"],
+        runnable: Runnable::NeedsArgs,
     },
     HelpEntry {
         command: "bundle",
@@ -109,6 +138,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr bundle --list", "list every unpushed bundle across projects"),
         ],
         see_also: &["log", "show", "push"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "push",
@@ -119,6 +149,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr push", "push every sealed bundle"),
         ],
         see_also: &["bundle", "pull", "log"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "pull",
@@ -130,6 +161,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr pull <remote-id>", "restore a specific bundle by ID"),
         ],
         see_also: &["push", "log"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "gc",
@@ -144,6 +176,7 @@ pub const HELP: &[HelpEntry] = &[
             ("pcr gc --orphaned", "delete unpushed bundles whose HEAD SHA is gone"),
         ],
         see_also: &["log", "push"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "mcp",
@@ -152,6 +185,7 @@ pub const HELP: &[HelpEntry] = &[
         when_to_use: "Currently exits with code 50 (NotImplemented). Track the rewrite issue on the cli repo.",
         examples: &[("pcr mcp", "shows a placeholder message and exits")],
         see_also: &["start"],
+        runnable: Runnable::Direct,
     },
     HelpEntry {
         command: "hook",
@@ -160,6 +194,7 @@ pub const HELP: &[HelpEntry] = &[
         when_to_use: "You don't run this directly. It's wired up automatically when you use `pcr start` and Claude Code together.",
         examples: &[],
         see_also: &["start"],
+        runnable: Runnable::Hidden,
     },
 ];
 
