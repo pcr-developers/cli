@@ -154,8 +154,10 @@ pcr --plain bundle "agent run" --select all && pcr --plain push
 
 ## Build from source
 
-Rust ≥ 1.82 (pinned in `rust-toolchain.toml`). Zero C dependencies — `rusqlite` uses the
-bundled SQLite, `reqwest` uses `rustls-tls`. A clean checkout compiles offline.
+Rust 1.82 or newer (MSRV). The dev `rust-toolchain.toml` pins a current
+stable release; `rustup` will install it on demand. Zero C dependencies —
+`rusqlite` uses the bundled SQLite, `reqwest` uses `rustls-tls`. A clean
+checkout compiles offline.
 
 ```bash
 git clone https://github.com/pcr-developers/cli.git
