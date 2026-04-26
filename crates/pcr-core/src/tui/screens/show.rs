@@ -1,10 +1,17 @@
 //! `pcr show` — interactive draft browser.
 //!
-//! Three panes (drafts list, detail, optional sidebar with changed files
-//! and tool calls). Selection lives on row index color: blue = focused,
-//! green = selected, green wins when both apply. `b` opens a bundle
-//! name prompt for the current selection (or the focused row).
-//! After a successful bundle, `p` exits the TUI and runs `pcr push`.
+//! Two top-level views, toggled with `Tab`:
+//!
+//! * **Drafts** — three panes (drafts list, detail, optional sidebar).
+//!   Focus is the row background; selection is a green index + bold
+//!   white preview. `b` opens a bundle modal that lists existing open
+//!   bundles plus a name input — pick one with ↑/↓ to add the
+//!   selection to it, or type a new name to create one. After a
+//!   successful bundle, `p` exits the TUI and runs `pcr push`.
+//!
+//! * **Bundles** — list of every unpushed bundle on the left, the
+//!   focused bundle's prompts on the right. `p` pushes everything,
+//!   `d` deletes the focused bundle (drafts return to the pool).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -18,7 +25,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::commands::helpers::{current_branch, draft_ids};
 use crate::commands::project_context::resolve;
-use crate::store::{self, DraftRecord};
+use crate::store::{self, DraftRecord, PromptCommit};
 use crate::tui::app::{restore_terminal, setup_terminal};
 use crate::tui::events::{Event, EventSource};
 use crate::tui::theme::{self, glyphs};
@@ -30,6 +37,7 @@ use crate::VERSION;
 /// What the caller should do after the TUI exits.
 pub enum ShowOutcome {
     Quit,
+    /// Run `pcr push` against every sealed bundle.
     PushAfterExit,
 }
 
@@ -67,8 +75,15 @@ pub fn run_focused_with_hidden(
         push_armed: false,
         outcome: ShowOutcome::Quit,
         nav_dir: NavDir::Down,
+        mode: BrowseMode::Drafts,
+        bundles: load_bundles(),
+        bundle_focus: 0,
+        bundles_state: ListState::default(),
     };
     state.list_state.select(Some(focus));
+    if !state.bundles.is_empty() {
+        state.bundles_state.select(Some(0));
+    }
 
     loop {
         term.draw(|f| draw(f, &state))?;
@@ -119,12 +134,26 @@ struct ShowState {
     /// select so it follows the user's scroll instead of always
     /// jumping down.
     nav_dir: NavDir,
+    /// Which top-level pane the user is browsing. `Tab` toggles.
+    mode: BrowseMode,
+    /// Cached open + closed unpushed bundles, refreshed when entering
+    /// the bundles view or after any local mutation (create / add /
+    /// delete).
+    bundles: Vec<PromptCommit>,
+    bundle_focus: usize,
+    bundles_state: ListState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NavDir {
     Up,
     Down,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowseMode {
+    Drafts,
+    Bundles,
 }
 
 /// Inline text-input modal overlaid on the list.
@@ -135,11 +164,26 @@ struct Modal {
     /// target set can't shift if focus changes behind the overlay.
     /// Unused by `RangeSelect`, which reads `state.drafts` at confirm.
     targets: Vec<String>,
+    /// Bundles the user can pick from in `Bundle` mode (id + name +
+    /// current draft count). Empty list = no existing bundles, only
+    /// the new-bundle input is shown. Filtered by `buf` while typing.
+    bundle_choices: Vec<BundleChoice>,
+    /// Index into the *filtered* `bundle_choices` for the highlighted
+    /// row, or `None` if the user is composing a new name in the input.
+    /// Up / Down move into the list; typing returns focus to the input.
+    pick: Option<usize>,
+}
+
+#[derive(Clone)]
+struct BundleChoice {
+    id: String,
+    name: String,
+    count: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModalKind {
-    /// `b`: prompt for a bundle name; on confirm bundle `targets`.
+    /// `b`: pick an existing open bundle to add to, or type a new name.
     Bundle,
     /// `:`: prompt for a `1-5,8,12-15` range; on confirm union those
     /// indices into `state.selected`.
@@ -149,6 +193,13 @@ enum ModalKind {
 fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
     if state.prompt.is_some() {
         return handle_prompt_key(k, state);
+    }
+    if k.code == KeyCode::Tab {
+        toggle_mode(state);
+        return true;
+    }
+    if state.mode == BrowseMode::Bundles {
+        return handle_bundles_key(k, state);
     }
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => return false,
@@ -234,10 +285,18 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     4,
                 ));
             } else {
+                let bundle_choices = bundle_choices_from(&state.bundles);
+                let pick = if bundle_choices.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
                 state.prompt = Some(Modal {
                     kind: ModalKind::Bundle,
                     buf: String::new(),
                     targets,
+                    bundle_choices,
+                    pick,
                 });
             }
         }
@@ -247,6 +306,8 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     kind: ModalKind::RangeSelect,
                     buf: String::new(),
                     targets: Vec::new(),
+                    bundle_choices: Vec::new(),
+                    pick: None,
                 });
             }
         }
@@ -269,7 +330,7 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         KeyCode::Char('d') => delete_focused(state),
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "j/k move · enter/space select · J/K select+move · : range (1-5,8) · a all · b bundle · p push · c copy · d delete · q quit"
+                "j/k move · enter/space select · J/K select+move · : range · a all · b bundle · p push · tab bundles view · c copy · d delete · q quit"
                     .into(),
                 14,
             ));
@@ -318,6 +379,98 @@ fn delete_focused(state: &mut ShowState) {
 
 /// Key dispatch while a modal prompt is on screen. Esc / empty-buf q
 /// dismiss the prompt; the TUI itself never quits from inside a modal.
+/// Switch between Drafts and Bundles browser views.
+fn toggle_mode(state: &mut ShowState) {
+    state.mode = match state.mode {
+        BrowseMode::Drafts => BrowseMode::Bundles,
+        BrowseMode::Bundles => BrowseMode::Drafts,
+    };
+    if state.mode == BrowseMode::Bundles {
+        // Refresh on every entry — bundles can change between visits if
+        // the user added drafts to one mid-session.
+        state.bundles = load_bundles();
+        if state.bundle_focus >= state.bundles.len() {
+            state.bundle_focus = state.bundles.len().saturating_sub(1);
+        }
+        state
+            .bundles_state
+            .select((!state.bundles.is_empty()).then_some(state.bundle_focus));
+    }
+}
+
+/// Key dispatch when the user is browsing the bundles view.
+fn handle_bundles_key(k: KeyEvent, state: &mut ShowState) -> bool {
+    match k.code {
+        KeyCode::Char('q') | KeyCode::Esc => return false,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !state.bundles.is_empty() {
+                state.bundle_focus = (state.bundle_focus + 1).min(state.bundles.len() - 1);
+                state.bundles_state.select(Some(state.bundle_focus));
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.bundle_focus = state.bundle_focus.saturating_sub(1);
+            state
+                .bundles_state
+                .select((!state.bundles.is_empty()).then_some(state.bundle_focus));
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.bundle_focus = 0;
+            state
+                .bundles_state
+                .select((!state.bundles.is_empty()).then_some(0));
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            if !state.bundles.is_empty() {
+                state.bundle_focus = state.bundles.len() - 1;
+                state.bundles_state.select(Some(state.bundle_focus));
+            }
+        }
+        KeyCode::Char('p') => {
+            if state.bundles.is_empty() {
+                state.copy_flash = Some(("No bundles to push.".into(), 3));
+            } else {
+                state.outcome = ShowOutcome::PushAfterExit;
+                return false;
+            }
+        }
+        KeyCode::Char('d') => delete_focused_bundle(state),
+        KeyCode::Char('?') => {
+            state.copy_flash = Some((
+                "tab back to drafts · j/k move · p push all · d delete focused · q quit".into(),
+                10,
+            ));
+        }
+        _ => {}
+    }
+    true
+}
+
+fn delete_focused_bundle(state: &mut ShowState) {
+    let Some(bundle) = state.bundles.get(state.bundle_focus).cloned() else {
+        return;
+    };
+    let label = bundle.message.clone();
+    match store::delete_bundle(&bundle.id) {
+        Ok(()) => {
+            state.bundles = load_bundles();
+            if state.bundle_focus >= state.bundles.len() {
+                state.bundle_focus = state.bundles.len().saturating_sub(1);
+            }
+            state
+                .bundles_state
+                .select((!state.bundles.is_empty()).then_some(state.bundle_focus));
+            state.copy_flash = Some((
+                format!("Deleted bundle {label:?} — drafts returned to the pool"),
+                5,
+            ));
+        }
+        Err(e) => {
+            state.copy_flash = Some((format!("Delete failed: {e}"), 6));
+        }
+    }
+}
+
 fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
     let Some(prompt) = state.prompt.as_mut() else {
         return true;
@@ -330,12 +483,39 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
         }
         KeyCode::Backspace => {
             prompt.buf.pop();
+            // Re-anchor the picker to the input as soon as the user
+            // edits — typing implies they want the new-name path.
+            if prompt.kind == ModalKind::Bundle {
+                prompt.pick = None;
+            }
+        }
+        KeyCode::Down => {
+            if prompt.kind == ModalKind::Bundle && !prompt.bundle_choices.is_empty() {
+                prompt.pick = Some(match prompt.pick {
+                    None => 0,
+                    Some(i) => (i + 1).min(prompt.bundle_choices.len() - 1),
+                });
+            }
+        }
+        KeyCode::Up => {
+            if prompt.kind == ModalKind::Bundle && !prompt.bundle_choices.is_empty() {
+                prompt.pick = match prompt.pick {
+                    None => None,
+                    Some(0) => None,
+                    Some(i) => Some(i - 1),
+                };
+            }
         }
         KeyCode::Enter => {
             let kind = prompt.kind;
             let buf = prompt.buf.trim().to_string();
+            let pick = prompt.pick;
+            let pick_choice = pick.and_then(|i| prompt.bundle_choices.get(i).cloned());
             match kind {
-                ModalKind::Bundle => confirm_bundle_modal(state, buf),
+                ModalKind::Bundle => match pick_choice {
+                    Some(choice) => confirm_add_to_bundle(state, choice),
+                    None => confirm_bundle_modal(state, buf),
+                },
                 ModalKind::RangeSelect => confirm_range_select_modal(state, buf),
             }
         }
@@ -345,6 +525,9 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
             // containing "q" stay reachable.
             if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
                 prompt.buf.clear();
+                if prompt.kind == ModalKind::Bundle {
+                    prompt.pick = None;
+                }
             } else if (c == 'q' || c == 'Q') && prompt.buf.is_empty() {
                 let kind = prompt.kind;
                 state.prompt = None;
@@ -353,6 +536,9 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 && prompt.buf.chars().count() < 120
             {
                 prompt.buf.push(c);
+                if prompt.kind == ModalKind::Bundle {
+                    prompt.pick = None;
+                }
             }
         }
         _ => {}
@@ -380,20 +566,7 @@ fn confirm_bundle_modal(state: &mut ShowState, name: String) {
     state.prompt = None;
     match create_bundle_from_targets(&name, &targets) {
         Ok(count) => {
-            // Drop bundled drafts from the in-memory list — the store
-            // has already moved them out of the draft pool.
-            let bundled: HashSet<String> = targets.into_iter().collect();
-            state.drafts.retain(|d| !bundled.contains(&d.id));
-            state.selected.retain(|id| !bundled.contains(id));
-            if state.drafts.is_empty() {
-                state.focus = 0;
-                state.list_state.select(None);
-            } else {
-                if state.focus >= state.drafts.len() {
-                    state.focus = state.drafts.len() - 1;
-                }
-                state.list_state.select(Some(state.focus));
-            }
+            apply_bundle_outcome(state, &targets);
             state.push_armed = true;
             state.copy_flash = Some((
                 format!(
@@ -407,6 +580,57 @@ fn confirm_bundle_modal(state: &mut ShowState, name: String) {
             state.copy_flash = Some((format!("Bundle failed: {e}"), 8));
         }
     }
+}
+
+fn confirm_add_to_bundle(state: &mut ShowState, choice: BundleChoice) {
+    let targets = state
+        .prompt
+        .as_mut()
+        .map(|p| std::mem::take(&mut p.targets))
+        .unwrap_or_default();
+    state.prompt = None;
+    let single_repo = resolve().single_repo;
+    match add_to_bundle(&choice.id, &targets, single_repo) {
+        Ok(count) => {
+            apply_bundle_outcome(state, &targets);
+            state.push_armed = true;
+            state.copy_flash = Some((
+                format!(
+                    "Added {count} draft{} to {:?} — press p to push, q to quit",
+                    plural(count),
+                    choice.name,
+                ),
+                12,
+            ));
+        }
+        Err(e) => {
+            state.copy_flash = Some((format!("Add failed: {e}"), 8));
+        }
+    }
+}
+
+/// Common post-bundle housekeeping: drop bundled drafts from the
+/// in-memory list, refresh the cached bundles, re-anchor focus.
+fn apply_bundle_outcome(state: &mut ShowState, target_ids: &[String]) {
+    let bundled: HashSet<String> = target_ids.iter().cloned().collect();
+    state.drafts.retain(|d| !bundled.contains(&d.id));
+    state.selected.retain(|id| !bundled.contains(id));
+    if state.drafts.is_empty() {
+        state.focus = 0;
+        state.list_state.select(None);
+    } else {
+        if state.focus >= state.drafts.len() {
+            state.focus = state.drafts.len() - 1;
+        }
+        state.list_state.select(Some(state.focus));
+    }
+    state.bundles = load_bundles();
+    if state.bundle_focus >= state.bundles.len() {
+        state.bundle_focus = state.bundles.len().saturating_sub(1);
+    }
+    state
+        .bundles_state
+        .select((!state.bundles.is_empty()).then_some(state.bundle_focus));
 }
 
 fn confirm_range_select_modal(state: &mut ShowState, expr: String) {
@@ -520,6 +744,42 @@ fn advance_focus(state: &mut ShowState) {
     state.list_state.select(Some(state.focus));
 }
 
+/// Snapshot of every unpushed bundle for the bundles view + the
+/// picker modal. Loaded at TUI open and refreshed after any local
+/// mutation (create, add, delete).
+fn load_bundles() -> Vec<PromptCommit> {
+    let mut all: Vec<PromptCommit> = store::get_unpushed_commits().unwrap_or_default();
+    // Newest first reads better in a folder-like list.
+    all.sort_by(|a, b| b.committed_at.cmp(&a.committed_at));
+    all
+}
+
+fn bundle_choices_from(bundles: &[PromptCommit]) -> Vec<BundleChoice> {
+    bundles
+        .iter()
+        .filter(|b| b.bundle_status == "open")
+        .map(|b| BundleChoice {
+            id: b.id.clone(),
+            name: b.message.clone(),
+            count: b.items.len(),
+        })
+        .collect()
+}
+
+/// Add `draft_ids_in` to an existing bundle. Re-uses the same store
+/// transaction `pcr bundle "name" --add --select` does.
+fn add_to_bundle(
+    bundle_id: &str,
+    draft_ids_in: &[String],
+    single_repo: bool,
+) -> Result<usize, String> {
+    if draft_ids_in.is_empty() {
+        return Err("nothing to add".into());
+    }
+    store::add_drafts_to_bundle(bundle_id, draft_ids_in, single_repo).map_err(|e| e.to_string())?;
+    Ok(draft_ids_in.len())
+}
+
 /// Create a sealed bundle from `draft_ids_in`, mirroring the
 /// `pcr bundle "name" --select` codepath. Returns the number of
 /// drafts actually bundled.
@@ -587,6 +847,12 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     }
     .render(frame, chunks[0]);
 
+    if state.mode == BrowseMode::Bundles {
+        draw_bundles_view(frame, chunks[1], state);
+        draw_footer(frame, chunks[2], state);
+        return;
+    }
+
     if state.drafts.is_empty() {
         let empty = Paragraph::new(vec![
             Line::from(""),
@@ -594,6 +860,11 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
             Line::from(""),
             Line::from(Span::styled(
                 "  → run `pcr start` and send a prompt in your editor.",
+                theme::dim(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press Tab to view your bundles.",
                 theme::dim(),
             )),
         ])
@@ -637,13 +908,182 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     }
 }
 
+/// Two-pane bundles view: list of all unpushed bundles on the left,
+/// the focused bundle's prompts on the right.
+fn draw_bundles_view(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(36), Constraint::Min(40)])
+        .split(area);
+    draw_bundles_list(frame, cols[0], state);
+    draw_bundle_detail(frame, cols[1], state);
+}
+
+fn draw_bundles_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
+    let title = format!(" Bundles · {} ", state.bundles.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::chrome())
+        .title(Line::from(Span::styled(title, theme::dim())));
+
+    if state.bundles.is_empty() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled("  No bundles yet.", theme::pending())),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press Tab to go back to drafts,",
+                theme::dim(),
+            )),
+            Line::from(Span::styled(
+                "  select some, and `b` to bundle.",
+                theme::dim(),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let inner_width = (area.width as usize).saturating_sub(2);
+    const STATUS_WIDTH: usize = 8; // " open  " or " sealed"
+    const COUNT_WIDTH: usize = 5; // "(NN) "
+    let name_max = inner_width
+        .saturating_sub(STATUS_WIDTH + COUNT_WIDTH + 2)
+        .max(8);
+
+    let items: Vec<ListItem<'_>> = state
+        .bundles
+        .iter()
+        .map(|b| {
+            let (status_label, status_style) = match b.bundle_status.as_str() {
+                "open" => (" open  ", theme::pending()),
+                _ => (" sealed", theme::success()),
+            };
+            let count = format!("({:>2})", b.items.len());
+            let name = truncate_for_display(&b.message, name_max);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{name:<width$}", width = name_max), theme::text()),
+                Span::raw(" "),
+                Span::styled(count, theme::chrome()),
+                Span::raw(" "),
+                Span::styled(status_label, status_style),
+            ]))
+        })
+        .collect();
+
+    let mut ls = state.bundles_state.clone();
+    let widget = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(34, 46, 62)));
+    frame.render_stateful_widget(widget, area, &mut ls);
+}
+
+fn draw_bundle_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
+    let Some(bundle) = state.bundles.get(state.bundle_focus) else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::chrome())
+            .title(Line::from(Span::styled(" Bundle ", theme::dim())));
+        frame.render_widget(block, area);
+        return;
+    };
+
+    let title = format!(
+        " Bundle · {} · {} prompt{} ",
+        truncate_for_display(&bundle.message, 30),
+        bundle.items.len(),
+        plural(bundle.items.len()),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::chrome())
+        .title(Line::from(Span::styled(title, theme::dim())));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let inner = inner.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("status   ", theme::dim()),
+        Span::styled(bundle.bundle_status.clone(), theme::text()),
+    ]));
+    if !bundle.branch_name.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("branch   ", theme::dim()),
+            Span::styled(bundle.branch_name.clone(), theme::text()),
+        ]));
+    }
+    if !bundle.project_name.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("project  ", theme::dim()),
+            Span::styled(bundle.project_name.clone(), theme::text()),
+        ]));
+    }
+    if !bundle.committed_at.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("created  ", theme::dim()),
+            Span::styled(fmt_time(&bundle.committed_at), theme::text()),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    if bundle.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no prompts in this bundle)",
+            theme::dim(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled("PROMPTS", theme::accent_bold())));
+        let preview_max = (inner.width as usize).saturating_sub(8).max(8);
+        for (i, d) in bundle.items.iter().enumerate() {
+            let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:>2}.  ", i + 1), theme::chrome()),
+                Span::styled(preview, theme::text()),
+            ]));
+        }
+    }
+
+    frame.render_widget(Clear, inner);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
+fn truncate_for_display(s: &str, width: usize) -> String {
+    if width == 0 || s.is_empty() {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let head: String = s.chars().take(width - 1).collect();
+    format!("{head}…")
+}
+
 /// Centered modal overlay for the active prompt.
 fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
     let Some(prompt) = state.prompt.as_ref() else {
         return;
     };
     let width = 64.min(body.width.saturating_sub(4));
-    let height = 7u16;
+    // Bundle modal grows vertically when there are existing bundles to
+    // pick from — cap at 16 rows so the picker stays scannable.
+    let bundle_rows = match prompt.kind {
+        ModalKind::Bundle => prompt.bundle_choices.len().min(8) as u16,
+        ModalKind::RangeSelect => 0,
+    };
+    let height = 7u16 + bundle_rows + if bundle_rows > 0 { 2 } else { 0 };
+    let height = height.min(body.height.saturating_sub(2));
     let x = body.x + body.width.saturating_sub(width) / 2;
     let y = body.y + body.height.saturating_sub(height) / 3;
     let area = Rect {
@@ -656,7 +1096,7 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
 
     let title = match prompt.kind {
         ModalKind::Bundle => format!(
-            " Bundle name · {} draft{} ",
+            " Bundle · {} draft{} ",
             prompt.targets.len(),
             plural(prompt.targets.len())
         ),
@@ -669,21 +1109,35 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let inner = inner.inner(ratatui::layout::Margin {
+        vertical: 0,
+        horizontal: 1,
+    });
+
+    // Layout: hint + input + spacer + (picker rows + spacer when present) + controls
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(1), // hint
+        Constraint::Length(1), // input
+        Constraint::Length(1), // spacer
+    ];
+    if bundle_rows > 0 {
+        constraints.push(Constraint::Length(bundle_rows));
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // controls
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // hint
-            Constraint::Length(1), // input
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // controls
-        ])
-        .split(inner.inner(ratatui::layout::Margin {
-            vertical: 0,
-            horizontal: 1,
-        }));
+        .constraints(constraints)
+        .split(inner);
 
     let hint = match prompt.kind {
-        ModalKind::Bundle => "Name your bundle (e.g. \"auth fix\"):",
+        ModalKind::Bundle => {
+            if prompt.bundle_choices.is_empty() {
+                "Name a new bundle (e.g. \"auth fix\"):"
+            } else {
+                "Type a new name, or ↑/↓ to add to an existing bundle:"
+            }
+        }
         ModalKind::RangeSelect => "Type draft numbers — comma + dash, e.g. 1-5,8,12-15 (or `all`):",
     };
     frame.render_widget(
@@ -691,28 +1145,86 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
         chunks[0],
     );
 
-    // Trailing block cursor instead of terminal cursor positioning so
-    // the modal renders identically under tmux / screen.
+    let input_active = prompt.pick.is_none();
+    let input_chevron_style = if input_active {
+        theme::accent()
+    } else {
+        theme::dim()
+    };
+    let cursor_glyph = if input_active { "▌" } else { " " };
     let cursor_style = Style::default().add_modifier(Modifier::SLOW_BLINK);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("> ", theme::accent()),
+            Span::styled("> ", input_chevron_style),
             Span::styled(prompt.buf.clone(), theme::text()),
-            Span::styled("▌", cursor_style),
+            Span::styled(cursor_glyph, cursor_style),
         ])),
         chunks[1],
     );
+
+    let controls_chunk = if bundle_rows > 0 {
+        let picker_chunk = chunks[3];
+        draw_bundle_picker(frame, picker_chunk, prompt);
+        chunks[5]
+    } else {
+        chunks[3]
+    };
+
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("enter", theme::accent()),
             Span::styled(" confirm   ", theme::dim()),
+            Span::styled("↑/↓", theme::accent()),
+            Span::styled(" pick   ", theme::dim()),
             Span::styled("esc/q", theme::accent()),
             Span::styled(" cancel   ", theme::dim()),
             Span::styled("ctrl-u", theme::accent()),
             Span::styled(" clear", theme::dim()),
         ])),
-        chunks[3],
+        controls_chunk,
     );
+}
+
+fn draw_bundle_picker(frame: &mut ratatui::Frame, area: Rect, prompt: &Modal) {
+    let visible = (area.height as usize).min(prompt.bundle_choices.len());
+    let pick = prompt.pick;
+    // Center the picked row when there are more rows than fit.
+    let offset = match pick {
+        Some(p) if visible > 0 && prompt.bundle_choices.len() > visible => {
+            let max = prompt.bundle_choices.len() - visible;
+            p.saturating_sub(visible / 2).min(max)
+        }
+        _ => 0,
+    };
+
+    let name_max = (area.width as usize).saturating_sub(8).max(8);
+    let lines: Vec<Line<'_>> = prompt
+        .bundle_choices
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(i, c)| {
+            let is_picked = pick == Some(i);
+            let marker = if is_picked { "▸ " } else { "  " };
+            let count = format!("({})", c.count);
+            let name_style = if is_picked {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme::text()
+            };
+            Line::from(vec![
+                Span::styled(marker, theme::accent()),
+                Span::styled(truncate_for_display(&c.name, name_max), name_style),
+                Span::raw("  "),
+                Span::styled(count, theme::dim()),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
@@ -1005,6 +1517,34 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         );
         return;
     }
+    let hints = if state.mode == BrowseMode::Bundles {
+        bundles_view_hints()
+    } else {
+        drafts_view_hints(state)
+    };
+    frame.render_widget(Paragraph::new(Line::from(hints)), area);
+}
+
+fn drafts_view_hints(state: &ShowState) -> Vec<Span<'static>> {
+    // When the user has marked drafts, surface the bundle action in
+    // success-green so the next step is impossible to miss.
+    let (b_key_style, b_label_style) = if state.selected.is_empty() {
+        (theme::accent(), theme::dim())
+    } else {
+        (
+            Style::default()
+                .fg(theme::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let bundle_label: String = if state.selected.is_empty() {
+        " bundle  ".into()
+    } else {
+        format!(" bundle ({})  ", state.selected.len())
+    };
     let mut hints = vec![
         Span::styled("j/k", theme::accent()),
         Span::styled(" move  ", theme::dim()),
@@ -1016,12 +1556,12 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         Span::styled(" 1-5,8  ", theme::dim()),
         Span::styled("a", theme::accent()),
         Span::styled(" all  ", theme::dim()),
-        Span::styled("b", theme::accent()),
-        Span::styled(" bundle  ", theme::dim()),
+        Span::styled("b", b_key_style),
+        Span::styled(bundle_label, b_label_style),
+        Span::styled("tab", theme::accent()),
+        Span::styled(" bundles  ", theme::dim()),
         Span::styled("d", theme::accent()),
         Span::styled(" delete  ", theme::dim()),
-        Span::styled("?", theme::accent()),
-        Span::styled(" help  ", theme::dim()),
         Span::styled("q", theme::accent()),
         Span::styled(" quit", theme::dim()),
     ];
@@ -1032,7 +1572,22 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             theme::pending(),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(hints)), area);
+    hints
+}
+
+fn bundles_view_hints() -> Vec<Span<'static>> {
+    vec![
+        Span::styled("tab", theme::accent()),
+        Span::styled(" back to drafts  ", theme::dim()),
+        Span::styled("j/k", theme::accent()),
+        Span::styled(" move  ", theme::dim()),
+        Span::styled("p", theme::accent()),
+        Span::styled(" push all  ", theme::dim()),
+        Span::styled("d", theme::accent()),
+        Span::styled(" delete focused  ", theme::dim()),
+        Span::styled("q", theme::accent()),
+        Span::styled(" quit", theme::dim()),
+    ]
 }
 
 fn short_path(p: &str) -> String {
