@@ -91,11 +91,30 @@ pub fn run(mode: OutputMode, args: BundleArgs) -> ExitCode {
     run_bundle_overview(args.repo.as_deref())
 }
 
-/// Open the show-style draft browser as the no-args bundle entrypoint.
-/// Loads the same draft set `run_bundle_overview` would have printed,
-/// then hands it to the show TUI which renders the list / detail /
-/// changed-files panes and supports keyboard inspection + delete.
 fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
+    browse_drafts(repo_filter, show_all, None, "bundle")
+}
+
+/// Shared draft browser used by both `pcr bundle` (no args) and
+/// `pcr show [n]`. The two commands are intentionally the same
+/// experience — `pcr show <n>` is just `pcr bundle` opened to a
+/// specific draft. Keeping a single implementation means selection,
+/// bundling, the post-bundle push shortcut, the recency cap, and the
+/// `--all` widening behave identically no matter how the user got here.
+///
+/// `focus_number` is 1-based against the *full* draft list (matching
+/// `pcr log` numbering). When the requested draft falls inside the
+/// hidden tail of the recency cap, we expand to the full list so the
+/// user always lands on the draft they asked for.
+///
+/// `caller` is just the prefix used in error messages so the user sees
+/// the command they actually typed in any failure output.
+pub fn browse_drafts(
+    repo_filter: Option<&str>,
+    show_all: bool,
+    focus_number: Option<usize>,
+    caller: &str,
+) -> ExitCode {
     sync_latest_prompts();
     let ctx = resolve();
     let proj_by_id = load_proj_by_id();
@@ -103,7 +122,7 @@ fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
     let drafts = match get_available_drafts(&ctx, repo_filter, &proj_by_id) {
         Ok(v) => v,
         Err(e) => {
-            display::print_error("bundle", &e.to_string());
+            display::print_error(caller, &e.to_string());
             return ExitCode::GenericError;
         }
     };
@@ -111,11 +130,30 @@ fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
         display::eprintln("PCR: No draft prompts. Run `pcr start` to capture some.");
         return ExitCode::Success;
     }
-    // Cap to the most recent N unless `--all` was passed. Heavy users
+    let total = drafts.len();
+    if let Some(n) = focus_number {
+        if n == 0 || n > total {
+            display::print_error(
+                caller,
+                &format!(
+                    "draft #{n} doesn't exist — you have {total} draft{} (1–{total})",
+                    plural(total)
+                ),
+            );
+            return ExitCode::NotFound;
+        }
+    }
+
+    // Cap to the most recent N unless `--all` was passed *or* the
+    // requested focus would land in the hidden tail. Heavy users
     // accumulate hundreds of drafts and the list otherwise becomes
     // unscannable; the older tail stays reachable via `--all` and via
     // `pcr gc --drafts-older-than` for permanent cleanup.
-    let (display_drafts, hidden) = if show_all {
+    let want_all = show_all
+        || focus_number
+            .map(|n| n + crate::commands::helpers::DEFAULT_RECENT_DRAFTS_CAP <= total)
+            .unwrap_or(false);
+    let (display_drafts, hidden) = if want_all {
         (drafts, 0)
     } else {
         crate::commands::helpers::cap_recent_drafts(
@@ -123,18 +161,24 @@ fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
             crate::commands::helpers::DEFAULT_RECENT_DRAFTS_CAP,
         )
     };
-    // Open focused on the newest draft. The list is sorted captured_at
-    // ASC, so the last index is the most recently captured prompt —
-    // almost always what the user wants to see when they open `pcr
-    // bundle` to triage their pending work.
+
+    // Default focus = newest draft (last index, since the list is sorted
+    // captured_at ASC). With an explicit number we re-anchor it against
+    // the kept slice — the cap is a window, not a deletion, so #N still
+    // means "the Nth draft overall".
     let last = display_drafts.len() - 1;
-    match crate::tui::screens::show::run_focused_with_hidden(display_drafts, last, hidden) {
+    let focus = match focus_number {
+        Some(n) => n.saturating_sub(1).saturating_sub(hidden).min(last),
+        None => last,
+    };
+
+    match crate::tui::screens::show::run_focused_with_hidden(display_drafts, focus, hidden) {
         Ok(crate::tui::screens::show::ShowOutcome::PushAfterExit) => {
             crate::commands::push::run(crate::agent::OutputMode::Auto)
         }
         Ok(_) => ExitCode::Success,
         Err(e) => {
-            display::print_error("bundle", &e.to_string());
+            display::print_error(caller, &e.to_string());
             ExitCode::GenericError
         }
     }

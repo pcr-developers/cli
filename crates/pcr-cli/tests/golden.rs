@@ -125,7 +125,7 @@ fn show_with_bad_number_exits_usage() {
         .arg("not-a-number")
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("invalid number"));
+        .stderr(predicate::str::contains("invalid draft number"));
 }
 
 #[test]

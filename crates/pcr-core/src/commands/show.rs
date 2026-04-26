@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use crate::agent::{self, OutputMode};
-use crate::commands::helpers::{cap_recent_drafts, DEFAULT_RECENT_DRAFTS_CAP};
 use crate::commands::project_context::{load_proj_by_id, resolve};
 use crate::display::{self, Color};
 use crate::entry::ShowArgs;
@@ -53,13 +52,42 @@ fn filter_with_changed_files(drafts: Vec<DraftRecord>) -> Vec<DraftRecord> {
 }
 
 pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
-    let n: usize = match args.number.trim().parse() {
-        Ok(n) if n >= 1 => n,
-        _ => {
-            display::print_error("show", &format!("invalid number {:?}", args.number));
-            display::print_hint("draft numbers come from `pcr log` or `pcr bundle`");
-            return ExitCode::Usage;
-        }
+    // Parse the optional draft number. Empty / missing means "open at
+    // the newest draft" — same as `pcr bundle` with no args.
+    let parsed_n: Option<usize> = match args.number.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => {
+                display::print_error("show", &format!("invalid draft number {s:?}"));
+                display::print_hint("draft numbers come from `pcr log` or `pcr bundle`");
+                return ExitCode::Usage;
+            }
+        },
+    };
+
+    // TUI / pretty mode: `pcr show` and `pcr bundle` are the same
+    // experience. Delegate to the shared browser. Without a number we
+    // open at the newest draft (= `pcr bundle` no-args). With a number
+    // we focus on that draft, expanding past the recency cap if needed.
+    if agent::is_tui_eligible(mode) {
+        return crate::commands::bundle::browse_drafts(
+            args.repo.as_deref(),
+            args.all,
+            parsed_n,
+            "show",
+        );
+    }
+
+    // Plain / JSON paths below want a specific draft. Without a number
+    // there's no single record to print, so point the user at `pcr log`
+    // (the canonical scriptable list) and at the TUI.
+    let Some(n) = parsed_n else {
+        display::print_error("show", "draft number required in plain / JSON mode");
+        display::print_hint(
+            "use `pcr log` to list drafts in plain mode, or drop --plain to browse them",
+        );
+        return ExitCode::Usage;
     };
 
     let ctx = resolve();
@@ -93,39 +121,6 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
     if matches!(mode, OutputMode::Json) {
         println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default());
         return ExitCode::Success;
-    }
-
-    if agent::is_tui_eligible(mode) {
-        // Cap the visible list to the most recent N drafts unless the
-        // user explicitly asked for the full history with `--all`. The
-        // requested `n` is 1-based against the *full* list; if it falls
-        // inside the hidden tail we expand to show everything so the
-        // requested draft is reachable. This avoids the "I asked for
-        // #200 but the list only has 100 items" confusion.
-        let total = all.len();
-        let (display_drafts, hidden, focus_in_view) = if args.all || n > total {
-            (all, 0, n - 1)
-        } else {
-            let (capped, hidden) = cap_recent_drafts(all, DEFAULT_RECENT_DRAFTS_CAP);
-            // `cap_recent_drafts` keeps the newest tail. The requested
-            // draft index needs to be re-anchored against the kept slice.
-            let focus = if n > hidden { n - 1 - hidden } else { 0 };
-            (capped, hidden, focus)
-        };
-        match crate::tui::screens::show::run_focused_with_hidden(
-            display_drafts,
-            focus_in_view,
-            hidden,
-        ) {
-            Ok(crate::tui::screens::show::ShowOutcome::PushAfterExit) => {
-                return crate::commands::push::run(mode);
-            }
-            Ok(_) => return ExitCode::Success,
-            Err(e) => {
-                display::print_error("show", &e.to_string());
-                return ExitCode::GenericError;
-            }
-        }
     }
 
     let proj_by_id = load_proj_by_id();
