@@ -37,15 +37,28 @@ use crate::util::time::{fmt_time, local_hms};
 use crate::VERSION;
 
 pub fn run(drafts: Vec<DraftRecord>) -> Result<()> {
+    run_focused(drafts, 0)
+}
+
+/// Open the show TUI focused on a specific draft index (0-based). Used by
+/// `pcr show <n>` to land on the requested draft instead of the first one,
+/// and by `pcr bundle` to focus on the most recent draft. Out-of-range
+/// indices are clamped to the last valid row.
+pub fn run_focused(drafts: Vec<DraftRecord>, initial_focus: usize) -> Result<()> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
+    let focus = if drafts.is_empty() {
+        0
+    } else {
+        initial_focus.min(drafts.len() - 1)
+    };
     let mut state = ShowState {
         drafts,
-        focus: 0,
+        focus,
         list_state: ListState::default(),
         copy_flash: None,
     };
-    state.list_state.select(Some(0));
+    state.list_state.select(Some(focus));
 
     loop {
         term.draw(|f| draw(f, &state))?;

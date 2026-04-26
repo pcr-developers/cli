@@ -95,7 +95,9 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
     }
 
     if agent::is_tui_eligible(mode) {
-        if let Err(e) = crate::tui::screens::show::run(all) {
+        // Land on the requested draft, not the first one. `n` is 1-based
+        // from the user; the TUI uses 0-based indexing internally.
+        if let Err(e) = crate::tui::screens::show::run_focused(all, n - 1) {
             display::print_error("show", &e.to_string());
             return ExitCode::GenericError;
         }
