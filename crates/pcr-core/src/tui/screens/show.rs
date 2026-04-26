@@ -41,6 +41,15 @@ pub enum ShowOutcome {
     PushAfterExit,
 }
 
+/// Which top-level view the browser should open in. Callers pick this
+/// based on the command name (`pcr show` → Drafts, `pcr bundle` →
+/// Bundles) so each command lands on the screen its name implies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InitialView {
+    Drafts,
+    Bundles,
+}
+
 pub fn run(drafts: Vec<DraftRecord>) -> Result<ShowOutcome> {
     run_focused(drafts, 0)
 }
@@ -50,12 +59,22 @@ pub fn run_focused(drafts: Vec<DraftRecord>, initial_focus: usize) -> Result<Sho
     run_focused_with_hidden(drafts, initial_focus, 0)
 }
 
-/// Like `run_focused` but advertises `hidden_count` older drafts in the
-/// footer so the user knows the recency cap truncated the list.
+/// Like `run_focused` but advertises `hidden_count` older drafts in
+/// the footer. Defaults to opening on the Drafts view; use
+/// `run_focused_with_view` to pick the initial view.
 pub fn run_focused_with_hidden(
     drafts: Vec<DraftRecord>,
     initial_focus: usize,
     hidden_count: usize,
+) -> Result<ShowOutcome> {
+    run_focused_with_view(drafts, initial_focus, hidden_count, InitialView::Drafts)
+}
+
+pub fn run_focused_with_view(
+    drafts: Vec<DraftRecord>,
+    initial_focus: usize,
+    hidden_count: usize,
+    initial_view: InitialView,
 ) -> Result<ShowOutcome> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
@@ -63,6 +82,10 @@ pub fn run_focused_with_hidden(
         0
     } else {
         initial_focus.min(drafts.len() - 1)
+    };
+    let mode = match initial_view {
+        InitialView::Drafts => BrowseMode::Drafts,
+        InitialView::Bundles => BrowseMode::Bundles,
     };
     let mut state = ShowState {
         drafts,
@@ -75,7 +98,7 @@ pub fn run_focused_with_hidden(
         push_armed: false,
         outcome: ShowOutcome::Quit,
         nav_dir: NavDir::Down,
-        mode: BrowseMode::Drafts,
+        mode,
         bundles: load_bundles(),
         bundle_focus: 0,
         bundles_state: ListState::default(),
@@ -202,7 +225,11 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         return handle_bundles_key(k, state);
     }
     match k.code {
-        KeyCode::Char('q') | KeyCode::Esc => return false,
+        KeyCode::Char('q' | 'Q') | KeyCode::Esc => return false,
+        KeyCode::Right | KeyCode::Left => {
+            toggle_mode(state);
+            return true;
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             if !state.drafts.is_empty() {
                 state.focus = (state.focus + 1).min(state.drafts.len() - 1);
@@ -401,7 +428,11 @@ fn toggle_mode(state: &mut ShowState) {
 /// Key dispatch when the user is browsing the bundles view.
 fn handle_bundles_key(k: KeyEvent, state: &mut ShowState) -> bool {
     match k.code {
-        KeyCode::Char('q') | KeyCode::Esc => return false,
+        KeyCode::Char('q' | 'Q') | KeyCode::Esc => return false,
+        KeyCode::Right | KeyCode::Left => {
+            toggle_mode(state);
+            return true;
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             if !state.bundles.is_empty() {
                 state.bundle_focus = (state.bundle_focus + 1).min(state.bundles.len() - 1);
@@ -746,18 +777,30 @@ fn advance_focus(state: &mut ShowState) {
 
 /// Snapshot of every unpushed bundle for the bundles view + the
 /// picker modal. Loaded at TUI open and refreshed after any local
-/// mutation (create, add, delete).
+/// mutation (create, add, delete). Items are eagerly resolved so
+/// counts and the detail pane have something to show — `get_unpushed_
+/// commits` alone returns commits with empty `items`.
 fn load_bundles() -> Vec<PromptCommit> {
-    let mut all: Vec<PromptCommit> = store::get_unpushed_commits().unwrap_or_default();
+    let stubs: Vec<PromptCommit> = store::get_unpushed_commits().unwrap_or_default();
+    let mut all: Vec<PromptCommit> = stubs
+        .into_iter()
+        .map(|stub| {
+            store::get_commit_with_items(&stub.id)
+                .ok()
+                .flatten()
+                .unwrap_or(stub)
+        })
+        .collect();
     // Newest first reads better in a folder-like list.
     all.sort_by(|a, b| b.committed_at.cmp(&a.committed_at));
     all
 }
 
 fn bundle_choices_from(bundles: &[PromptCommit]) -> Vec<BundleChoice> {
+    // Every unpushed bundle is a valid add target — the store's
+    // `add_drafts_to_bundle` re-opens sealed bundles automatically.
     bundles
         .iter()
-        .filter(|b| b.bundle_status == "open")
         .map(|b| BundleChoice {
             id: b.id.clone(),
             name: b.message.clone(),
@@ -933,14 +976,22 @@ fn draw_bundles_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) 
             Line::from(""),
             Line::from(Span::styled("  No bundles yet.", theme::pending())),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Press Tab to go back to drafts,",
-                theme::dim(),
-            )),
-            Line::from(Span::styled(
-                "  select some, and `b` to bundle.",
-                theme::dim(),
-            )),
+            Line::from(vec![
+                Span::styled("  Press ", theme::dim()),
+                Span::styled("Tab", theme::accent()),
+                Span::styled(" or ", theme::dim()),
+                Span::styled("→", theme::accent()),
+                Span::styled(" to switch to drafts,", theme::dim()),
+            ]),
+            Line::from(vec![
+                Span::styled("  select with ", theme::dim()),
+                Span::styled("enter", theme::accent()),
+                Span::styled(" / ", theme::dim()),
+                Span::styled("space", theme::accent()),
+                Span::styled(", then ", theme::dim()),
+                Span::styled("b", theme::accent()),
+                Span::styled(" to bundle.", theme::dim()),
+            ]),
         ];
         frame.render_widget(Paragraph::new(lines), inner);
         return;
@@ -1550,15 +1601,13 @@ fn drafts_view_hints(state: &ShowState) -> Vec<Span<'static>> {
         Span::styled(" move  ", theme::dim()),
         Span::styled("enter", theme::accent()),
         Span::styled(" select  ", theme::dim()),
-        Span::styled("J/K", theme::accent()),
-        Span::styled(" range  ", theme::dim()),
         Span::styled(":", theme::accent()),
         Span::styled(" 1-5,8  ", theme::dim()),
         Span::styled("a", theme::accent()),
         Span::styled(" all  ", theme::dim()),
         Span::styled("b", b_key_style),
         Span::styled(bundle_label, b_label_style),
-        Span::styled("tab", theme::accent()),
+        Span::styled("tab/←/→", theme::accent()),
         Span::styled(" bundles  ", theme::dim()),
         Span::styled("d", theme::accent()),
         Span::styled(" delete  ", theme::dim()),
@@ -1577,14 +1626,14 @@ fn drafts_view_hints(state: &ShowState) -> Vec<Span<'static>> {
 
 fn bundles_view_hints() -> Vec<Span<'static>> {
     vec![
-        Span::styled("tab", theme::accent()),
-        Span::styled(" back to drafts  ", theme::dim()),
+        Span::styled("tab/←/→", theme::accent()),
+        Span::styled(" drafts  ", theme::dim()),
         Span::styled("j/k", theme::accent()),
         Span::styled(" move  ", theme::dim()),
         Span::styled("p", theme::accent()),
         Span::styled(" push all  ", theme::dim()),
         Span::styled("d", theme::accent()),
-        Span::styled(" delete focused  ", theme::dim()),
+        Span::styled(" delete  ", theme::dim()),
         Span::styled("q", theme::accent()),
         Span::styled(" quit", theme::dim()),
     ]

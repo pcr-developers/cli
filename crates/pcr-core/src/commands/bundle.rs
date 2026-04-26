@@ -92,7 +92,16 @@ pub fn run(mode: OutputMode, args: BundleArgs) -> ExitCode {
 }
 
 fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
-    browse_drafts(repo_filter, show_all, None, "bundle")
+    // `pcr bundle` opens on the Bundles view by default — the command
+    // name implies bundle-level work, not draft scrolling. Use Tab /
+    // arrow keys to switch to drafts.
+    browse_drafts_with_view(
+        repo_filter,
+        show_all,
+        None,
+        "bundle",
+        crate::tui::screens::show::InitialView::Bundles,
+    )
 }
 
 /// Shared TUI entrypoint for `pcr show [n]` and `pcr bundle` (no args).
@@ -107,6 +116,22 @@ pub fn browse_drafts(
     focus_number: Option<usize>,
     caller: &str,
 ) -> ExitCode {
+    browse_drafts_with_view(
+        repo_filter,
+        show_all,
+        focus_number,
+        caller,
+        crate::tui::screens::show::InitialView::Drafts,
+    )
+}
+
+pub fn browse_drafts_with_view(
+    repo_filter: Option<&str>,
+    show_all: bool,
+    focus_number: Option<usize>,
+    caller: &str,
+    initial_view: crate::tui::screens::show::InitialView,
+) -> ExitCode {
     sync_latest_prompts();
     let ctx = resolve();
     let proj_by_id = load_proj_by_id();
@@ -118,7 +143,9 @@ pub fn browse_drafts(
             return ExitCode::GenericError;
         }
     };
-    if drafts.is_empty() {
+    // No drafts is OK when we're opening on the Bundles view — the
+    // user might just want to manage existing bundles.
+    if drafts.is_empty() && initial_view == crate::tui::screens::show::InitialView::Drafts {
         display::eprintln("PCR: No draft prompts. Run `pcr start` to capture some.");
         return ExitCode::Success;
     }
@@ -153,13 +180,22 @@ pub fn browse_drafts(
 
     // Default focus = newest (the list is captured_at ASC). An explicit
     // number is re-anchored against the kept slice.
-    let last = display_drafts.len() - 1;
-    let focus = match focus_number {
-        Some(n) => n.saturating_sub(1).saturating_sub(hidden).min(last),
-        None => last,
+    let focus = if display_drafts.is_empty() {
+        0
+    } else {
+        let last = display_drafts.len() - 1;
+        match focus_number {
+            Some(n) => n.saturating_sub(1).saturating_sub(hidden).min(last),
+            None => last,
+        }
     };
 
-    match crate::tui::screens::show::run_focused_with_hidden(display_drafts, focus, hidden) {
+    match crate::tui::screens::show::run_focused_with_view(
+        display_drafts,
+        focus,
+        hidden,
+        initial_view,
+    ) {
         Ok(crate::tui::screens::show::ShowOutcome::PushAfterExit) => {
             crate::commands::push::run(crate::agent::OutputMode::Auto)
         }
