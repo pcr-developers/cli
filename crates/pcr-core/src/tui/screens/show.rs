@@ -617,25 +617,29 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
-    // Each row is `M ▸ NNN  REPO  preview` with a budget that adapts
-    // to column width. The repo column is more useful at-a-glance than
-    // the source label was — across multi-repo work it's the strongest
-    // signal for what a draft is *about*. If a row has no project
-    // attribution, we leave the repo slot blank rather than print "—",
-    // since the column is already narrow and a placeholder steals
-    // preview width without saying anything.
+    // Each row is `M ▸ NNN  REPO  preview`. The repo column adapts to
+    // the actual longest project name in view (capped at REPO_MAX) and
+    // collapses to zero width when no row has a repo. The previous
+    // fixed 8-char column wasted 6+ columns whenever the visible slice
+    // happened to be short-named (or empty-named) — the user reads the
+    // gap as "this UI is loose" not "we're reserving space".
     //
     // Width budget:
     //   mark(1) + space(1) + pointer(1) + space(1) + index(3) + space(1) = 8
-    //   repo column = REPO_WIDTH (8) when any draft in view has a repo
-    //                 name, else 0 to give the preview the full column
-    //   space(1) between repo and preview if repo is shown
+    //   repo column = min(longest_project_name_in_view, REPO_MAX)
+    //                 + 1 separator, or 0 if no row has a repo
     const FIXED_PREFIX: usize = 8;
-    const REPO_WIDTH: usize = 8;
+    const REPO_MAX: usize = 12;
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
-    let any_repo = state.drafts.iter().any(|d| !d.project_name.is_empty());
-    let repo_block = if any_repo { REPO_WIDTH + 1 } else { 0 };
+    let repo_width = state
+        .drafts
+        .iter()
+        .map(|d| d.project_name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(REPO_MAX);
+    let repo_block = if repo_width > 0 { repo_width + 1 } else { 0 };
     let preview_max = inner_width
         .saturating_sub(FIXED_PREFIX + repo_block)
         .max(MIN_PREVIEW_WIDTH);
@@ -679,10 +683,10 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
                 Span::styled(format!("{:>3}", i + 1), idx_style),
                 Span::raw(" "),
             ];
-            if any_repo {
-                let repo = truncate_for_column(&d.project_name, REPO_WIDTH);
+            if repo_width > 0 {
+                let repo = truncate_for_column(&d.project_name, repo_width);
                 spans.push(Span::styled(
-                    format!("{:<width$}", repo, width = REPO_WIDTH),
+                    format!("{:<width$}", repo, width = repo_width),
                     repo_style,
                 ));
                 spans.push(Span::raw(" "));
