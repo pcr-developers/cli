@@ -150,7 +150,14 @@ pub fn browse_drafts_with_view(
     caller: &str,
     initial_view: crate::tui::screens::show::InitialView,
 ) -> ExitCode {
-    browse_drafts_full(repo_filter, show_all, focus_number, caller, initial_view, None)
+    browse_drafts_full(
+        repo_filter,
+        show_all,
+        focus_number,
+        caller,
+        initial_view,
+        None,
+    )
 }
 
 pub fn browse_drafts_full(
