@@ -4,15 +4,16 @@
 //!
 //! ```text
 //! ┌─ HEADER ────────────────────────────────────────────────────────────┐
-//! │ DRAFTS ▼              │ PROMPT                      │ CHANGED FILES │
-//! │ ✓ 1 ▸ pcr-dev  fix t  │ "fix the bug in render"     │ src/page.tsx  │
-//! │   2   cli      add r  │                             │ src/main.rs   │
-//! │ ✓ 3   docs     wire   │ RESPONSE                    │               │
-//! │                       │ Done — applied 2 edits.     │ TOOL CALLS    │
-//! │                       │                             │ Write × 2     │
-//! │                       │ METADATA                    │ Read  × 5     │
-//! │                       │ branch · main               │               │
-//! │                       │ source · cursor             │               │
+//! │ DRAFTS ▼            │ PROMPT                        │ CHANGED FILES │
+//! │ ✓▸  1 fix the bug   │ "fix the bug in render"       │ src/page.tsx  │
+//! │    2 add reset link │                               │ src/main.rs   │
+//! │ ✓  3 wire up redux  │ RESPONSE                      │               │
+//! │                     │ Done — applied 2 edits.       │ TOOL CALLS    │
+//! │                     │                               │ Write × 2     │
+//! │                     │ METADATA                      │ Read  × 5     │
+//! │                     │ source · cursor               │               │
+//! │                     │ branch · main                 │               │
+//! │                     │ project · pcr-dev             │               │
 //! └─────────────────────────────────────────────────────────────────────┘
 //!  j/k move · enter/space select · a all · b bundle · d delete · q quit
 //! ```
@@ -734,31 +735,21 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
-    // Each row is `M ▸ NNN  REPO  preview`. The repo column adapts to
-    // the actual longest project name in view (capped at REPO_MAX) and
-    // collapses to zero width when no row has a repo. The previous
-    // fixed 8-char column wasted 6+ columns whenever the visible slice
-    // happened to be short-named (or empty-named) — the user reads the
-    // gap as "this UI is loose" not "we're reserving space".
+    // Each row is `M▸NNN preview`. Tightest layout we can give while
+    // keeping the four pieces visually distinguishable. The repo used
+    // to live inline between the index and the preview, but the user
+    // hated the dead column that introduced for rows whose own repo
+    // was empty — repo is already shown in the detail pane and isn't
+    // worth a permanent column tax in the list.
     //
     // Width budget:
-    //   mark(1) + space(1) + pointer(1) + space(1) + index(3) + space(1) = 8
-    //   repo column = min(longest_project_name_in_view, REPO_MAX)
-    //                 + 1 separator, or 0 if no row has a repo
-    const FIXED_PREFIX: usize = 8;
-    const REPO_MAX: usize = 12;
+    //   mark(1) + pointer(1) + index(3) + space(1) = 6
+    //   preview = inner_width - 6
+    const FIXED_PREFIX: usize = 6;
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
-    let repo_width = state
-        .drafts
-        .iter()
-        .map(|d| d.project_name.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(REPO_MAX);
-    let repo_block = if repo_width > 0 { repo_width + 1 } else { 0 };
     let preview_max = inner_width
-        .saturating_sub(FIXED_PREFIX + repo_block)
+        .saturating_sub(FIXED_PREFIX)
         .max(MIN_PREVIEW_WIDTH);
 
     let items: Vec<ListItem<'_>> = state
@@ -774,42 +765,25 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             let is_selected = state.selected.contains(&d.id);
             let mark = if is_selected { "✓" } else { " " };
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
-            // Selected rows render the *whole row* in bold white so the
-            // selection state is obvious at scanning distance — the user
-            // shouldn't have to hunt for tiny ✓ marks to see what `b` is
-            // about to bundle. Unselected rows keep the normal hierarchy
-            // (chrome index, soft repo, light preview).
-            let (mark_style, idx_style, repo_style, preview_style) = if is_selected {
+            // Selected rows render the index + preview in bold white so
+            // the selection state is obvious at scanning distance — the
+            // user shouldn't have to hunt for tiny ✓ marks to see what
+            // `b` is about to bundle.
+            let (mark_style, idx_style, preview_style) = if is_selected {
                 let bold_white = Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD);
-                (theme::success(), bold_white, bold_white, bold_white)
+                (theme::success(), bold_white, bold_white)
             } else {
-                (
-                    theme::dim(),
-                    theme::chrome(),
-                    theme::pending(),
-                    theme::text(),
-                )
+                (theme::dim(), theme::chrome(), theme::text())
             };
-            let mut spans = vec![
+            ListItem::new(Line::from(vec![
                 Span::styled(mark, mark_style),
-                Span::raw(" "),
                 Span::styled(pointer, theme::accent()),
-                Span::raw(" "),
                 Span::styled(format!("{:>3}", i + 1), idx_style),
                 Span::raw(" "),
-            ];
-            if repo_width > 0 {
-                let repo = truncate_for_column(&d.project_name, repo_width);
-                spans.push(Span::styled(
-                    format!("{:<width$}", repo, width = repo_width),
-                    repo_style,
-                ));
-                spans.push(Span::raw(" "));
-            }
-            spans.push(Span::styled(preview, preview_style));
-            ListItem::new(Line::from(spans))
+                Span::styled(preview, preview_style),
+            ]))
         })
         .collect();
 
@@ -846,26 +820,6 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         .title(Line::from(Span::styled(title, theme::dim())));
     let widget = List::new(items).block(block);
     frame.render_stateful_widget(widget, area, &mut ls);
-}
-
-/// Truncate `s` to fit in `width` display columns, appending `…` when
-/// it has to drop characters. Approximates display width by `chars()`
-/// — fine for ASCII project names and adequate for the BMP characters
-/// that show up in real-world repo slugs. The list is monospaced so
-/// any cell that's too narrow just gets a trailing `…`, never wrapped.
-fn truncate_for_column(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let count = s.chars().count();
-    if count <= width {
-        return s.to_string();
-    }
-    if width == 1 {
-        return "…".into();
-    }
-    let head: String = s.chars().take(width - 1).collect();
-    format!("{head}…")
 }
 
 fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
