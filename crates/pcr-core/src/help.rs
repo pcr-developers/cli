@@ -118,10 +118,11 @@ pub const HELP: &[HelpEntry] = &[
         purpose: "Inspect one draft's full prompt, response, tool calls, changed files, and metadata.",
         when_to_use: "When `pcr log` shows something interesting and you want the full text. Numbers come from `pcr log` / `pcr bundle`.",
         examples: &[
-            ("pcr show 3", "open draft #3"),
+            ("pcr show 3", "open draft #3 in the browser (most recent 100 visible)"),
+            ("pcr show 3 --all", "open draft #3 with no recency cap"),
             ("pcr --plain show 3", "print to stderr instead of the TUI"),
         ],
-        see_also: &["log", "bundle"],
+        see_also: &["log", "bundle", "gc"],
         runnable: Runnable::NeedsArgs,
     },
     HelpEntry {
@@ -130,7 +131,8 @@ pub const HELP: &[HelpEntry] = &[
         purpose: "Bundles are the unit of review on PCR.dev. You select N drafts, give them a name, and `pcr push` ships them.",
         when_to_use: "After a coherent block of work — a feature, a fix, an experiment. Bundles can be edited (add/remove drafts) until you push them.",
         examples: &[
-            ("pcr bundle", "show drafts + bundle overview"),
+            ("pcr bundle", "browse the most recent 100 drafts in the TUI"),
+            ("pcr bundle --all", "browse every draft, not just the most recent"),
             ("pcr bundle \"auth fix\" --select 1-5", "create a sealed bundle from drafts 1 through 5"),
             ("pcr bundle \"auth fix\" --select all", "bundle every draft in the current repo"),
             ("pcr bundle \"auth fix\" --add --select 6,7", "add drafts 6 and 7 to an existing bundle"),

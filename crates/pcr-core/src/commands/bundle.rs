@@ -86,7 +86,7 @@ pub fn run(mode: OutputMode, args: BundleArgs) -> ExitCode {
     // diff, and supports `d` to delete stale ones inline. Plain mode
     // keeps the historical line dump for scripts and agents.
     if agent::is_tui_eligible(mode) {
-        return run_bundle_browse(args.repo.as_deref());
+        return run_bundle_browse(args.repo.as_deref(), args.all);
     }
     run_bundle_overview(args.repo.as_deref())
 }
@@ -95,7 +95,7 @@ pub fn run(mode: OutputMode, args: BundleArgs) -> ExitCode {
 /// Loads the same draft set `run_bundle_overview` would have printed,
 /// then hands it to the show TUI which renders the list / detail /
 /// changed-files panes and supports keyboard inspection + delete.
-fn run_bundle_browse(repo_filter: Option<&str>) -> ExitCode {
+fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
     sync_latest_prompts();
     let ctx = resolve();
     let proj_by_id = load_proj_by_id();
@@ -111,12 +111,25 @@ fn run_bundle_browse(repo_filter: Option<&str>) -> ExitCode {
         display::eprintln("PCR: No draft prompts. Run `pcr start` to capture some.");
         return ExitCode::Success;
     }
+    // Cap to the most recent N unless `--all` was passed. Heavy users
+    // accumulate hundreds of drafts and the list otherwise becomes
+    // unscannable; the older tail stays reachable via `--all` and via
+    // `pcr gc --drafts-older-than` for permanent cleanup.
+    let (display_drafts, hidden) = if show_all {
+        (drafts, 0)
+    } else {
+        crate::commands::helpers::cap_recent_drafts(
+            drafts,
+            crate::commands::helpers::DEFAULT_RECENT_DRAFTS_CAP,
+        )
+    };
     // Open focused on the newest draft. The list is sorted captured_at
     // ASC, so the last index is the most recently captured prompt —
     // almost always what the user wants to see when they open `pcr
     // bundle` to triage their pending work.
-    let last = drafts.len() - 1;
-    if let Err(e) = crate::tui::screens::show::run_focused(drafts, last) {
+    let last = display_drafts.len() - 1;
+    if let Err(e) = crate::tui::screens::show::run_focused_with_hidden(display_drafts, last, hidden)
+    {
         display::print_error("bundle", &e.to_string());
         return ExitCode::GenericError;
     }

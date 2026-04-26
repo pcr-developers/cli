@@ -4,9 +4,9 @@
 //!
 //! ```text
 //! ┌─ HEADER ────────────────────────────────────────────────────────────┐
-//! │ DRAFTS ▼      │ PROMPT                              │ CHANGED FILES │
-//! │  1 ▸ pcr-dev  │ "fix the bug in render"             │ src/page.tsx  │
-//! │  2   cli      │                                     │ src/main.rs   │
+//! │ DRAFTS ▼          │ PROMPT                          │ CHANGED FILES │
+//! │  1 cur ▸ pcr-dev  │ "fix the bug in render"         │ src/page.tsx  │
+//! │  2 cld   cli      │                                 │ src/main.rs   │
 //! │  3   func     │ RESPONSE                            │               │
 //! │              │ Done — applied 2 edits.             │ TOOL CALLS    │
 //! │              │                                     │ Write × 2     │
@@ -45,6 +45,18 @@ pub fn run(drafts: Vec<DraftRecord>) -> Result<()> {
 /// and by `pcr bundle` to focus on the most recent draft. Out-of-range
 /// indices are clamped to the last valid row.
 pub fn run_focused(drafts: Vec<DraftRecord>, initial_focus: usize) -> Result<()> {
+    run_focused_with_hidden(drafts, initial_focus, 0)
+}
+
+/// Same as `run_focused`, but lets the caller report how many drafts
+/// were filtered out before opening the TUI. Used by the recency cap
+/// in `pcr show` / `pcr bundle` so the footer can hint that the list
+/// is truncated and how to see everything.
+pub fn run_focused_with_hidden(
+    drafts: Vec<DraftRecord>,
+    initial_focus: usize,
+    hidden_count: usize,
+) -> Result<()> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
     let focus = if drafts.is_empty() {
@@ -57,6 +69,7 @@ pub fn run_focused(drafts: Vec<DraftRecord>, initial_focus: usize) -> Result<()>
         focus,
         list_state: ListState::default(),
         copy_flash: None,
+        hidden_count,
     };
     state.list_state.select(Some(focus));
 
@@ -93,6 +106,10 @@ struct ShowState {
     list_state: ListState,
     /// (message, ticks_remaining) — flash banner that confirms keyboard actions.
     copy_flash: Option<(String, u32)>,
+    /// Drafts filtered out *before* the TUI opened (e.g. by the recency
+    /// cap in `pcr show` / `pcr bundle`). Surfaced in the footer so the
+    /// user knows the list isn't the complete history and how to widen it.
+    hidden_count: usize,
 }
 
 fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
@@ -173,8 +190,9 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "j/k move · g/G top/bottom · c copy · b bundle hint · d delete · q quit".into(),
-                8,
+                "labels: cur=cursor · cld=claude-code · vsc=vscode  ·  keys: j/k move · g/G top/bottom · c copy · d delete · b bundle · q quit"
+                    .into(),
+                10,
             ));
         }
         _ => {}
@@ -241,12 +259,12 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             theme::dim(),
         )));
 
-    // Each row is `▸ NNN G preview` with a fixed prefix width:
-    //   pointer(1) + space(1) + index(3) + space(1) + glyph(1) + space(1) = 8
+    // Each row is `▸ NNN LBL preview` with a fixed prefix width:
+    //   pointer(1) + space(1) + index(3) + space(1) + label(3) + space(1) = 10
     // Clamp the preview text to whatever's left of the inner column width so
     // long prompts don't soft-wrap onto the next ListItem and visually
     // contaminate adjacent rows.
-    const PREFIX_WIDTH: usize = 8;
+    const PREFIX_WIDTH: usize = 10;
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
     let preview_max = inner_width
@@ -264,13 +282,13 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
                 " "
             };
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
-            let (g, gs) = source_glyph(&d.source);
+            let (label, label_style) = source_label(&d.source);
             ListItem::new(Line::from(vec![
                 Span::styled(pointer, theme::accent()),
                 Span::raw(" "),
                 Span::styled(format!("{:>3}", i + 1), theme::chrome()),
                 Span::raw(" "),
-                Span::styled(g, gs),
+                Span::styled(format!("{label:<3}"), label_style),
                 Span::raw(" "),
                 Span::styled(preview, theme::text()),
             ]))
@@ -282,11 +300,16 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
     frame.render_stateful_widget(widget, area, &mut ls);
 }
 
-fn source_glyph(source: &str) -> (&'static str, ratatui::style::Style) {
+/// Three-letter source label shown in the drafts list. Single-letter
+/// glyphs (`C` / `K` / `V`) saved a column but were opaque — a new user
+/// staring at the list had no way to know what `C` meant. Three letters
+/// fit `cursor` / `claude` / `vscode` unambiguously and the legend in
+/// the `?` help banner spells them out the first time.
+fn source_label(source: &str) -> (&'static str, ratatui::style::Style) {
     match source {
-        "cursor" => ("C", theme::accent()),
-        "claude-code" => ("K", theme::pending()),
-        "vscode" => ("V", theme::info()),
+        "cursor" => ("cur", theme::accent()),
+        "claude-code" => ("cld", theme::pending()),
+        "vscode" => ("vsc", theme::info()),
         _ => ("?", theme::dim()),
     }
 }
@@ -453,7 +476,17 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
 
     let summary = crate::display::summarize_tools(&d.tool_calls);
     let lines = if summary.is_empty() {
-        vec![Line::from(Span::styled("  (no tools used)", theme::dim()))]
+        // Distinguish "agent ran with no tools" (claude-code, vscode)
+        // from "tool calls aren't captured for this source at all"
+        // (cursor — its bubble store doesn't expose structured tool
+        // events the way the other watchers do). Saying "no tools used"
+        // for a cursor draft was actively misleading: the agent often
+        // *did* use tools, we just don't see them.
+        let msg = match d.source.as_str() {
+            "cursor" => "  (tool calls aren't captured for cursor)",
+            _ => "  (no tools used)",
+        };
+        vec![Line::from(Span::styled(msg, theme::dim()))]
     } else {
         summary
             .split("  ")
@@ -481,7 +514,7 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         );
         return;
     }
-    let hints = vec![
+    let mut hints = vec![
         Span::styled("j/k", theme::accent()),
         Span::styled(" move  ", theme::dim()),
         Span::styled("g/G", theme::accent()),
@@ -491,12 +524,22 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         Span::styled("d", theme::accent()),
         Span::styled(" delete  ", theme::dim()),
         Span::styled("b", theme::accent()),
-        Span::styled(" bundle hint  ", theme::dim()),
+        Span::styled(" bundle  ", theme::dim()),
         Span::styled("?", theme::accent()),
         Span::styled(" help  ", theme::dim()),
         Span::styled("q", theme::accent()),
         Span::styled(" quit", theme::dim()),
     ];
+    // When the recency cap hid older drafts, surface the count + the
+    // exact command to widen the view. Otherwise the user just sees
+    // "Drafts · 100" and assumes that's everything they have.
+    if state.hidden_count > 0 {
+        hints.push(Span::styled("   ", theme::dim()));
+        hints.push(Span::styled(
+            format!("({} older hidden — --all to view)", state.hidden_count),
+            theme::pending(),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(hints)), area);
 }
 

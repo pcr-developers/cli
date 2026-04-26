@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::agent::{self, OutputMode};
+use crate::commands::helpers::{cap_recent_drafts, DEFAULT_RECENT_DRAFTS_CAP};
 use crate::commands::project_context::{load_proj_by_id, resolve};
 use crate::display::{self, Color};
 use crate::entry::ShowArgs;
@@ -95,9 +96,27 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
     }
 
     if agent::is_tui_eligible(mode) {
-        // Land on the requested draft, not the first one. `n` is 1-based
-        // from the user; the TUI uses 0-based indexing internally.
-        if let Err(e) = crate::tui::screens::show::run_focused(all, n - 1) {
+        // Cap the visible list to the most recent N drafts unless the
+        // user explicitly asked for the full history with `--all`. The
+        // requested `n` is 1-based against the *full* list; if it falls
+        // inside the hidden tail we expand to show everything so the
+        // requested draft is reachable. This avoids the "I asked for
+        // #200 but the list only has 100 items" confusion.
+        let total = all.len();
+        let (display_drafts, hidden, focus_in_view) = if args.all || n > total {
+            (all, 0, n - 1)
+        } else {
+            let (capped, hidden) = cap_recent_drafts(all, DEFAULT_RECENT_DRAFTS_CAP);
+            // `cap_recent_drafts` keeps the newest tail. The requested
+            // draft index needs to be re-anchored against the kept slice.
+            let focus = if n > hidden { n - 1 - hidden } else { 0 };
+            (capped, hidden, focus)
+        };
+        if let Err(e) = crate::tui::screens::show::run_focused_with_hidden(
+            display_drafts,
+            focus_in_view,
+            hidden,
+        ) {
             display::print_error("show", &e.to_string());
             return ExitCode::GenericError;
         }
