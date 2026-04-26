@@ -147,10 +147,11 @@ struct ShowState {
     /// row alone is the fallback when this set is empty, so casual
     /// users never need to learn multi-select to ship a single draft.
     selected: HashSet<String>,
-    /// Inline name prompt shown when the user presses `b`. While
-    /// `Some`, all key input goes to the modal (text input, Enter to
-    /// confirm, Esc/q to cancel) instead of list navigation.
-    prompt: Option<NamePrompt>,
+    /// Inline modal — either the bundle name prompt (after `b`) or the
+    /// range-select prompt (after `:`). While `Some`, all key input
+    /// goes to the modal (text input, Enter to confirm, Esc/q to
+    /// cancel) instead of list navigation.
+    prompt: Option<Modal>,
     /// Set by a successful bundle and cleared when the confirmation
     /// flash expires. While true, pressing `p` quits the TUI and
     /// signals the caller to run `pcr push`. Without this gate, `p`
@@ -163,18 +164,30 @@ struct ShowState {
     outcome: ShowOutcome,
 }
 
-/// Modal name input shown over the list when the user is about to
-/// create a bundle. We render an overlay box near the bottom so the
-/// list and detail view stay visible underneath — handy for spelling
-/// the name from what's on screen.
-struct NamePrompt {
+/// Modal text-input shown over the list. Two flavors:
+///
+/// * `Bundle` — typed by the user after `b`. The `targets` are the
+///   draft IDs we'll bundle when the user confirms.
+/// * `RangeSelect` — typed by the user after `:`. On confirm we parse
+///   the buffer as a `pcr bundle --select` expression (`1-5,8,12-15`)
+///   and add those draft IDs to `state.selected` — useful when you
+///   already know exactly which drafts you want and don't feel like
+///   scrolling through them with Space.
+struct Modal {
+    kind: ModalKind,
     /// Current text the user has typed.
     buf: String,
-    /// Snapshot of the draft IDs that will go into the bundle when the
-    /// user confirms. Captured at prompt-open time so subsequent `j/k`
-    /// (which we still allow during the prompt? — no, we don't) can't
-    /// shift the target set behind the prompt's back.
+    /// Snapshot of the draft IDs the bundle modal will operate on.
+    /// Captured at open time so navigation behind the modal can't
+    /// shift the target set out from under the user. Empty for
+    /// `RangeSelect` since that mode reads `state.drafts` at confirm.
     targets: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModalKind {
+    Bundle,
+    RangeSelect,
 }
 
 fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
@@ -285,11 +298,56 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     4,
                 ));
             } else {
-                state.prompt = Some(NamePrompt {
+                state.prompt = Some(Modal {
+                    kind: ModalKind::Bundle,
                     buf: String::new(),
                     targets,
                 });
             }
+        }
+        KeyCode::Char(':') => {
+            // Number-range select. The user types something like
+            //   1-5,8,12-15
+            // and we add those draft IDs to the selection on confirm.
+            // This matches the `pcr bundle --select` syntax so power
+            // users have one consistent grammar across CLI and TUI.
+            if !state.drafts.is_empty() {
+                state.prompt = Some(Modal {
+                    kind: ModalKind::RangeSelect,
+                    buf: String::new(),
+                    targets: Vec::new(),
+                });
+            }
+        }
+        KeyCode::Char('J') => {
+            // Shift-J: range-select downward. Toggle the focused row,
+            // then move down — same shape as Space, but rotation-
+            // friendly for a sustained Shift+J hold to mark a run.
+            if let Some(d) = state.drafts.get(state.focus) {
+                if state.selected.contains(&d.id) {
+                    state.selected.remove(&d.id);
+                } else {
+                    state.selected.insert(d.id.clone());
+                }
+            }
+            if !state.drafts.is_empty() && state.focus + 1 < state.drafts.len() {
+                state.focus += 1;
+                state.list_state.select(Some(state.focus));
+            }
+        }
+        KeyCode::Char('K') => {
+            // Shift-K: range-select upward. Toggle current, then move
+            // up. Pairs with capital J for symmetric range building in
+            // either direction without repositioning first.
+            if let Some(d) = state.drafts.get(state.focus) {
+                if state.selected.contains(&d.id) {
+                    state.selected.remove(&d.id);
+                } else {
+                    state.selected.insert(d.id.clone());
+                }
+            }
+            state.focus = state.focus.saturating_sub(1);
+            state.list_state.select(Some(state.focus));
         }
         KeyCode::Char('p') if state.push_armed => {
             // Push shortcut, only live during the post-bundle flash.
@@ -334,9 +392,9 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "j/k move · enter/space select · a select-all · b bundle (then p to push) · c copy · d delete · q quit  ·  source/branch in detail pane"
+                "j/k move · enter/space select · J/K select+move · : range (1-5,8) · a all · b bundle · p push · c copy · d delete · q quit"
                     .into(),
-                12,
+                14,
             ));
         }
         _ => {}
@@ -344,7 +402,7 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
     true
 }
 
-/// Key dispatch while the name prompt is on screen. Returns false to
+/// Key dispatch while a modal prompt is on screen. Returns false to
 /// quit the TUI (we never quit from inside the prompt — Esc just
 /// dismisses the prompt itself, matching how every other modal in
 /// Cursor / VS Code works).
@@ -354,65 +412,34 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
     };
     match k.code {
         KeyCode::Esc => {
+            let kind = prompt.kind;
             state.prompt = None;
-            state.copy_flash = Some(("Bundle cancelled.".into(), 3));
+            state.copy_flash = Some((cancel_flash(kind).into(), 3));
         }
         KeyCode::Backspace => {
             prompt.buf.pop();
         }
         KeyCode::Enter => {
-            let name = prompt.buf.trim().to_string();
-            if name.is_empty() {
-                state.copy_flash = Some(("Bundle name can't be empty — Esc to cancel.".into(), 4));
-                return true;
-            }
-            let targets = std::mem::take(&mut prompt.targets);
-            // Drop the prompt before calling out so the success flash
-            // renders on a clean footer.
-            state.prompt = None;
-            match create_bundle_from_targets(&name, &targets) {
-                Ok(count) => {
-                    // Drop bundled drafts from the in-memory list so the
-                    // user can immediately see they've moved out of the
-                    // draft pool. The store has already migrated them to
-                    // the bundle in the same transaction.
-                    let bundled: HashSet<String> = targets.into_iter().collect();
-                    state.drafts.retain(|d| !bundled.contains(&d.id));
-                    state.selected.retain(|id| !bundled.contains(id));
-                    if state.drafts.is_empty() {
-                        state.focus = 0;
-                        state.list_state.select(None);
-                    } else {
-                        if state.focus >= state.drafts.len() {
-                            state.focus = state.drafts.len() - 1;
-                        }
-                        state.list_state.select(Some(state.focus));
-                    }
-                    state.push_armed = true;
-                    state.copy_flash = Some((
-                        format!(
-                            "Bundled {count} draft{} as {name:?} — press p to push, q to quit",
-                            plural(count)
-                        ),
-                        12,
-                    ));
-                }
-                Err(e) => {
-                    state.copy_flash = Some((format!("Bundle failed: {e}"), 8));
-                }
+            let kind = prompt.kind;
+            let buf = prompt.buf.trim().to_string();
+            match kind {
+                ModalKind::Bundle => confirm_bundle_modal(state, buf),
+                ModalKind::RangeSelect => confirm_range_select_modal(state, buf),
             }
         }
         KeyCode::Char(c) => {
-            // Treat Ctrl-U as line-clear; `q` while the buffer is empty
-            // is a cancel shortcut (matches the user's expectation that
-            // q always quits whatever modal they're in). Once they've
-            // typed anything, q is a literal character — otherwise you
-            // could never type a bundle name containing a `q`.
+            // Treat Ctrl-U as line-clear; `q` while the buffer is
+            // empty is a cancel shortcut (matches the user's
+            // expectation that q always quits whatever modal they're
+            // in). Once they've typed anything, q is a literal
+            // character — otherwise you could never type a bundle
+            // name containing a `q`.
             if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
                 prompt.buf.clear();
             } else if (c == 'q' || c == 'Q') && prompt.buf.is_empty() {
+                let kind = prompt.kind;
                 state.prompt = None;
-                state.copy_flash = Some(("Bundle cancelled.".into(), 3));
+                state.copy_flash = Some((cancel_flash(kind).into(), 3));
             } else if !k.modifiers.contains(KeyModifiers::CONTROL) {
                 // Soft cap so a runaway paste can't blow the terminal width.
                 if prompt.buf.chars().count() < 120 {
@@ -423,6 +450,94 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
         _ => {}
     }
     true
+}
+
+fn cancel_flash(kind: ModalKind) -> &'static str {
+    match kind {
+        ModalKind::Bundle => "Bundle cancelled.",
+        ModalKind::RangeSelect => "Range select cancelled.",
+    }
+}
+
+fn confirm_bundle_modal(state: &mut ShowState, name: String) {
+    if name.is_empty() {
+        state.copy_flash = Some(("Bundle name can't be empty — Esc to cancel.".into(), 4));
+        return;
+    }
+    let targets = state
+        .prompt
+        .as_mut()
+        .map(|p| std::mem::take(&mut p.targets))
+        .unwrap_or_default();
+    state.prompt = None;
+    match create_bundle_from_targets(&name, &targets) {
+        Ok(count) => {
+            // Drop bundled drafts from the in-memory list so the user
+            // can immediately see they've moved out of the draft pool.
+            // The store has already migrated them to the bundle in the
+            // same transaction.
+            let bundled: HashSet<String> = targets.into_iter().collect();
+            state.drafts.retain(|d| !bundled.contains(&d.id));
+            state.selected.retain(|id| !bundled.contains(id));
+            if state.drafts.is_empty() {
+                state.focus = 0;
+                state.list_state.select(None);
+            } else {
+                if state.focus >= state.drafts.len() {
+                    state.focus = state.drafts.len() - 1;
+                }
+                state.list_state.select(Some(state.focus));
+            }
+            state.push_armed = true;
+            state.copy_flash = Some((
+                format!(
+                    "Bundled {count} draft{} as {name:?} — press p to push, q to quit",
+                    plural(count)
+                ),
+                12,
+            ));
+        }
+        Err(e) => {
+            state.copy_flash = Some((format!("Bundle failed: {e}"), 8));
+        }
+    }
+}
+
+fn confirm_range_select_modal(state: &mut ShowState, expr: String) {
+    if expr.is_empty() {
+        state.copy_flash = Some(("Empty range — Esc to cancel.".into(), 3));
+        return;
+    }
+    let total = state.drafts.len();
+    let indices = if expr.eq_ignore_ascii_case("all") {
+        (0..total).collect::<Vec<_>>()
+    } else {
+        crate::util::text::parse_selection_indices(&expr, total)
+    };
+    state.prompt = None;
+    if indices.is_empty() {
+        state.copy_flash = Some((
+            format!("No drafts matched {expr:?} (valid: 1-{total}, e.g. 1-5,8,12)"),
+            6,
+        ));
+        return;
+    }
+    let mut added = 0usize;
+    for i in &indices {
+        if let Some(d) = state.drafts.get(*i) {
+            if state.selected.insert(d.id.clone()) {
+                added += 1;
+            }
+        }
+    }
+    state.copy_flash = Some((
+        format!(
+            "Selected {added} new draft{} from range {expr:?} (total ✓ {})",
+            plural(added),
+            state.selected.len()
+        ),
+        5,
+    ));
 }
 
 /// Tiny pluralizer helper local to this file — `crate::util::text::plural`
@@ -556,17 +671,18 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
     };
     frame.render_widget(Clear, area);
 
+    let title = match prompt.kind {
+        ModalKind::Bundle => format!(
+            " Bundle name · {} draft{} ",
+            prompt.targets.len(),
+            plural(prompt.targets.len())
+        ),
+        ModalKind::RangeSelect => " Select range · e.g. 1-5,8,12-15 ".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::accent())
-        .title(Line::from(Span::styled(
-            format!(
-                " Bundle name · {} draft{} ",
-                prompt.targets.len(),
-                plural(prompt.targets.len())
-            ),
-            theme::accent_bold(),
-        )));
+        .title(Line::from(Span::styled(title, theme::accent_bold())));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -583,11 +699,12 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
             horizontal: 1,
         }));
 
+    let hint = match prompt.kind {
+        ModalKind::Bundle => "Name your bundle (e.g. \"auth fix\"):",
+        ModalKind::RangeSelect => "Type draft numbers — comma + dash, e.g. 1-5,8,12-15 (or `all`):",
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "Name your bundle (e.g. \"auth fix\"):",
-            theme::dim(),
-        ))),
+        Paragraph::new(Line::from(Span::styled(hint, theme::dim()))),
         chunks[0],
     );
 
@@ -697,9 +814,23 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         .collect();
 
     let mut ls = state.list_state.clone();
-    // Title now shows the selection count when something is marked, so
-    // the user has constant feedback on how many drafts will go into a
-    // bundle if they hit Enter.
+    // Bias the scroll so the focused row sits near the vertical center
+    // of the viewport (instead of being pinned to whichever edge the
+    // user is moving toward). When the focus is near the top or bottom
+    // we clamp so we don't scroll past the data and leave empty rows.
+    // Without this, navigating up from the bottom kept the cursor
+    // permanently glued to the last row — there was always a blank
+    // expanse above and zero context below.
+    let visible_rows = (area.height as usize).saturating_sub(2); // minus borders
+    if visible_rows > 0 && state.drafts.len() > visible_rows {
+        let half = visible_rows / 2;
+        let max_offset = state.drafts.len().saturating_sub(visible_rows);
+        let desired = state.focus.saturating_sub(half).min(max_offset);
+        *ls.offset_mut() = desired;
+    }
+    // Title shows the selection count when something is marked, so the
+    // user has constant feedback on how many drafts will go into a
+    // bundle if they hit `b`.
     let title = if state.selected.is_empty() {
         format!(" Drafts · {} ", state.drafts.len())
     } else {
@@ -940,14 +1071,16 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
     let mut hints = vec![
         Span::styled("j/k", theme::accent()),
         Span::styled(" move  ", theme::dim()),
-        Span::styled("enter/space", theme::accent()),
+        Span::styled("enter", theme::accent()),
         Span::styled(" select  ", theme::dim()),
+        Span::styled("J/K", theme::accent()),
+        Span::styled(" range  ", theme::dim()),
+        Span::styled(":", theme::accent()),
+        Span::styled(" 1-5,8  ", theme::dim()),
         Span::styled("a", theme::accent()),
         Span::styled(" all  ", theme::dim()),
         Span::styled("b", theme::accent()),
         Span::styled(" bundle  ", theme::dim()),
-        Span::styled("c", theme::accent()),
-        Span::styled(" copy  ", theme::dim()),
         Span::styled("d", theme::accent()),
         Span::styled(" delete  ", theme::dim()),
         Span::styled("?", theme::accent()),
