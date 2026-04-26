@@ -99,6 +99,7 @@ pub fn run_focused_with_hidden(
         prompt: None,
         push_armed: false,
         outcome: ShowOutcome::Quit,
+        nav_dir: NavDir::Down,
     };
     state.list_state.select(Some(focus));
 
@@ -163,6 +164,20 @@ struct ShowState {
     /// plain quit; set to `PushAfterExit` when the user opts into the
     /// post-bundle push shortcut.
     outcome: ShowOutcome,
+    /// Direction the user last navigated. Enter/Space's auto-advance
+    /// follows this so that selecting while scrolling up keeps moving
+    /// up (instead of bouncing back down past the row you just marked).
+    /// Defaults to `Down` because the TUI opens focused on the newest
+    /// draft and the only initial navigation is upward — meaning the
+    /// first Enter/Space without prior j/k still does the intuitive
+    /// thing for someone who only browses by selecting.
+    nav_dir: NavDir,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavDir {
+    Up,
+    Down,
 }
 
 /// Modal text-input shown over the list. Two flavors:
@@ -204,20 +219,28 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 state.focus = (state.focus + 1).min(state.drafts.len() - 1);
                 state.list_state.select(Some(state.focus));
             }
+            state.nav_dir = NavDir::Down;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.focus = state.focus.saturating_sub(1);
             state.list_state.select(Some(state.focus));
+            state.nav_dir = NavDir::Up;
         }
         KeyCode::Home | KeyCode::Char('g') => {
             state.focus = 0;
             state.list_state.select(Some(0));
+            // From the top, the only way is down — pre-arm the
+            // auto-advance so the next Space/Enter starts moving
+            // through the list rather than getting stuck at row 0.
+            state.nav_dir = NavDir::Down;
         }
         KeyCode::End | KeyCode::Char('G') => {
             if !state.drafts.is_empty() {
                 state.focus = state.drafts.len() - 1;
                 state.list_state.select(Some(state.focus));
             }
+            // Mirror image: at the bottom the natural direction is up.
+            state.nav_dir = NavDir::Up;
         }
         KeyCode::Char('c') => {
             // Copy the prompt to the system clipboard if available, otherwise just flash.
@@ -237,12 +260,12 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
-            // Toggle multi-select on the focused draft. Both Space and
-            // Enter mark a row — Enter is the natural "do the thing on
-            // this row" key, and the original behavior (Enter immediately
-            // popping the bundle prompt) felt abrupt; selection is the
-            // safer default. Both keys auto-advance so the user can hold
-            // enter-j-enter-j to mark a contiguous run.
+            // Toggle multi-select on the focused draft, then auto-
+            // advance in whichever direction the user was last moving.
+            // Without this, scrolling up and selecting kept bouncing
+            // the focus back down past the row you just marked — a
+            // direction-dependent advance keeps the cursor moving
+            // through the list the way the user is reading it.
             if let Some(d) = state.drafts.get(state.focus) {
                 if state.selected.contains(&d.id) {
                     state.selected.remove(&d.id);
@@ -250,10 +273,7 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     state.selected.insert(d.id.clone());
                 }
             }
-            if !state.drafts.is_empty() && state.focus + 1 < state.drafts.len() {
-                state.focus += 1;
-                state.list_state.select(Some(state.focus));
-            }
+            advance_focus(state);
         }
         KeyCode::Char('a') => {
             // Toggle "select all visible" / "clear all". If anything is
@@ -321,9 +341,11 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char('J') => {
-            // Shift-J: range-select downward. Toggle the focused row,
-            // then move down — same shape as Space, but rotation-
-            // friendly for a sustained Shift+J hold to mark a run.
+            // Shift-J explicitly forces downward range select even when
+            // the user was previously moving up. Toggles current, sets
+            // direction = Down, then advances. After this, plain
+            // Space/Enter will keep moving down too.
+            state.nav_dir = NavDir::Down;
             if let Some(d) = state.drafts.get(state.focus) {
                 if state.selected.contains(&d.id) {
                     state.selected.remove(&d.id);
@@ -331,15 +353,12 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     state.selected.insert(d.id.clone());
                 }
             }
-            if !state.drafts.is_empty() && state.focus + 1 < state.drafts.len() {
-                state.focus += 1;
-                state.list_state.select(Some(state.focus));
-            }
+            advance_focus(state);
         }
         KeyCode::Char('K') => {
-            // Shift-K: range-select upward. Toggle current, then move
-            // up. Pairs with capital J for symmetric range building in
-            // either direction without repositioning first.
+            // Shift-K is the upward counterpart. Sets direction = Up
+            // so subsequent Space/Enter presses keep moving up.
+            state.nav_dir = NavDir::Up;
             if let Some(d) = state.drafts.get(state.focus) {
                 if state.selected.contains(&d.id) {
                     state.selected.remove(&d.id);
@@ -347,8 +366,7 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     state.selected.insert(d.id.clone());
                 }
             }
-            state.focus = state.focus.saturating_sub(1);
-            state.list_state.select(Some(state.focus));
+            advance_focus(state);
         }
         KeyCode::Char('p') if state.push_armed => {
             // Push shortcut, only live during the post-bundle flash.
@@ -549,6 +567,27 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// Move the focus one row in the user's last navigation direction,
+/// clamped to the list bounds. Shared by every "select-and-advance"
+/// keybinding (Space, Enter, Shift+J, Shift+K) so the auto-advance
+/// behavior is consistent across all of them.
+fn advance_focus(state: &mut ShowState) {
+    if state.drafts.is_empty() {
+        return;
+    }
+    match state.nav_dir {
+        NavDir::Down => {
+            if state.focus + 1 < state.drafts.len() {
+                state.focus += 1;
+            }
+        }
+        NavDir::Up => {
+            state.focus = state.focus.saturating_sub(1);
+        }
+    }
+    state.list_state.select(Some(state.focus));
 }
 
 /// Create a sealed bundle from the given draft IDs, mirroring the
