@@ -21,14 +21,12 @@
     "prompts"
   ],
   "main": "index.js",
-  "types": "index.d.ts",
   "bin": {
     "pcr": "bin/pcr"
   },
   "files": [
     "bin/",
-    "index.js",
-    "index.d.ts"
+    "index.js"
   ],
   "engines": {
     "node": ">=16.0.0"
