@@ -637,6 +637,20 @@ fn create_bundle_from_targets(name: &str, draft_ids_in: &[String]) -> Result<usi
 
 fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     let area = frame.area();
+
+    // Bulletproof clear of the whole frame before anything else
+    // renders. The previous body-only Clear didn't fully fix the
+    // ghosting problem; users still saw stale text fragments at the
+    // right edge after rapid scrolls. The cause appears to be
+    // `Paragraph` + `Wrap { trim: false }` not always writing every
+    // cell of its target area when the wrap layout shifts between
+    // frames — combined with ratatui's diff-render only emitting
+    // changed cells. Clearing the full screen up front means the
+    // first thing ratatui sees in the new buffer is "every cell is
+    // default", which forces the diff to overwrite anything stale
+    // from the previous frame.
+    frame.render_widget(Clear, area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -676,7 +690,6 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     // detail pane (the place the user is actually reading). The user
     // explicitly asked for this; Cursor drafts in particular almost
     // always hit this case because we don't capture their tool calls.
-    let body = chunks[1];
     let show_sidebar = focused_has_sidebar_content(state);
     let cols = if show_sidebar {
         Layout::default()
@@ -686,7 +699,7 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
                 Constraint::Min(40),    // detail
                 Constraint::Length(28), // changed files / tools
             ])
-            .split(body)
+            .split(chunks[1])
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -694,20 +707,8 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
                 Constraint::Length(28), // drafts list
                 Constraint::Min(40),    // detail (gets the sidebar's columns)
             ])
-            .split(body)
+            .split(chunks[1])
     };
-
-    // Force-clear the body before any pane renders into it. We've
-    // observed stale text fragments lingering at the right edge when
-    // the layout reflows (sidebar appearing/disappearing) or when the
-    // user scrolls quickly between drafts whose detail content has
-    // very different lengths — Paragraph + `Wrap { trim: false }`
-    // doesn't always overwrite every cell of its target area, and the
-    // residue from the previous frame stays on screen. Writing default
-    // cells over the entire body ahead of time makes the panes always
-    // render onto a clean canvas, no matter what the previous frame
-    // looked like.
-    frame.render_widget(Clear, body);
 
     draw_list(frame, cols[0], state);
     draw_detail(frame, cols[1], state);
@@ -1004,6 +1005,14 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         ]));
     }
 
+    // Belt + suspenders: explicitly clear the inner area before the
+    // Paragraph renders. The frame-level Clear at the top of `draw`
+    // already covers this in theory, but `Paragraph` + `Wrap { trim:
+    // false }` is the specific widget where leftover cells have been
+    // observed leaking through, so we clear once more right before its
+    // render. Cheap (one buffer pass over the inner rect) and removes
+    // every realistic source of stale content for this pane.
+    frame.render_widget(Clear, inner);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
 }
