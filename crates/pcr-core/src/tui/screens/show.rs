@@ -716,9 +716,9 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
-    // Row format: `NNN preview`. State lives on the index color
-    // (focused = blue, selected = green; selection wins when both
-    // apply). No mark / pointer column.
+    // Row format: `NNN preview`. Focus = subtle row background (via
+    // List::highlight_style); selection = green index + bold preview.
+    // The two states are orthogonal so you can always see both.
     const FIXED_PREFIX: usize = 4; // 3-wide index + 1 separator space
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
@@ -731,27 +731,20 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let is_focused = i == state.focus;
             let is_selected = state.selected.contains(&d.id);
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
 
-            let bold_white = Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD);
-            let (idx_style, preview_style) = match (is_selected, is_focused) {
-                (true, _) => (
+            let (idx_style, preview_style) = if is_selected {
+                (
                     Style::default()
                         .fg(theme::SUCCESS)
                         .add_modifier(Modifier::BOLD),
-                    bold_white,
-                ),
-                (false, true) => (
                     Style::default()
-                        .fg(theme::ACCENT)
+                        .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
-                    theme::text(),
-                ),
-                (false, false) => (theme::chrome(), theme::text()),
+                )
+            } else {
+                (theme::chrome(), theme::text())
             };
 
             ListItem::new(Line::from(vec![
@@ -784,7 +777,12 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         .borders(Borders::ALL)
         .border_style(theme::chrome())
         .title(Line::from(Span::styled(title, theme::dim())));
-    let widget = List::new(items).block(block);
+    // Focus = subtle dark-blue row background. Stays visible even on
+    // selected rows (whose foreground is already green-on-bold) so the
+    // user can always see where the cursor is.
+    let widget = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::Rgb(34, 46, 62)));
     frame.render_stateful_widget(widget, area, &mut ls);
 }
 
