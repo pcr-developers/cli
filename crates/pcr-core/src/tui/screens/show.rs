@@ -4,10 +4,10 @@
 //!
 //! ```text
 //! ┌─ HEADER ────────────────────────────────────────────────────────────┐
-//! │ DRAFTS ▼            │ PROMPT                        │ CHANGED FILES │
-//! │ ✓ 1 cur ▸ pcr-dev   │ "fix the bug in render"       │ src/page.tsx  │
-//! │   2 cld   cli       │                               │ src/main.rs   │
-//! │ ✓ 3 cur   docs      │ RESPONSE                      │               │
+//! │ DRAFTS ▼              │ PROMPT                      │ CHANGED FILES │
+//! │ ✓ 1 ▸ pcr-dev  fix t  │ "fix the bug in render"     │ src/page.tsx  │
+//! │   2   cli      add r  │                             │ src/main.rs   │
+//! │ ✓ 3   docs     wire   │ RESPONSE                    │               │
 //! │                     │ Done — applied 2 edits.       │ TOOL CALLS    │
 //! │                     │                               │ Write × 2     │
 //! │                     │ METADATA                      │ Read  × 5     │
@@ -284,9 +284,9 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "labels: cur=cursor · cld=claude-code · vsc=vscode  ·  keys: j/k move · space select · a select-all · enter/b bundle · c copy · d delete · q quit"
+                "j/k move · space select · a select-all · enter bundle · c copy · d delete · ? help · q quit  ·  source/branch shown in the detail pane"
                     .into(),
-                12,
+                10,
             ));
         }
         _ => {}
@@ -560,17 +560,27 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
-    // Each row is `M ▸ NNN LBL preview` with a fixed prefix width:
-    //   mark(1) + space(1) + pointer(1) + space(1) + index(3) + space(1)
-    //   + label(3) + space(1) = 12
-    // Clamp the preview text to whatever's left of the inner column width so
-    // long prompts don't soft-wrap onto the next ListItem and visually
-    // contaminate adjacent rows.
-    const PREFIX_WIDTH: usize = 12;
+    // Each row is `M ▸ NNN  REPO  preview` with a budget that adapts
+    // to column width. The repo column is more useful at-a-glance than
+    // the source label was — across multi-repo work it's the strongest
+    // signal for what a draft is *about*. If a row has no project
+    // attribution, we leave the repo slot blank rather than print "—",
+    // since the column is already narrow and a placeholder steals
+    // preview width without saying anything.
+    //
+    // Width budget:
+    //   mark(1) + space(1) + pointer(1) + space(1) + index(3) + space(1) = 8
+    //   repo column = REPO_WIDTH (8) when any draft in view has a repo
+    //                 name, else 0 to give the preview the full column
+    //   space(1) between repo and preview if repo is shown
+    const FIXED_PREFIX: usize = 8;
+    const REPO_WIDTH: usize = 8;
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
+    let any_repo = state.drafts.iter().any(|d| !d.project_name.is_empty());
+    let repo_block = if any_repo { REPO_WIDTH + 1 } else { 0 };
     let preview_max = inner_width
-        .saturating_sub(PREFIX_WIDTH)
+        .saturating_sub(FIXED_PREFIX + repo_block)
         .max(MIN_PREVIEW_WIDTH);
 
     let items: Vec<ListItem<'_>> = state
@@ -589,18 +599,24 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
                 " "
             };
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
-            let (label, label_style) = source_label(&d.source);
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(mark, theme::success()),
                 Span::raw(" "),
                 Span::styled(pointer, theme::accent()),
                 Span::raw(" "),
                 Span::styled(format!("{:>3}", i + 1), theme::chrome()),
                 Span::raw(" "),
-                Span::styled(format!("{label:<3}"), label_style),
-                Span::raw(" "),
-                Span::styled(preview, theme::text()),
-            ]))
+            ];
+            if any_repo {
+                let repo = truncate_for_column(&d.project_name, REPO_WIDTH);
+                spans.push(Span::styled(
+                    format!("{:<width$}", repo, width = REPO_WIDTH),
+                    theme::pending(),
+                ));
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(preview, theme::text()));
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -625,18 +641,24 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
     frame.render_stateful_widget(widget, area, &mut ls);
 }
 
-/// Three-letter source label shown in the drafts list. Single-letter
-/// glyphs (`C` / `K` / `V`) saved a column but were opaque — a new user
-/// staring at the list had no way to know what `C` meant. Three letters
-/// fit `cursor` / `claude` / `vscode` unambiguously and the legend in
-/// the `?` help banner spells them out the first time.
-fn source_label(source: &str) -> (&'static str, ratatui::style::Style) {
-    match source {
-        "cursor" => ("cur", theme::accent()),
-        "claude-code" => ("cld", theme::pending()),
-        "vscode" => ("vsc", theme::info()),
-        _ => ("?", theme::dim()),
+/// Truncate `s` to fit in `width` display columns, appending `…` when
+/// it has to drop characters. Approximates display width by `chars()`
+/// — fine for ASCII project names and adequate for the BMP characters
+/// that show up in real-world repo slugs. The list is monospaced so
+/// any cell that's too narrow just gets a trailing `…`, never wrapped.
+fn truncate_for_column(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
     }
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let head: String = s.chars().take(width - 1).collect();
+    format!("{head}…")
 }
 
 fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
