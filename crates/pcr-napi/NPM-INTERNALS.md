@@ -41,7 +41,6 @@ No second `CreateProcess`, no policy violation, no admin needed.
 pcr-dev/
 ├── bin/pcr        # 4-line shim: require("../index.js").run(["pcr", ...argv])
 ├── index.js       # platform selector — picks the right native subpackage
-├── index.d.ts     # TypeScript types for the run() export
 └── package.json   # optionalDependencies pin one subpackage per platform
 ```
 
