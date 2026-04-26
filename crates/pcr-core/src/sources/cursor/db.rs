@@ -340,10 +340,10 @@ fn store_meta_cache(session_id: &str, meta: Option<SessionMeta>) {
     }
 }
 
-// Full session data cache. Mirrors the SessionMeta cache: same 60s TTL,
-// same per-session keying. Without this the watcher re-parses the full
-// composerData JSON (often 50–500 KB) on every save_completed_turn for
-// the same session, even though it's already in the SessionMeta cache.
+// Per-session cache for the full composerData JSON. Same shape as the
+// SessionMeta cache (60s TTL, keyed by session_id) so save_completed_turn
+// doesn't re-parse 50–500 KB of JSON on every agent turn in the same
+// session.
 struct FullCacheEntry {
     data: Option<SessionData>,
     ts: Instant,

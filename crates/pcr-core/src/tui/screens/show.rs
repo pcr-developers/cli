@@ -1,33 +1,10 @@
-//! `pcr show` — three-pane draft browser.
+//! `pcr show` — interactive draft browser.
 //!
-//! Layout:
-//!
-//! ```text
-//! ┌─ HEADER ────────────────────────────────────────────────────────────┐
-//! │ DRAFTS ▼            │ PROMPT                        │ CHANGED FILES │
-//! │   1  fix the bug    │ "fix the bug in render"       │ src/page.tsx  │   ← 1 selected  (green)
-//! │   2  add reset link │                               │ src/main.rs   │   ← 2 focused   (blue)
-//! │   3  wire up redux  │ RESPONSE                      │               │
-//! │                     │ Done — applied 2 edits.       │ TOOL CALLS    │
-//! │                     │                               │ Write × 2     │
-//! │                     │ METADATA                      │ Read  × 5     │
-//! │                     │ source · cursor               │               │
-//! │                     │ branch · main                 │               │
-//! │                     │ project · pcr-dev             │               │
-//! └─────────────────────────────────────────────────────────────────────┘
-//!  j/k move · enter/space select · a all · b bundle · d delete · q quit
-//! ```
-//!
-//! Selection / bundle flow:
-//!
-//! * `enter` and `space` both toggle a row's selection mark (`✓`).
-//!   Selected rows render in bold white so they stand out from the
-//!   regular text — the user always knows what `b` is about to bundle.
-//! * `b` opens an inline name prompt for the current selection (or the
-//!   focused row if nothing's marked).
-//! * After a successful bundle the footer offers `p` to push
-//!   immediately — `p` cleanly tears down the TUI and runs `pcr push`
-//!   as if the user had typed it.
+//! Three panes (drafts list, detail, optional sidebar with changed files
+//! and tool calls). Selection lives on row index color: blue = focused,
+//! green = selected, green wins when both apply. `b` opens a bundle
+//! name prompt for the current selection (or the focused row).
+//! After a successful bundle, `p` exits the TUI and runs `pcr push`.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -50,12 +27,7 @@ use crate::util::id::generate_hex_id;
 use crate::util::time::{fmt_time, local_hms};
 use crate::VERSION;
 
-/// What the user did on the way out of the TUI. The caller acts on
-/// this — currently just runs `pcr push` if the user hit `p` after a
-/// successful bundle. Returning an outcome (instead of side-effecting
-/// from inside the TUI) keeps the TUI thread purely a renderer + input
-/// loop and lets all blocking network code run with the terminal
-/// already restored.
+/// What the caller should do after the TUI exits.
 pub enum ShowOutcome {
     Quit,
     PushAfterExit,
@@ -65,18 +37,13 @@ pub fn run(drafts: Vec<DraftRecord>) -> Result<ShowOutcome> {
     run_focused(drafts, 0)
 }
 
-/// Open the show TUI focused on a specific draft index (0-based). Used by
-/// `pcr show <n>` to land on the requested draft instead of the first one,
-/// and by `pcr bundle` to focus on the most recent draft. Out-of-range
-/// indices are clamped to the last valid row.
+/// Open the browser focused on `initial_focus` (0-based, clamped).
 pub fn run_focused(drafts: Vec<DraftRecord>, initial_focus: usize) -> Result<ShowOutcome> {
     run_focused_with_hidden(drafts, initial_focus, 0)
 }
 
-/// Same as `run_focused`, but lets the caller report how many drafts
-/// were filtered out before opening the TUI. Used by the recency cap
-/// in `pcr show` / `pcr bundle` so the footer can hint that the list
-/// is truncated and how to see everything.
+/// Like `run_focused` but advertises `hidden_count` older drafts in the
+/// footer so the user knows the recency cap truncated the list.
 pub fn run_focused_with_hidden(
     drafts: Vec<DraftRecord>,
     initial_focus: usize,
@@ -113,15 +80,13 @@ pub fn run_focused_with_hidden(
                 }
             }
             Ok(Event::Tick(_)) => {
-                // Tick down the copy-flash banner so it disappears after a moment.
+                // Tick down the flash banner; expiring it also disarms
+                // the post-bundle `p` shortcut so it can't fire silently
+                // long after the confirmation has scrolled off.
                 if let Some((_, ref mut ttl)) = state.copy_flash {
                     *ttl = ttl.saturating_sub(1);
                     if *ttl == 0 {
                         state.copy_flash = None;
-                        // Also disarm the push shortcut when the flash
-                        // expires — keeping `p` live indefinitely after
-                        // the bundle confirmation scrolls off screen
-                        // would be a footgun.
                         state.push_armed = false;
                     }
                 }
@@ -139,38 +104,20 @@ struct ShowState {
     drafts: Vec<DraftRecord>,
     focus: usize,
     list_state: ListState,
-    /// (message, ticks_remaining) — flash banner that confirms keyboard actions.
+    /// `(message, ticks_remaining)` — transient footer banner.
     copy_flash: Option<(String, u32)>,
-    /// Drafts filtered out *before* the TUI opened (e.g. by the recency
-    /// cap in `pcr show` / `pcr bundle`). Surfaced in the footer so the
-    /// user knows the list isn't the complete history and how to widen it.
+    /// Drafts hidden by the recency cap before the TUI opened.
     hidden_count: usize,
-    /// Draft IDs the user has marked with Space. Bundling the focused
-    /// row alone is the fallback when this set is empty, so casual
-    /// users never need to learn multi-select to ship a single draft.
+    /// Draft IDs marked for the next bundle.
     selected: HashSet<String>,
-    /// Inline modal — either the bundle name prompt (after `b`) or the
-    /// range-select prompt (after `:`). While `Some`, all key input
-    /// goes to the modal (text input, Enter to confirm, Esc/q to
-    /// cancel) instead of list navigation.
+    /// Active modal prompt; freezes list navigation while `Some`.
     prompt: Option<Modal>,
-    /// Set by a successful bundle and cleared when the confirmation
-    /// flash expires. While true, pressing `p` quits the TUI and
-    /// signals the caller to run `pcr push`. Without this gate, `p`
-    /// would either be a noop or a hidden push trigger that fires
-    /// whenever the user's typing wandered past it.
+    /// Whether the post-bundle `p` push shortcut is currently live.
     push_armed: bool,
-    /// Where the TUI hands control back to the caller. Default is a
-    /// plain quit; set to `PushAfterExit` when the user opts into the
-    /// post-bundle push shortcut.
     outcome: ShowOutcome,
-    /// Direction the user last navigated. Enter/Space's auto-advance
-    /// follows this so that selecting while scrolling up keeps moving
-    /// up (instead of bouncing back down past the row you just marked).
-    /// Defaults to `Down` because the TUI opens focused on the newest
-    /// draft and the only initial navigation is upward — meaning the
-    /// first Enter/Space without prior j/k still does the intuitive
-    /// thing for someone who only browses by selecting.
+    /// Last navigation direction; drives the auto-advance after a
+    /// select so it follows the user's scroll instead of always
+    /// jumping down.
     nav_dir: NavDir,
 }
 
@@ -180,35 +127,26 @@ enum NavDir {
     Down,
 }
 
-/// Modal text-input shown over the list. Two flavors:
-///
-/// * `Bundle` — typed by the user after `b`. The `targets` are the
-///   draft IDs we'll bundle when the user confirms.
-/// * `RangeSelect` — typed by the user after `:`. On confirm we parse
-///   the buffer as a `pcr bundle --select` expression (`1-5,8,12-15`)
-///   and add those draft IDs to `state.selected` — useful when you
-///   already know exactly which drafts you want and don't feel like
-///   scrolling through them with Space.
+/// Inline text-input modal overlaid on the list.
 struct Modal {
     kind: ModalKind,
-    /// Current text the user has typed.
     buf: String,
-    /// Snapshot of the draft IDs the bundle modal will operate on.
-    /// Captured at open time so navigation behind the modal can't
-    /// shift the target set out from under the user. Empty for
-    /// `RangeSelect` since that mode reads `state.drafts` at confirm.
+    /// Draft IDs the modal will act on. Snapshotted at open so the
+    /// target set can't shift if focus changes behind the overlay.
+    /// Unused by `RangeSelect`, which reads `state.drafts` at confirm.
     targets: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModalKind {
+    /// `b`: prompt for a bundle name; on confirm bundle `targets`.
     Bundle,
+    /// `:`: prompt for a `1-5,8,12-15` range; on confirm union those
+    /// indices into `state.selected`.
     RangeSelect,
 }
 
 fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
-    // Modal-first. While the name prompt is open, the list is frozen
-    // and every keystroke goes into the prompt buffer (or controls it).
     if state.prompt.is_some() {
         return handle_prompt_key(k, state);
     }
@@ -229,9 +167,6 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         KeyCode::Home | KeyCode::Char('g') => {
             state.focus = 0;
             state.list_state.select(Some(0));
-            // From the top, the only way is down — pre-arm the
-            // auto-advance so the next Space/Enter starts moving
-            // through the list rather than getting stuck at row 0.
             state.nav_dir = NavDir::Down;
         }
         KeyCode::End | KeyCode::Char('G') => {
@@ -239,11 +174,9 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 state.focus = state.drafts.len() - 1;
                 state.list_state.select(Some(state.focus));
             }
-            // Mirror image: at the bottom the natural direction is up.
             state.nav_dir = NavDir::Up;
         }
         KeyCode::Char('c') => {
-            // Copy the prompt to the system clipboard if available, otherwise just flash.
             if let Some(d) = state.drafts.get(state.focus) {
                 let copied = copy_to_clipboard(&d.prompt_text);
                 state.copy_flash = Some((
@@ -260,25 +193,10 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
-            // Toggle multi-select on the focused draft, then auto-
-            // advance in whichever direction the user was last moving.
-            // Without this, scrolling up and selecting kept bouncing
-            // the focus back down past the row you just marked — a
-            // direction-dependent advance keeps the cursor moving
-            // through the list the way the user is reading it.
-            if let Some(d) = state.drafts.get(state.focus) {
-                if state.selected.contains(&d.id) {
-                    state.selected.remove(&d.id);
-                } else {
-                    state.selected.insert(d.id.clone());
-                }
-            }
+            toggle_focused(state);
             advance_focus(state);
         }
         KeyCode::Char('a') => {
-            // Toggle "select all visible" / "clear all". If anything is
-            // selected, the first press clears (matches the gmail-style
-            // mental model). Otherwise selects every visible draft.
             if state.selected.is_empty() {
                 for d in &state.drafts {
                     state.selected.insert(d.id.clone());
@@ -294,18 +212,15 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char('b') => {
-            // Open the inline name prompt. If the user has multi-
-            // selected, those are the targets; otherwise we fall back
-            // to the focused row so the single-draft case stays a
-            // three-keystroke flow (b, type name, Enter).
+            // Multi-select if anything's marked, else just the focused row.
+            // Iterate `state.drafts` (not the HashSet) so the bundle's
+            // draft sequence reads top-to-bottom on push.
             let targets: Vec<String> = if state.selected.is_empty() {
                 match state.drafts.get(state.focus) {
                     Some(d) => vec![d.id.clone()],
                     None => Vec::new(),
                 }
             } else {
-                // Preserve list order, not insertion order, so the
-                // bundle's draft sequence reads top-to-bottom on push.
                 state
                     .drafts
                     .iter()
@@ -327,11 +242,6 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char(':') => {
-            // Number-range select. The user types something like
-            //   1-5,8,12-15
-            // and we add those draft IDs to the selection on confirm.
-            // This matches the `pcr bundle --select` syntax so power
-            // users have one consistent grammar across CLI and TUI.
             if !state.drafts.is_empty() {
                 state.prompt = Some(Modal {
                     kind: ModalKind::RangeSelect,
@@ -341,74 +251,22 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char('J') => {
-            // Shift-J explicitly forces downward range select even when
-            // the user was previously moving up. Toggles current, sets
-            // direction = Down, then advances. After this, plain
-            // Space/Enter will keep moving down too.
             state.nav_dir = NavDir::Down;
-            if let Some(d) = state.drafts.get(state.focus) {
-                if state.selected.contains(&d.id) {
-                    state.selected.remove(&d.id);
-                } else {
-                    state.selected.insert(d.id.clone());
-                }
-            }
+            toggle_focused(state);
             advance_focus(state);
         }
         KeyCode::Char('K') => {
-            // Shift-K is the upward counterpart. Sets direction = Up
-            // so subsequent Space/Enter presses keep moving up.
             state.nav_dir = NavDir::Up;
-            if let Some(d) = state.drafts.get(state.focus) {
-                if state.selected.contains(&d.id) {
-                    state.selected.remove(&d.id);
-                } else {
-                    state.selected.insert(d.id.clone());
-                }
-            }
+            toggle_focused(state);
             advance_focus(state);
         }
         KeyCode::Char('p') if state.push_armed => {
-            // Push shortcut, only live during the post-bundle flash.
-            // Setting the outcome and breaking the loop hands control
-            // back to the caller, which tears down the TUI and runs
-            // `pcr push` with the terminal already restored — so push's
-            // own progress output renders normally instead of colliding
-            // with leftover ratatui frames.
+            // Hand control back to the caller so it can run `pcr push`
+            // with the terminal already restored.
             state.outcome = ShowOutcome::PushAfterExit;
             return false;
         }
-        KeyCode::Char('d') => {
-            // Delete the focused draft from the local store and drop it
-            // from the in-memory list. Cursor is moved to the nearest
-            // surviving sibling. No confirmation modal — the user is
-            // explicitly choosing this and the action is local-only
-            // (nothing was pushed); if they want it back, the original
-            // session in Cursor / Claude Code will re-capture it on the
-            // next watcher pass.
-            if let Some(d) = state.drafts.get(state.focus).cloned() {
-                let display_idx = state.focus + 1;
-                state.selected.remove(&d.id);
-                match crate::store::delete_drafts(std::slice::from_ref(&d.id)) {
-                    Ok(()) => {
-                        state.drafts.remove(state.focus);
-                        if state.drafts.is_empty() {
-                            state.focus = 0;
-                            state.list_state.select(None);
-                        } else {
-                            if state.focus >= state.drafts.len() {
-                                state.focus = state.drafts.len() - 1;
-                            }
-                            state.list_state.select(Some(state.focus));
-                        }
-                        state.copy_flash = Some((format!("Deleted draft #{display_idx}"), 4));
-                    }
-                    Err(e) => {
-                        state.copy_flash = Some((format!("Delete failed: {e}"), 6));
-                    }
-                }
-            }
-        }
+        KeyCode::Char('d') => delete_focused(state),
         KeyCode::Char('?') => {
             state.copy_flash = Some((
                 "j/k move · enter/space select · J/K select+move · : range (1-5,8) · a all · b bundle · p push · c copy · d delete · q quit"
@@ -421,10 +279,45 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
     true
 }
 
-/// Key dispatch while a modal prompt is on screen. Returns false to
-/// quit the TUI (we never quit from inside the prompt — Esc just
-/// dismisses the prompt itself, matching how every other modal in
-/// Cursor / VS Code works).
+fn toggle_focused(state: &mut ShowState) {
+    if let Some(d) = state.drafts.get(state.focus) {
+        if !state.selected.insert(d.id.clone()) {
+            state.selected.remove(&d.id);
+        }
+    }
+}
+
+/// Delete the focused draft from the store and drop it from the list.
+/// No confirmation: the action is local-only and the original session
+/// will re-capture the prompt on the next watcher pass if needed.
+fn delete_focused(state: &mut ShowState) {
+    let Some(d) = state.drafts.get(state.focus).cloned() else {
+        return;
+    };
+    let display_idx = state.focus + 1;
+    state.selected.remove(&d.id);
+    match crate::store::delete_drafts(std::slice::from_ref(&d.id)) {
+        Ok(()) => {
+            state.drafts.remove(state.focus);
+            if state.drafts.is_empty() {
+                state.focus = 0;
+                state.list_state.select(None);
+            } else {
+                if state.focus >= state.drafts.len() {
+                    state.focus = state.drafts.len() - 1;
+                }
+                state.list_state.select(Some(state.focus));
+            }
+            state.copy_flash = Some((format!("Deleted draft #{display_idx}"), 4));
+        }
+        Err(e) => {
+            state.copy_flash = Some((format!("Delete failed: {e}"), 6));
+        }
+    }
+}
+
+/// Key dispatch while a modal prompt is on screen. Esc / empty-buf q
+/// dismiss the prompt; the TUI itself never quits from inside a modal.
 fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
     let Some(prompt) = state.prompt.as_mut() else {
         return true;
@@ -447,23 +340,19 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char(c) => {
-            // Treat Ctrl-U as line-clear; `q` while the buffer is
-            // empty is a cancel shortcut (matches the user's
-            // expectation that q always quits whatever modal they're
-            // in). Once they've typed anything, q is a literal
-            // character — otherwise you could never type a bundle
-            // name containing a `q`.
+            // q only cancels when the buffer is empty; once the user
+            // has typed anything it becomes a literal so bundle names
+            // containing "q" stay reachable.
             if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
                 prompt.buf.clear();
             } else if (c == 'q' || c == 'Q') && prompt.buf.is_empty() {
                 let kind = prompt.kind;
                 state.prompt = None;
                 state.copy_flash = Some((cancel_flash(kind).into(), 3));
-            } else if !k.modifiers.contains(KeyModifiers::CONTROL) {
-                // Soft cap so a runaway paste can't blow the terminal width.
-                if prompt.buf.chars().count() < 120 {
-                    prompt.buf.push(c);
-                }
+            } else if !k.modifiers.contains(KeyModifiers::CONTROL)
+                && prompt.buf.chars().count() < 120
+            {
+                prompt.buf.push(c);
             }
         }
         _ => {}
@@ -491,10 +380,8 @@ fn confirm_bundle_modal(state: &mut ShowState, name: String) {
     state.prompt = None;
     match create_bundle_from_targets(&name, &targets) {
         Ok(count) => {
-            // Drop bundled drafts from the in-memory list so the user
-            // can immediately see they've moved out of the draft pool.
-            // The store has already migrated them to the bundle in the
-            // same transaction.
+            // Drop bundled drafts from the in-memory list — the store
+            // has already moved them out of the draft pool.
             let bundled: HashSet<String> = targets.into_iter().collect();
             state.drafts.retain(|d| !bundled.contains(&d.id));
             state.selected.retain(|id| !bundled.contains(id));
@@ -559,8 +446,6 @@ fn confirm_range_select_modal(state: &mut ShowState, expr: String) {
     ));
 }
 
-/// Tiny pluralizer helper local to this file — `crate::util::text::plural`
-/// returns "s" or "" but we want it inline without the import dance.
 fn plural(n: usize) -> &'static str {
     if n == 1 {
         ""
@@ -569,76 +454,55 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-/// Make a single line of user-supplied text safe to feed into ratatui's
-/// `Paragraph` widget.
-///
-/// `Paragraph` + `Wrap { trim: false }` doesn't expand tabs before
-/// counting display width, so a `\t` in a markdown-style table prompt
-/// makes the wrap calculation drift by 7 columns per occurrence — the
-/// visible result is text that spills past the right edge into mid-
-/// word fragments and looks like ghosting. Same problem with raw ANSI
-/// escape bytes (cursor moves, color codes), and with NULs / vertical
-/// tabs / carriage returns. We strip or replace anything that doesn't
-/// occupy exactly its character-count's worth of display columns.
-///
-/// Newlines aren't stripped here — the caller already split on them
-/// before passing each line in.
+/// Strip / normalize control bytes so each remaining `char` occupies
+/// exactly one display column. Without this, tabs and ANSI escapes
+/// throw off `Paragraph`'s wrap calculation and lines spill past the
+/// right edge as mid-word fragments.
 fn sanitize_for_display(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\t' => out.push_str("    "), // 4 spaces — readable, predictable width
-            '\u{1b}' => {
-                // ESC starts an escape sequence. The two we actually
-                // see in real-world prompt / response text are CSI
-                // (`ESC [`) for SGR colors / cursor moves and OSC
-                // (`ESC ]`) for window titles / hyperlinks. Drop the
-                // whole sequence including its terminator.
-                match chars.peek() {
-                    Some(&'[') => {
-                        chars.next();
-                        // CSI ends at the first byte in the 0x40-0x7e
-                        // range; everything before that is a parameter
-                        // or intermediate byte.
-                        for p in chars.by_ref() {
-                            if matches!(p, '\u{40}'..='\u{7e}') {
-                                break;
-                            }
-                        }
-                    }
-                    Some(&']') => {
-                        chars.next();
-                        // OSC ends at BEL (0x07) or ST (`ESC \`).
-                        while let Some(p) = chars.next() {
-                            if p == '\u{07}' {
-                                break;
-                            }
-                            if p == '\u{1b}' && chars.peek() == Some(&'\\') {
-                                chars.next();
-                                break;
-                            }
-                        }
-                    }
-                    _ => {
-                        // Bare ESC or a sequence we don't recognize:
-                        // drop the ESC alone and let the next char
-                        // through normally.
-                    }
-                }
-            }
-            '\r' | '\u{0b}' | '\u{0c}' => {} // carriage return / vertical tab / form feed
-            c if c.is_control() => {}        // every other control char drops out silently
+            '\t' => out.push_str("    "),
+            '\u{1b}' => skip_escape_sequence(&mut chars),
+            '\r' | '\u{0b}' | '\u{0c}' => {}
+            c if c.is_control() => {}
             c => out.push(c),
         }
     }
     out
 }
 
-/// Move the focus one row in the user's last navigation direction,
-/// clamped to the list bounds. Shared by every "select-and-advance"
-/// keybinding (Space, Enter, Shift+J, Shift+K) so the auto-advance
-/// behavior is consistent across all of them.
+/// Consume an ANSI escape sequence after an ESC has already been read.
+/// Handles CSI (`ESC [ … final`) and OSC (`ESC ] … BEL` or `ESC \`);
+/// any other introducer leaves the next char to be processed normally.
+fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.peek() {
+        Some(&'[') => {
+            chars.next();
+            for p in chars.by_ref() {
+                if matches!(p, '\u{40}'..='\u{7e}') {
+                    break;
+                }
+            }
+        }
+        Some(&']') => {
+            chars.next();
+            while let Some(p) = chars.next() {
+                if p == '\u{07}' {
+                    break;
+                }
+                if p == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Move focus one row in the last navigation direction, clamped.
 fn advance_focus(state: &mut ShowState) {
     if state.drafts.is_empty() {
         return;
@@ -656,16 +520,13 @@ fn advance_focus(state: &mut ShowState) {
     state.list_state.select(Some(state.focus));
 }
 
-/// Create a sealed bundle from the given draft IDs, mirroring the
-/// non-interactive `pcr bundle "name" --select` codepath. Returns the
-/// number of drafts actually bundled or a user-facing error string.
+/// Create a sealed bundle from `draft_ids_in`, mirroring the
+/// `pcr bundle "name" --select` codepath. Returns the number of
+/// drafts actually bundled.
 fn create_bundle_from_targets(name: &str, draft_ids_in: &[String]) -> Result<usize, String> {
     if draft_ids_in.is_empty() {
         return Err("nothing to bundle".into());
     }
-    // Pull the same draft pool the non-interactive path sees so we can
-    // map the IDs back into full records and inherit the same project
-    // attribution rules.
     let ctx = resolve();
     let drafts = store::get_drafts_by_status(store::DraftStatus::Draft, &ctx.ids, &ctx.names)
         .map_err(|e| e.to_string())?;
@@ -704,17 +565,9 @@ fn create_bundle_from_targets(name: &str, draft_ids_in: &[String]) -> Result<usi
 fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     let area = frame.area();
 
-    // Bulletproof clear of the whole frame before anything else
-    // renders. The previous body-only Clear didn't fully fix the
-    // ghosting problem; users still saw stale text fragments at the
-    // right edge after rapid scrolls. The cause appears to be
-    // `Paragraph` + `Wrap { trim: false }` not always writing every
-    // cell of its target area when the wrap layout shifts between
-    // frames — combined with ratatui's diff-render only emitting
-    // changed cells. Clearing the full screen up front means the
-    // first thing ratatui sees in the new buffer is "every cell is
-    // default", which forces the diff to overwrite anything stale
-    // from the previous frame.
+    // Defense against `Paragraph` + `Wrap` leaving cells unwritten when
+    // the layout reflows between frames; clears the whole frame so
+    // ratatui's diff overwrites anything stale.
     frame.render_widget(Clear, area);
 
     let chunks = Layout::default()
@@ -750,12 +603,8 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
         return;
     }
 
-    // Drop the right sidebar entirely when the focused draft has nothing
-    // to put in it — empty `Changed files` + empty `Tool calls` panes
-    // are just two boxes of unused chrome stealing 28 columns from the
-    // detail pane (the place the user is actually reading). The user
-    // explicitly asked for this; Cursor drafts in particular almost
-    // always hit this case because we don't capture their tool calls.
+    // Reflow to a 2-column layout when the sidebar would be empty so
+    // the detail pane absorbs those 28 columns.
     let show_sidebar = focused_has_sidebar_content(state);
     let cols = if show_sidebar {
         Layout::default()
@@ -783,21 +632,16 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     }
     draw_footer(frame, chunks[2], state);
 
-    // Modal overlay last so it paints on top of the list / detail.
     if state.prompt.is_some() {
         draw_name_prompt(frame, chunks[1], state);
     }
 }
 
-/// Centered overlay that takes user input for the bundle name.
-/// Rendered on top of the body chunk after the list / detail / sidebar
-/// are drawn, with `Clear` to wipe whatever was underneath the box.
+/// Centered modal overlay for the active prompt.
 fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
     let Some(prompt) = state.prompt.as_ref() else {
         return;
     };
-    // Box: 60 cols wide (or body width), 5 rows tall, centered horizontally,
-    // anchored a little above body center so the user's eyes find it fast.
     let width = 64.min(body.width.saturating_sub(4));
     let height = 7u16;
     let x = body.x + body.width.saturating_sub(width) / 2;
@@ -847,9 +691,8 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
         chunks[0],
     );
 
-    // Input line with a trailing block cursor so the user can see where
-    // they're typing. We append `▌` rather than relying on terminal
-    // cursor positioning — much simpler and works under tmux/screen.
+    // Trailing block cursor instead of terminal cursor positioning so
+    // the modal renders identically under tmux / screen.
     let cursor_style = Style::default().add_modifier(Modifier::SLOW_BLINK);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -873,24 +716,10 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
-    // Each row is `NNN preview`. The leading mark + pointer columns
-    // are gone — state lives on the number's color instead:
-    //
-    //   focused              → blue index, normal preview
-    //   selected             → green index, bold-white preview
-    //   focused + selected   → green index (selection dominates), bold
-    //                          white preview
-    //   neither              → muted index, normal preview
-    //
-    // The user's eyes still scan left-to-right; the colored number is
-    // the strongest at-a-glance signal for "where am I" and "what's
-    // marked". No glyph column means another two columns flow into
-    // the prompt preview.
-    //
-    // Width budget:
-    //   index(3) + space(1) = 4
-    //   preview = inner_width - 4
-    const FIXED_PREFIX: usize = 4;
+    // Row format: `NNN preview`. State lives on the index color
+    // (focused = blue, selected = green; selection wins when both
+    // apply). No mark / pointer column.
+    const FIXED_PREFIX: usize = 4; // 3-wide index + 1 separator space
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
     let preview_max = inner_width
@@ -906,9 +735,6 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             let is_selected = state.selected.contains(&d.id);
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
 
-            // Per-state styling. Selection is the more important state
-            // (it's what `b` will operate on) so green wins over blue
-            // when both apply.
             let bold_white = Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD);
@@ -937,23 +763,14 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         .collect();
 
     let mut ls = state.list_state.clone();
-    // Bias the scroll so the focused row sits near the vertical center
-    // of the viewport (instead of being pinned to whichever edge the
-    // user is moving toward). When the focus is near the top or bottom
-    // we clamp so we don't scroll past the data and leave empty rows.
-    // Without this, navigating up from the bottom kept the cursor
-    // permanently glued to the last row — there was always a blank
-    // expanse above and zero context below.
-    let visible_rows = (area.height as usize).saturating_sub(2); // minus borders
+    // Center the focused row in the viewport, clamped at the ends.
+    let visible_rows = (area.height as usize).saturating_sub(2);
     if visible_rows > 0 && state.drafts.len() > visible_rows {
         let half = visible_rows / 2;
         let max_offset = state.drafts.len().saturating_sub(visible_rows);
         let desired = state.focus.saturating_sub(half).min(max_offset);
         *ls.offset_mut() = desired;
     }
-    // Title shows the selection count when something is marked, so the
-    // user has constant feedback on how many drafts will go into a
-    // bundle if they hit `b`.
     let title = if state.selected.is_empty() {
         format!(" Drafts · {} ", state.drafts.len())
     } else {
@@ -1077,24 +894,14 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         ]));
     }
 
-    // Belt + suspenders: explicitly clear the inner area before the
-    // Paragraph renders. The frame-level Clear at the top of `draw`
-    // already covers this in theory, but `Paragraph` + `Wrap { trim:
-    // false }` is the specific widget where leftover cells have been
-    // observed leaking through, so we clear once more right before its
-    // render. Cheap (one buffer pass over the inner rect) and removes
-    // every realistic source of stale content for this pane.
+    // Pre-clear the Paragraph target — see `draw` for context.
     frame.render_widget(Clear, inner);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
 }
 
-/// True when the focused draft has anything worth rendering in the
-/// right sidebar. Drives whether `draw` reserves the 28-column slot
-/// at all — when both the changed-files list and the tool-call summary
-/// are empty, those columns go to the detail pane instead. Mirrors
-/// the same data lookups `draw_sidebar` performs so the two stay in
-/// sync as `file_context` schemas evolve.
+/// Whether the focused draft has anything to put in the right sidebar.
+/// Must mirror `draw_sidebar`'s data lookups.
 fn focused_has_sidebar_content(state: &ShowState) -> bool {
     let Some(d) = state.drafts.get(state.focus) else {
         return false;
@@ -1166,12 +973,8 @@ fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
 
     let summary = crate::display::summarize_tools(&d.tool_calls);
     let lines = if summary.is_empty() {
-        // Distinguish "agent ran with no tools" (claude-code, vscode)
-        // from "tool calls aren't captured for this source at all"
-        // (cursor — its bubble store doesn't expose structured tool
-        // events the way the other watchers do). Saying "no tools used"
-        // for a cursor draft was actively misleading: the agent often
-        // *did* use tools, we just don't see them.
+        // Cursor doesn't expose tool calls; everything else does, so
+        // "no tools used" is only accurate for those sources.
         let msg = match d.source.as_str() {
             "cursor" => "  (tool calls aren't captured for cursor)",
             _ => "  (no tools used)",
@@ -1224,9 +1027,6 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         Span::styled("q", theme::accent()),
         Span::styled(" quit", theme::dim()),
     ];
-    // When the recency cap hid older drafts, surface the count + the
-    // exact command to widen the view. Otherwise the user just sees
-    // "Drafts · 100" and assumes that's everything they have.
     if state.hidden_count > 0 {
         hints.push(Span::styled("   ", theme::dim()));
         hints.push(Span::styled(
@@ -1246,9 +1046,8 @@ fn short_path(p: &str) -> String {
     format!("…/{}", tail.join("/"))
 }
 
-/// Best-effort clipboard copy. Uses `pbcopy` on macOS, `xclip` / `wl-copy`
-/// on Linux, `clip.exe` on Windows. Returns false if no clipboard tool is
-/// available — the caller flashes a message either way.
+/// Best-effort clipboard copy via `pbcopy` / `wl-copy` / `xclip` /
+/// `xsel` / `clip.exe`. Returns false when no tool was available.
 fn copy_to_clipboard(text: &str) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1301,11 +1100,8 @@ mod sanitize_tests {
 
     #[test]
     fn ansi_csi_sequences_are_stripped() {
-        // SGR color reset: ESC [ 0 m
         assert_eq!(sanitize_for_display("\u{1b}[0mhello"), "hello");
-        // Foreground color: ESC [ 3 1 m
         assert_eq!(sanitize_for_display("\u{1b}[31mred\u{1b}[0m"), "red");
-        // Cursor move: ESC [ 1 0 ; 5 H
         assert_eq!(sanitize_for_display("a\u{1b}[10;5Hb"), "ab");
     }
 
@@ -1326,11 +1122,7 @@ mod sanitize_tests {
     }
 
     #[test]
-    fn realistic_markdown_table_row_renders_cleanly() {
-        // The exact shape that broke the user's screenshot: tab-
-        // separated columns with prose in the third column. After
-        // sanitization the line is all printable + spaces and any
-        // wrap calc will count its display width correctly.
+    fn tab_separated_table_row_has_no_tabs() {
         let input = "GitHub Copilot Reviews\tAI reviews diffs\tPCR puts humans in the loop";
         let out = sanitize_for_display(input);
         assert!(!out.contains('\t'));

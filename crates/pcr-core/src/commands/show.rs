@@ -44,16 +44,14 @@ fn draft_cursor_mode(d: &DraftRecord) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Mirrors `bundle.rs::filter_with_changed_files`: a passthrough today,
-/// kept as a function so any future opt-in "hide agent turns with no
-/// edits" filter has an obvious place to live.
+/// Mirrors `bundle.rs::filter_with_changed_files`. Currently a
+/// passthrough; reserved for a future opt-in "hide no-edit agent
+/// turns" filter.
 fn filter_with_changed_files(drafts: Vec<DraftRecord>) -> Vec<DraftRecord> {
     drafts
 }
 
 pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
-    // Parse the optional draft number. Empty / missing means "open at
-    // the newest draft" — same as `pcr bundle` with no args.
     let parsed_n: Option<usize> = match args.number.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(s) => match s.parse::<usize>() {
@@ -66,10 +64,7 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
         },
     };
 
-    // TUI / pretty mode: `pcr show` and `pcr bundle` are the same
-    // experience. Delegate to the shared browser. Without a number we
-    // open at the newest draft (= `pcr bundle` no-args). With a number
-    // we focus on that draft, expanding past the recency cap if needed.
+    // TUI mode: `pcr show` is just `pcr bundle` opened to a focus.
     if agent::is_tui_eligible(mode) {
         return crate::commands::bundle::browse_drafts(
             args.repo.as_deref(),
@@ -79,9 +74,6 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
         );
     }
 
-    // Plain / JSON paths below want a specific draft. Without a number
-    // there's no single record to print, so point the user at `pcr log`
-    // (the canonical scriptable list) and at the TUI.
     let Some(n) = parsed_n else {
         display::print_error("show", "draft number required in plain / JSON mode");
         display::print_hint(
