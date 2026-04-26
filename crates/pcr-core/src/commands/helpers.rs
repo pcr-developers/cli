@@ -26,3 +26,63 @@ pub fn current_branch() -> String {
         b
     }
 }
+
+/// Default ceiling on how many drafts the interactive browser shows
+/// without `--all`. Heavy users accumulate hundreds of drafts and the
+/// list becomes unscannable; this bounds the visible set to the most
+/// recent slice while leaving the full history reachable via `--all`
+/// or `pcr gc --drafts-older-than`.
+pub const DEFAULT_RECENT_DRAFTS_CAP: usize = 100;
+
+/// Drop everything but the most recent `cap` entries from a draft list
+/// that's already sorted ascending by `captured_at`. Returns the kept
+/// slice plus the number that was hidden so the TUI can advertise the
+/// truncation.
+pub fn cap_recent_drafts(drafts: Vec<DraftRecord>, cap: usize) -> (Vec<DraftRecord>, usize) {
+    if drafts.len() <= cap {
+        return (drafts, 0);
+    }
+    let hidden = drafts.len() - cap;
+    let kept = drafts.into_iter().skip(hidden).collect();
+    (kept, hidden)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(id: &str) -> DraftRecord {
+        DraftRecord {
+            id: id.into(),
+            ..DraftRecord::default()
+        }
+    }
+
+    #[test]
+    fn cap_keeps_full_list_under_threshold() {
+        let drafts = vec![d("a"), d("b"), d("c")];
+        let (kept, hidden) = cap_recent_drafts(drafts, 10);
+        assert_eq!(hidden, 0);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn cap_drops_oldest_when_over_threshold() {
+        let drafts = vec![d("a"), d("b"), d("c"), d("d"), d("e")];
+        let (kept, hidden) = cap_recent_drafts(drafts, 3);
+        assert_eq!(hidden, 2);
+        // Oldest two ("a","b") are dropped; newest three ("c","d","e") kept.
+        assert_eq!(
+            kept.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "d", "e"]
+        );
+    }
+
+    #[test]
+    fn cap_at_exact_size_is_a_noop() {
+        let drafts = vec![d("a"), d("b")];
+        let (kept, hidden) = cap_recent_drafts(drafts, 2);
+        assert_eq!(hidden, 0);
+        assert_eq!(kept.len(), 2);
+    }
+}

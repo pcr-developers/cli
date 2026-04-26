@@ -164,12 +164,18 @@ pub struct BundleArgs {
     /// Filter drafts to only those touching a specific repo (e.g. cli, pcr-dev)
     #[arg(long)]
     pub repo: Option<String>,
+    /// Show every draft, not just the most recent ones (default cap: 100)
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args, Clone, Default)]
 pub struct ShowArgs {
     /// Draft number (1-based) — get one from `pcr log`
     pub number: String,
+    /// Show every draft in the browser, not just the most recent ones (default cap: 100)
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args, Clone, Default)]
