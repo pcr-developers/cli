@@ -47,7 +47,7 @@ pcr login                                # one-time browser auth (skip for local
 cd ~/code/your-repo
 pcr init                                 # register the current git repo
 pcr start                                # leave running while you work in your editor
-pcr bundle "auth refactor" --select all  # group captured prompts as a named bundle
+pcr bundle "auth refactor"               # opens the TUI: pick drafts, press b → enter
 pcr push                                 # upload to pcr.dev for team review
 ```
 
@@ -66,7 +66,7 @@ Cursor / Claude Code / Copilot
    pcr start ─────────▶ ~/.pcr-dev/drafts.db
        │
        ▼
-   pcr bundle "name" --select 1-5     (group N drafts as one named artifact)
+   pcr bundle "name"                  (TUI: select drafts, press b → enter)
        │
        ▼
    pcr push      ────▶ pcr.dev      (reviewers comment on prompts as they would on code)
@@ -93,7 +93,7 @@ the diff it produced.
 | `pcr status` | Auth · projects · pipeline overview |
 | `pcr log` | Captured prompts and bundles for the current repo |
 | `pcr show <n>` | Open one draft in the full-screen browser |
-| `pcr bundle <name>` | Group drafts into a named bundle |
+| `pcr bundle [name]` | Open the interactive bundle browser (name pre-fills the modal) |
 | `pcr push` | Upload sealed bundles to pcr.dev |
 | `pcr pull <id>` | Restore a pushed bundle to local drafts |
 | `pcr gc` | Reclaim local-store space |
@@ -140,7 +140,7 @@ Falls back to plain stderr lines when stdout isn't a TTY, `CI=1`, `NO_COLOR` is 
 
 ```bash
 pcr --json status
-pcr --plain bundle "agent run" --select all && pcr --plain push
+pcr --plain bundle "agent run" --select all && pcr --plain push   # plain mode keeps --select for scripts
 ```
 
 ## Privacy

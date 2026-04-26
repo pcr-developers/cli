@@ -70,12 +70,22 @@ pub fn run(mode: OutputMode, args: BundleArgs) -> ExitCode {
         return run_bundle_add(&name, sel);
     }
 
+    // `pcr bundle "name"` in a TTY opens the TUI on the Drafts view
+    // with the name pre-seeded into the bundle modal. The user picks
+    // drafts, presses `b` + enter, and the bundle is sealed without
+    // them retyping the name. Plain / JSON modes keep `--select` for
+    // CI scripts.
     if !name.is_empty() {
+        if agent::is_tui_eligible(mode) {
+            return run_bundle_browse_with_name(
+                args.repo.as_deref(),
+                args.all,
+                Some(name.clone()),
+                crate::tui::screens::show::InitialView::Drafts,
+            );
+        }
         if let Some(sel) = args.select.as_deref() {
             return run_bundle_create(&name, sel, args.repo.as_deref());
-        }
-        if agent::is_interactive_terminal() {
-            return run_bundle_interactive(&name, args.repo.as_deref());
         }
         return run_bundle_show_hint(&name, args.repo.as_deref());
     }
@@ -86,21 +96,29 @@ pub fn run(mode: OutputMode, args: BundleArgs) -> ExitCode {
     // diff, and supports `d` to delete stale ones inline. Plain mode
     // keeps the historical line dump for scripts and agents.
     if agent::is_tui_eligible(mode) {
-        return run_bundle_browse(args.repo.as_deref(), args.all);
+        return run_bundle_browse_with_name(
+            args.repo.as_deref(),
+            args.all,
+            None,
+            crate::tui::screens::show::InitialView::Bundles,
+        );
     }
     run_bundle_overview(args.repo.as_deref())
 }
 
-fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
-    // `pcr bundle` opens on the Bundles view by default — the command
-    // name implies bundle-level work, not draft scrolling. Use Tab /
-    // arrow keys to switch to drafts.
-    browse_drafts_with_view(
+fn run_bundle_browse_with_name(
+    repo_filter: Option<&str>,
+    show_all: bool,
+    prefill_bundle_name: Option<String>,
+    initial_view: crate::tui::screens::show::InitialView,
+) -> ExitCode {
+    browse_drafts_full(
         repo_filter,
         show_all,
         None,
         "bundle",
-        crate::tui::screens::show::InitialView::Bundles,
+        initial_view,
+        prefill_bundle_name,
     )
 }
 
@@ -131,6 +149,17 @@ pub fn browse_drafts_with_view(
     focus_number: Option<usize>,
     caller: &str,
     initial_view: crate::tui::screens::show::InitialView,
+) -> ExitCode {
+    browse_drafts_full(repo_filter, show_all, focus_number, caller, initial_view, None)
+}
+
+pub fn browse_drafts_full(
+    repo_filter: Option<&str>,
+    show_all: bool,
+    focus_number: Option<usize>,
+    caller: &str,
+    initial_view: crate::tui::screens::show::InitialView,
+    prefill_bundle_name: Option<String>,
 ) -> ExitCode {
     sync_latest_prompts();
     let ctx = resolve();
@@ -190,11 +219,12 @@ pub fn browse_drafts_with_view(
         }
     };
 
-    match crate::tui::screens::show::run_focused_with_view(
+    match crate::tui::screens::show::run_focused_with_view_and_prefill(
         display_drafts,
         focus,
         hidden,
         initial_view,
+        prefill_bundle_name,
     ) {
         Ok(crate::tui::screens::show::ShowOutcome::PushAfterExit) => {
             crate::commands::push::run(crate::agent::OutputMode::Auto)
@@ -574,35 +604,6 @@ fn render_draft_list(title: &str, all: &[DraftRecord], proj_by_id: &BTreeMap<Str
         ));
     }
     display::eprintln("");
-}
-
-fn run_bundle_interactive(name: &str, repo_filter: Option<&str>) -> ExitCode {
-    let ctx = resolve();
-    let proj_by_id = load_proj_by_id();
-    let repo_filter = repo_filter.unwrap_or("");
-    let all = get_available_drafts(&ctx, repo_filter, &proj_by_id).unwrap_or_default();
-    if all.is_empty() {
-        display::eprintln("PCR: No draft prompts available.");
-        return ExitCode::Success;
-    }
-    let mut title = "Draft prompts".to_string();
-    if !repo_filter.is_empty() {
-        title.push_str(&format!("  (repo: {repo_filter})"));
-    }
-    render_draft_list(&title, &all, &proj_by_id);
-
-    display::eprint("Select prompts [e.g. 1-5, 1,3,7, or all — enter to cancel]: ");
-    let mut buf = String::new();
-    if std::io::stdin().read_line(&mut buf).is_err() {
-        display::eprintln("\nPCR: Cancelled.");
-        return ExitCode::Success;
-    }
-    let resp = buf.trim().to_string();
-    if resp.is_empty() {
-        display::eprintln("PCR: Cancelled.");
-        return ExitCode::Success;
-    }
-    run_bundle_create(name, &resp, Some(repo_filter))
 }
 
 fn run_bundle_show_hint(name: &str, repo_filter: Option<&str>) -> ExitCode {

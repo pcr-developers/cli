@@ -76,6 +76,19 @@ pub fn run_focused_with_view(
     hidden_count: usize,
     initial_view: InitialView,
 ) -> Result<ShowOutcome> {
+    run_focused_with_view_and_prefill(drafts, initial_focus, hidden_count, initial_view, None)
+}
+
+/// Same as `run_focused_with_view` but seeds the next bundle modal's
+/// name input. Used by `pcr bundle "name"` so the user just selects
+/// drafts and hits `b` + enter without retyping the name.
+pub fn run_focused_with_view_and_prefill(
+    drafts: Vec<DraftRecord>,
+    initial_focus: usize,
+    hidden_count: usize,
+    initial_view: InitialView,
+    prefill_bundle_name: Option<String>,
+) -> Result<ShowOutcome> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
     let focus = if drafts.is_empty() {
@@ -102,6 +115,9 @@ pub fn run_focused_with_view(
         bundles: load_bundles(),
         bundle_focus: 0,
         bundles_state: ListState::default(),
+        prefill_bundle_name: prefill_bundle_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     };
     state.list_state.select(Some(focus));
     if !state.bundles.is_empty() {
@@ -165,6 +181,11 @@ struct ShowState {
     bundles: Vec<PromptCommit>,
     bundle_focus: usize,
     bundles_state: ListState,
+    /// Optional bundle name supplied on the CLI (`pcr bundle "name"`).
+    /// Used as the default text in the bundle modal's name input the
+    /// first time it's opened, then cleared so subsequent `b` presses
+    /// start with an empty input.
+    prefill_bundle_name: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -211,6 +232,9 @@ enum ModalKind {
     /// `:`: prompt for a `1-5,8,12-15` range; on confirm union those
     /// indices into `state.selected`.
     RangeSelect,
+    /// `d` with selection: confirm deleting every selected draft.
+    /// Targets are snapshotted into `Modal.targets` at open.
+    DeleteDrafts,
 }
 
 fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
@@ -313,14 +337,20 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 ));
             } else {
                 let bundle_choices = bundle_choices_from(&state.bundles);
-                let pick = if bundle_choices.is_empty() {
+                // Pre-fill the input with the CLI-supplied name (one-shot).
+                // If we prefill a name, anchor focus on the input so
+                // enter creates a new bundle with that name instead of
+                // adding to the highlighted existing bundle.
+                let prefill = state.prefill_bundle_name.take();
+                let has_prefill = prefill.is_some();
+                let pick = if bundle_choices.is_empty() || has_prefill {
                     None
                 } else {
                     Some(0)
                 };
                 state.prompt = Some(Modal {
                     kind: ModalKind::Bundle,
-                    buf: String::new(),
+                    buf: prefill.unwrap_or_default(),
                     targets,
                     bundle_choices,
                     pick,
@@ -354,10 +384,20 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             state.outcome = ShowOutcome::PushAfterExit;
             return false;
         }
-        KeyCode::Char('d') => delete_focused(state),
+        KeyCode::Char('d') => {
+            // Multi-select: open a confirmation modal so a stray `d`
+            // can't wipe a dozen drafts. Single focused row keeps the
+            // historical no-confirmation behaviour — fast to undo by
+            // re-running the source watcher.
+            if state.selected.is_empty() {
+                delete_focused(state);
+            } else {
+                open_delete_drafts_modal(state);
+            }
+        }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "j/k move · enter/space select · J/K select+move · : range · a all · b bundle · p push · tab bundles view · c copy · d delete · q quit"
+                "j/k move · enter/space select · J/K select+move · : range · a all · b bundle · p push · tab bundles view · c copy · d delete (focused, or all selected with confirmation) · q quit"
                     .into(),
                 14,
             ));
@@ -371,6 +411,68 @@ fn toggle_focused(state: &mut ShowState) {
     if let Some(d) = state.drafts.get(state.focus) {
         if !state.selected.insert(d.id.clone()) {
             state.selected.remove(&d.id);
+        }
+    }
+}
+
+/// Snapshot the current selection into a `DeleteDrafts` modal so the
+/// user can confirm wiping every selected draft in one go. Uses
+/// `state.drafts` ordering (not the HashSet's) so the count rendered
+/// in the modal matches what the user sees in the list.
+fn open_delete_drafts_modal(state: &mut ShowState) {
+    let targets: Vec<String> = state
+        .drafts
+        .iter()
+        .filter(|d| state.selected.contains(&d.id))
+        .map(|d| d.id.clone())
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    state.prompt = Some(Modal {
+        kind: ModalKind::DeleteDrafts,
+        buf: String::new(),
+        targets,
+        bundle_choices: Vec::new(),
+        pick: None,
+    });
+}
+
+/// Delete every draft in `target_ids` from the store and drop them
+/// from the in-memory list. Re-anchors focus and clears each id from
+/// the active selection set on success.
+fn confirm_delete_drafts_modal(state: &mut ShowState) {
+    let targets = state
+        .prompt
+        .as_mut()
+        .map(|p| std::mem::take(&mut p.targets))
+        .unwrap_or_default();
+    state.prompt = None;
+    if targets.is_empty() {
+        return;
+    }
+    let total = targets.len();
+    match crate::store::delete_drafts(&targets) {
+        Ok(()) => {
+            let removed: HashSet<String> = targets.into_iter().collect();
+            state.drafts.retain(|d| !removed.contains(&d.id));
+            state.selected.retain(|id| !removed.contains(id));
+            if state.drafts.is_empty() {
+                state.focus = 0;
+                state.list_state.select(None);
+            } else {
+                if state.focus >= state.drafts.len() {
+                    state.focus = state.drafts.len() - 1;
+                }
+                state.list_state.select(Some(state.focus));
+            }
+            state.copy_flash = Some((
+                format!("Deleted {total} draft{}", plural(total)),
+                4,
+            ));
+        }
+        Err(e) => {
+            state.copy_flash = Some((format!("Delete failed: {e}"), 6));
         }
     }
 }
@@ -548,13 +650,28 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     None => confirm_bundle_modal(state, buf),
                 },
                 ModalKind::RangeSelect => confirm_range_select_modal(state, buf),
+                ModalKind::DeleteDrafts => confirm_delete_drafts_modal(state),
             }
         }
         KeyCode::Char(c) => {
-            // q only cancels when the buffer is empty; once the user
-            // has typed anything it becomes a literal so bundle names
-            // containing "q" stay reachable.
-            if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
+            // The delete modal is confirm-only — `y` doubles as
+            // confirm and `n` / `q` cancel, matching the muscle memory
+            // most CLI prompts have. Typing into the buffer is
+            // disabled so a stray keystroke can't sneak past it.
+            if prompt.kind == ModalKind::DeleteDrafts {
+                match c {
+                    'y' | 'Y' => confirm_delete_drafts_modal(state),
+                    'n' | 'N' | 'q' | 'Q' => {
+                        let kind = prompt.kind;
+                        state.prompt = None;
+                        state.copy_flash = Some((cancel_flash(kind).into(), 3));
+                    }
+                    _ => {}
+                }
+            } else if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
+                // q only cancels when the buffer is empty; once the
+                // user has typed anything it becomes a literal so
+                // bundle names containing "q" stay reachable.
                 prompt.buf.clear();
                 if prompt.kind == ModalKind::Bundle {
                     prompt.pick = None;
@@ -581,6 +698,7 @@ fn cancel_flash(kind: ModalKind) -> &'static str {
     match kind {
         ModalKind::Bundle => "Bundle cancelled.",
         ModalKind::RangeSelect => "Range select cancelled.",
+        ModalKind::DeleteDrafts => "Delete cancelled.",
     }
 }
 
@@ -884,7 +1002,11 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
 
     HeaderBar {
         version: VERSION.to_string(),
-        user: None,
+        // Mirror the status screen: read the on-disk auth blob each
+        // frame so the header reflects logout/login that happened in
+        // another terminal without us having to plumb auth state
+        // through the whole show / bundle plumbing.
+        user: crate::auth::load().map(|a| a.user_id),
         command: "show",
         clock: local_hms(),
     }
@@ -911,7 +1033,8 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
                 theme::dim(),
             )),
         ])
-        .alignment(Alignment::Left);
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false });
         frame.render_widget(empty, chunks[1]);
         draw_footer(frame, chunks[2], state);
         return;
@@ -972,28 +1095,34 @@ fn draw_bundles_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) 
     if state.bundles.is_empty() {
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        // The bundles list is a narrow column (≈36 cols); the hint
+        // text would otherwise get clipped at the right border. Wrap
+        // it explicitly so each line breaks at word boundaries.
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled("  No bundles yet.", theme::pending())),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Press ", theme::dim()),
-                Span::styled("Tab", theme::accent()),
-                Span::styled(" or ", theme::dim()),
+                Span::styled("tab", theme::accent()),
+                Span::styled(" / ", theme::dim()),
                 Span::styled("→", theme::accent()),
-                Span::styled(" to switch to drafts,", theme::dim()),
+                Span::styled(" to see prompts,", theme::dim()),
             ]),
             Line::from(vec![
                 Span::styled("  select with ", theme::dim()),
                 Span::styled("enter", theme::accent()),
                 Span::styled(" / ", theme::dim()),
                 Span::styled("space", theme::accent()),
-                Span::styled(", then ", theme::dim()),
+                Span::styled(",", theme::dim()),
+            ]),
+            Line::from(vec![
+                Span::styled("  then ", theme::dim()),
                 Span::styled("b", theme::accent()),
                 Span::styled(" to bundle.", theme::dim()),
             ]),
         ];
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         return;
     }
 
@@ -1131,7 +1260,7 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
     // pick from — cap at 16 rows so the picker stays scannable.
     let bundle_rows = match prompt.kind {
         ModalKind::Bundle => prompt.bundle_choices.len().min(8) as u16,
-        ModalKind::RangeSelect => 0,
+        ModalKind::RangeSelect | ModalKind::DeleteDrafts => 0,
     };
     let height = 7u16 + bundle_rows + if bundle_rows > 0 { 2 } else { 0 };
     let height = height.min(body.height.saturating_sub(2));
@@ -1152,11 +1281,28 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
             plural(prompt.targets.len())
         ),
         ModalKind::RangeSelect => " Select range · e.g. 1-5,8,12-15 ".to_string(),
+        ModalKind::DeleteDrafts => format!(
+            " Delete · {} draft{} ",
+            prompt.targets.len(),
+            plural(prompt.targets.len())
+        ),
+    };
+    // Lean on the destructive accent for delete so the modal can't be
+    // confused with the (additive) bundle / range modals.
+    let border_style = match prompt.kind {
+        ModalKind::DeleteDrafts => Style::default().fg(theme::DANGER),
+        _ => theme::accent(),
+    };
+    let title_style = match prompt.kind {
+        ModalKind::DeleteDrafts => Style::default()
+            .fg(theme::DANGER)
+            .add_modifier(Modifier::BOLD),
+        _ => theme::accent_bold(),
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::accent())
-        .title(Line::from(Span::styled(title, theme::accent_bold())));
+        .border_style(border_style)
+        .title(Line::from(Span::styled(title, title_style)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1190,11 +1336,42 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
             }
         }
         ModalKind::RangeSelect => "Type draft numbers — comma + dash, e.g. 1-5,8,12-15 (or `all`):",
+        ModalKind::DeleteDrafts => "This permanently removes the selected drafts from the local store.",
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, theme::dim()))),
+        Paragraph::new(Line::from(Span::styled(hint, theme::dim())))
+            .wrap(Wrap { trim: false }),
         chunks[0],
     );
+
+    if prompt.kind == ModalKind::DeleteDrafts {
+        // Stand-in for the input row: spell out the action so the
+        // confirm key has unmistakable consequences.
+        let line = Line::from(vec![
+            Span::styled("Delete ", theme::dim()),
+            Span::styled(
+                format!("{}", prompt.targets.len()),
+                Style::default()
+                    .fg(theme::DANGER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" draft{}? ", plural(prompt.targets.len())),
+                theme::dim(),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), chunks[1]);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("y / enter", theme::accent()),
+                Span::styled(" delete   ", theme::dim()),
+                Span::styled("n / esc / q", theme::accent()),
+                Span::styled(" cancel", theme::dim()),
+            ])),
+            chunks[3],
+        );
+        return;
+    }
 
     let input_active = prompt.pick.is_none();
     let input_chevron_style = if input_active {

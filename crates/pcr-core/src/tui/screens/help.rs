@@ -95,7 +95,7 @@ fn draw(frame: &mut ratatui::Frame, focus: usize, list_state: &mut ListState) {
 
     HeaderBar {
         version: VERSION.to_string(),
-        user: None,
+        user: crate::auth::load().map(|a| a.user_id),
         command: "help",
         clock: local_hms(),
     }
