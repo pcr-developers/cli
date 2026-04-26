@@ -7,6 +7,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use crate::config;
 
@@ -38,8 +40,30 @@ fn file_path() -> PathBuf {
     config::pcr_dir().join("projects.json")
 }
 
+/// Returns the registered project list. Cached per-process and
+/// invalidated automatically when `projects.json`'s mtime changes, so
+/// the high-frequency watchers (cursor scan every 20s, diff_tracker
+/// every 3s, session_state_watcher every 2s) don't re-read and
+/// re-deserialize the file on every poll.
+///
+/// In the steady state — where `projects.json` doesn't change between
+/// polls — every call after the first returns the cached `Vec` for the
+/// cost of a single `metadata()` syscall (~10µs). Without this, the same
+/// file was being read + JSON-parsed roughly 30 times per minute on a
+/// typical setup.
 pub fn load() -> Vec<Project> {
-    let Ok(data) = fs::read(file_path()) else {
+    let path = file_path();
+    let mtime = mtime_of(&path);
+    if let Some(cached) = lookup_cache(mtime) {
+        return cached;
+    }
+    let projects = read_from_disk(&path);
+    insert_cache(mtime, &projects);
+    projects
+}
+
+fn read_from_disk(path: &Path) -> Vec<Project> {
+    let Ok(data) = fs::read(path) else {
         return Vec::new();
     };
     let Ok(reg) = serde_json::from_slice::<Registry>(&data) else {
@@ -57,8 +81,57 @@ fn save(projects: &[Project]) -> anyhow::Result<()> {
         projects: projects.to_vec(),
     };
     let data = serde_json::to_vec_pretty(&reg)?;
-    fs::write(path, data)?;
+    fs::write(&path, data)?;
+    // Drop the cache so the next `load()` picks up the fresh write
+    // without waiting for an mtime miss (some filesystems coalesce
+    // mtimes at second-level resolution and we'd otherwise serve a
+    // stale snapshot for up to a second).
+    invalidate_cache();
     Ok(())
+}
+
+// ─── Cache plumbing ─────────────────────────────────────────────────────────
+//
+// One slot, no eviction. The on-disk file is small (KB) and projects
+// turn over rarely; storing the full Vec is fine.
+
+struct CacheSlot {
+    mtime: Option<SystemTime>,
+    projects: Vec<Project>,
+}
+
+fn cache() -> &'static Mutex<Option<CacheSlot>> {
+    static CACHE: OnceLock<Mutex<Option<CacheSlot>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn lookup_cache(current_mtime: Option<SystemTime>) -> Option<Vec<Project>> {
+    let guard = cache().lock().ok()?;
+    let slot = guard.as_ref()?;
+    if slot.mtime == current_mtime {
+        Some(slot.projects.clone())
+    } else {
+        None
+    }
+}
+
+fn insert_cache(mtime: Option<SystemTime>, projects: &[Project]) {
+    if let Ok(mut guard) = cache().lock() {
+        *guard = Some(CacheSlot {
+            mtime,
+            projects: projects.to_vec(),
+        });
+    }
+}
+
+fn invalidate_cache() {
+    if let Ok(mut guard) = cache().lock() {
+        *guard = None;
+    }
 }
 
 /// `/Users/foo/Desktop/PCR.dev` → `Users-foo-Desktop-PCR-dev`.
