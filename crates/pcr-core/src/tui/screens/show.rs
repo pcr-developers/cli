@@ -631,18 +631,38 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
         return;
     }
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(28), // drafts list
-            Constraint::Min(40),    // detail
-            Constraint::Length(28), // changed files / tools
-        ])
-        .split(chunks[1]);
+    // Drop the right sidebar entirely when the focused draft has nothing
+    // to put in it — empty `Changed files` + empty `Tool calls` panes
+    // are just two boxes of unused chrome stealing 28 columns from the
+    // detail pane (the place the user is actually reading). The user
+    // explicitly asked for this; Cursor drafts in particular almost
+    // always hit this case because we don't capture their tool calls.
+    let body = chunks[1];
+    let show_sidebar = focused_has_sidebar_content(state);
+    let cols = if show_sidebar {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(28), // drafts list
+                Constraint::Min(40),    // detail
+                Constraint::Length(28), // changed files / tools
+            ])
+            .split(body)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(28), // drafts list
+                Constraint::Min(40),    // detail (gets the sidebar's columns)
+            ])
+            .split(body)
+    };
 
     draw_list(frame, cols[0], state);
     draw_detail(frame, cols[1], state);
-    draw_sidebar(frame, cols[2], state);
+    if show_sidebar {
+        draw_sidebar(frame, cols[2], state);
+    }
     draw_footer(frame, chunks[2], state);
 
     // Modal overlay last so it paints on top of the list / detail.
@@ -924,6 +944,25 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
+}
+
+/// True when the focused draft has anything worth rendering in the
+/// right sidebar. Drives whether `draw` reserves the 28-column slot
+/// at all — when both the changed-files list and the tool-call summary
+/// are empty, those columns go to the detail pane instead. Mirrors
+/// the same data lookups `draw_sidebar` performs so the two stay in
+/// sync as `file_context` schemas evolve.
+fn focused_has_sidebar_content(state: &ShowState) -> bool {
+    let Some(d) = state.drafts.get(state.focus) else {
+        return false;
+    };
+    let has_changed_files = d
+        .file_context
+        .as_ref()
+        .and_then(|m| m.get("changed_files").and_then(|v| v.as_array()))
+        .is_some_and(|a| !a.is_empty());
+    let has_tool_calls = !crate::display::summarize_tools(&d.tool_calls).is_empty();
+    has_changed_files || has_tool_calls
 }
 
 fn draw_sidebar(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
