@@ -5,9 +5,9 @@
 //! ```text
 //! ┌─ HEADER ────────────────────────────────────────────────────────────┐
 //! │ DRAFTS ▼            │ PROMPT                        │ CHANGED FILES │
-//! │ ✓▸  1 fix the bug   │ "fix the bug in render"       │ src/page.tsx  │
-//! │    2 add reset link │                               │ src/main.rs   │
-//! │ ✓  3 wire up redux  │ RESPONSE                      │               │
+//! │   1  fix the bug    │ "fix the bug in render"       │ src/page.tsx  │   ← 1 selected  (green)
+//! │   2  add reset link │                               │ src/main.rs   │   ← 2 focused   (blue)
+//! │   3  wire up redux  │ RESPONSE                      │               │
 //! │                     │ Done — applied 2 edits.       │ TOOL CALLS    │
 //! │                     │                               │ Write × 2     │
 //! │                     │ METADATA                      │ Read  × 5     │
@@ -755,17 +755,24 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
-    // Each row is `M▸NNN preview`. Tightest layout we can give while
-    // keeping the four pieces visually distinguishable. The repo used
-    // to live inline between the index and the preview, but the user
-    // hated the dead column that introduced for rows whose own repo
-    // was empty — repo is already shown in the detail pane and isn't
-    // worth a permanent column tax in the list.
+    // Each row is `NNN preview`. The leading mark + pointer columns
+    // are gone — state lives on the number's color instead:
+    //
+    //   focused              → blue index, normal preview
+    //   selected             → green index, bold-white preview
+    //   focused + selected   → green index (selection dominates), bold
+    //                          white preview
+    //   neither              → muted index, normal preview
+    //
+    // The user's eyes still scan left-to-right; the colored number is
+    // the strongest at-a-glance signal for "where am I" and "what's
+    // marked". No glyph column means another two columns flow into
+    // the prompt preview.
     //
     // Width budget:
-    //   mark(1) + pointer(1) + index(3) + space(1) = 6
-    //   preview = inner_width - 6
-    const FIXED_PREFIX: usize = 6;
+    //   index(3) + space(1) = 4
+    //   preview = inner_width - 4
+    const FIXED_PREFIX: usize = 4;
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
     let preview_max = inner_width
@@ -777,29 +784,33 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let pointer = if i == state.focus {
-                glyphs::POINTER
-            } else {
-                " "
-            };
+            let is_focused = i == state.focus;
             let is_selected = state.selected.contains(&d.id);
-            let mark = if is_selected { "✓" } else { " " };
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
-            // Selected rows render the index + preview in bold white so
-            // the selection state is obvious at scanning distance — the
-            // user shouldn't have to hunt for tiny ✓ marks to see what
-            // `b` is about to bundle.
-            let (mark_style, idx_style, preview_style) = if is_selected {
-                let bold_white = Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD);
-                (theme::success(), bold_white, bold_white)
-            } else {
-                (theme::dim(), theme::chrome(), theme::text())
+
+            // Per-state styling. Selection is the more important state
+            // (it's what `b` will operate on) so green wins over blue
+            // when both apply.
+            let bold_white = Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD);
+            let (idx_style, preview_style) = match (is_selected, is_focused) {
+                (true, _) => (
+                    Style::default()
+                        .fg(theme::SUCCESS)
+                        .add_modifier(Modifier::BOLD),
+                    bold_white,
+                ),
+                (false, true) => (
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                    theme::text(),
+                ),
+                (false, false) => (theme::chrome(), theme::text()),
             };
+
             ListItem::new(Line::from(vec![
-                Span::styled(mark, mark_style),
-                Span::styled(pointer, theme::accent()),
                 Span::styled(format!("{:>3}", i + 1), idx_style),
                 Span::raw(" "),
                 Span::styled(preview, preview_style),
