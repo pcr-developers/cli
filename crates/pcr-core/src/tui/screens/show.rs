@@ -569,6 +569,72 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
+/// Make a single line of user-supplied text safe to feed into ratatui's
+/// `Paragraph` widget.
+///
+/// `Paragraph` + `Wrap { trim: false }` doesn't expand tabs before
+/// counting display width, so a `\t` in a markdown-style table prompt
+/// makes the wrap calculation drift by 7 columns per occurrence — the
+/// visible result is text that spills past the right edge into mid-
+/// word fragments and looks like ghosting. Same problem with raw ANSI
+/// escape bytes (cursor moves, color codes), and with NULs / vertical
+/// tabs / carriage returns. We strip or replace anything that doesn't
+/// occupy exactly its character-count's worth of display columns.
+///
+/// Newlines aren't stripped here — the caller already split on them
+/// before passing each line in.
+fn sanitize_for_display(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\t' => out.push_str("    "), // 4 spaces — readable, predictable width
+            '\u{1b}' => {
+                // ESC starts an escape sequence. The two we actually
+                // see in real-world prompt / response text are CSI
+                // (`ESC [`) for SGR colors / cursor moves and OSC
+                // (`ESC ]`) for window titles / hyperlinks. Drop the
+                // whole sequence including its terminator.
+                match chars.peek() {
+                    Some(&'[') => {
+                        chars.next();
+                        // CSI ends at the first byte in the 0x40-0x7e
+                        // range; everything before that is a parameter
+                        // or intermediate byte.
+                        for p in chars.by_ref() {
+                            if matches!(p, '\u{40}'..='\u{7e}') {
+                                break;
+                            }
+                        }
+                    }
+                    Some(&']') => {
+                        chars.next();
+                        // OSC ends at BEL (0x07) or ST (`ESC \`).
+                        while let Some(p) = chars.next() {
+                            if p == '\u{07}' {
+                                break;
+                            }
+                            if p == '\u{1b}' && chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Bare ESC or a sequence we don't recognize:
+                        // drop the ESC alone and let the next char
+                        // through normally.
+                    }
+                }
+            }
+            '\r' | '\u{0b}' | '\u{0c}' => {} // carriage return / vertical tab / form feed
+            c if c.is_control() => {}        // every other control char drops out silently
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Move the focus one row in the user's last navigation direction,
 /// clamped to the list bounds. Shared by every "select-and-advance"
 /// keybinding (Space, Enter, Shift+J, Shift+K) so the auto-advance
@@ -934,7 +1000,10 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         Span::styled("PROMPT", theme::accent_bold()),
     ]));
     for line in d.prompt_text.lines().take(20) {
-        lines.push(Line::from(Span::styled(line.to_string(), theme::text())));
+        lines.push(Line::from(Span::styled(
+            sanitize_for_display(line),
+            theme::text(),
+        )));
     }
     if d.prompt_text.lines().count() > 20 {
         lines.push(Line::from(Span::styled("  …", theme::dim())));
@@ -952,7 +1021,10 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             d.response_text.clone()
         };
         for line in resp.lines() {
-            lines.push(Line::from(Span::styled(line.to_string(), theme::text())));
+            lines.push(Line::from(Span::styled(
+                sanitize_for_display(line),
+                theme::text(),
+            )));
         }
         lines.push(Line::from(""));
     }
@@ -1216,4 +1288,53 @@ fn copy_to_clipboard(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_for_display;
+
+    #[test]
+    fn tabs_become_four_spaces() {
+        assert_eq!(sanitize_for_display("a\tb\tc"), "a    b    c");
+    }
+
+    #[test]
+    fn ansi_csi_sequences_are_stripped() {
+        // SGR color reset: ESC [ 0 m
+        assert_eq!(sanitize_for_display("\u{1b}[0mhello"), "hello");
+        // Foreground color: ESC [ 3 1 m
+        assert_eq!(sanitize_for_display("\u{1b}[31mred\u{1b}[0m"), "red");
+        // Cursor move: ESC [ 1 0 ; 5 H
+        assert_eq!(sanitize_for_display("a\u{1b}[10;5Hb"), "ab");
+    }
+
+    #[test]
+    fn carriage_returns_and_form_feeds_are_stripped() {
+        assert_eq!(sanitize_for_display("a\rb\u{0c}c\u{0b}d"), "abcd");
+    }
+
+    #[test]
+    fn other_control_chars_are_stripped() {
+        assert_eq!(sanitize_for_display("a\u{0}b\u{7}c"), "abc");
+    }
+
+    #[test]
+    fn normal_text_is_unchanged() {
+        let input = "Hello, world! — 你好 🚀";
+        assert_eq!(sanitize_for_display(input), input);
+    }
+
+    #[test]
+    fn realistic_markdown_table_row_renders_cleanly() {
+        // The exact shape that broke the user's screenshot: tab-
+        // separated columns with prose in the third column. After
+        // sanitization the line is all printable + spaces and any
+        // wrap calc will count its display width correctly.
+        let input = "GitHub Copilot Reviews\tAI reviews diffs\tPCR puts humans in the loop";
+        let out = sanitize_for_display(input);
+        assert!(!out.contains('\t'));
+        assert!(out.starts_with("GitHub Copilot Reviews    "));
+        assert!(out.ends_with("PCR puts humans in the loop"));
+    }
 }
