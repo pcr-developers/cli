@@ -111,7 +111,12 @@ fn run_bundle_browse(repo_filter: Option<&str>) -> ExitCode {
         display::eprintln("PCR: No draft prompts. Run `pcr start` to capture some.");
         return ExitCode::Success;
     }
-    if let Err(e) = crate::tui::screens::show::run(drafts) {
+    // Open focused on the newest draft. The list is sorted captured_at
+    // ASC, so the last index is the most recently captured prompt —
+    // almost always what the user wants to see when they open `pcr
+    // bundle` to triage their pending work.
+    let last = drafts.len() - 1;
+    if let Err(e) = crate::tui::screens::show::run_focused(drafts, last) {
         display::print_error("bundle", &e.to_string());
         return ExitCode::GenericError;
     }
