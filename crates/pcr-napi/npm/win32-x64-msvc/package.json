@@ -1,6 +1,6 @@
 {
   "name": "pcr-dev-windows-x64",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "PCR.dev CLI prebuilt binary for Windows x64",
   "license": "Apache-2.0",
   "os": [
