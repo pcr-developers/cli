@@ -658,6 +658,18 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
             .split(body)
     };
 
+    // Force-clear the body before any pane renders into it. We've
+    // observed stale text fragments lingering at the right edge when
+    // the layout reflows (sidebar appearing/disappearing) or when the
+    // user scrolls quickly between drafts whose detail content has
+    // very different lengths — Paragraph + `Wrap { trim: false }`
+    // doesn't always overwrite every cell of its target area, and the
+    // residue from the previous frame stays on screen. Writing default
+    // cells over the entire body ahead of time makes the panes always
+    // render onto a clean canvas, no matter what the previous frame
+    // looked like.
+    frame.render_widget(Clear, body);
+
     draw_list(frame, cols[0], state);
     draw_detail(frame, cols[1], state);
     if show_sidebar {
