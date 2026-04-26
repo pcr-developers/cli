@@ -16,7 +16,7 @@ use crate::util::id::generate_hex_id;
 use crate::util::text::{plural, prompt_preview};
 use crate::util::time::format_captured_at;
 
-pub fn run(_mode: OutputMode, args: BundleArgs) -> ExitCode {
+pub fn run(mode: OutputMode, args: BundleArgs) -> ExitCode {
     let name = args.name.join(" ").trim().to_string();
 
     if args.list {
@@ -80,7 +80,42 @@ pub fn run(_mode: OutputMode, args: BundleArgs) -> ExitCode {
         return run_bundle_show_hint(&name, args.repo.as_deref());
     }
 
+    // No name, no flags — open the interactive draft browser when we
+    // can. Dumping every draft (often hundreds) to stderr is hostile;
+    // the TUI scrolls, lets the user inspect each draft alongside its
+    // diff, and supports `d` to delete stale ones inline. Plain mode
+    // keeps the historical line dump for scripts and agents.
+    if agent::is_tui_eligible(mode) {
+        return run_bundle_browse(args.repo.as_deref());
+    }
     run_bundle_overview(args.repo.as_deref())
+}
+
+/// Open the show-style draft browser as the no-args bundle entrypoint.
+/// Loads the same draft set `run_bundle_overview` would have printed,
+/// then hands it to the show TUI which renders the list / detail /
+/// changed-files panes and supports keyboard inspection + delete.
+fn run_bundle_browse(repo_filter: Option<&str>) -> ExitCode {
+    sync_latest_prompts();
+    let ctx = resolve();
+    let proj_by_id = load_proj_by_id();
+    let repo_filter = repo_filter.unwrap_or("");
+    let drafts = match get_available_drafts(&ctx, repo_filter, &proj_by_id) {
+        Ok(v) => v,
+        Err(e) => {
+            display::print_error("bundle", &e.to_string());
+            return ExitCode::GenericError;
+        }
+    };
+    if drafts.is_empty() {
+        display::eprintln("PCR: No draft prompts. Run `pcr start` to capture some.");
+        return ExitCode::Success;
+    }
+    if let Err(e) = crate::tui::screens::show::run(drafts) {
+        display::print_error("bundle", &e.to_string());
+        return ExitCode::GenericError;
+    }
+    ExitCode::Success
 }
 
 // ─── Core flows ────────────────────────────────────────────────────────────

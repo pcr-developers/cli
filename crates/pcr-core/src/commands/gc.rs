@@ -49,6 +49,44 @@ pub fn run(_mode: OutputMode, args: GcArgs) -> ExitCode {
         return ExitCode::Success;
     }
 
+    if let Some(raw) = args.drafts_older_than.as_deref() {
+        let days = match parse_days(raw) {
+            Ok(d) => d,
+            Err(bad) => {
+                display::print_error("gc", &format!("invalid --drafts-older-than value: {bad:?}"));
+                display::print_hint("examples:  --drafts-older-than 7d   --drafts-older-than 30");
+                return ExitCode::Usage;
+            }
+        };
+        match store::gc_drafts_older_than(days) {
+            Ok(0) => display::eprintln(&format!("PCR: No drafts older than {days} days.")),
+            Ok(n) => display::eprintln(&format!(
+                "PCR: Deleted {n} draft prompt{} older than {days} days.",
+                plural(n as usize)
+            )),
+            Err(e) => {
+                display::print_error("gc", &e.to_string());
+                return ExitCode::GenericError;
+            }
+        }
+        return ExitCode::Success;
+    }
+
+    if args.drafts {
+        match store::gc_drafts() {
+            Ok(0) => display::eprintln("PCR: No draft prompts to delete."),
+            Ok(n) => display::eprintln(&format!(
+                "PCR: Deleted {n} draft prompt{} (bundled / pushed prompts untouched).",
+                plural(n as usize)
+            )),
+            Err(e) => {
+                display::print_error("gc", &e.to_string());
+                return ExitCode::GenericError;
+            }
+        }
+        return ExitCode::Success;
+    }
+
     if args.all_pushed {
         match store::gc_all_pushed() {
             Ok(0) => display::eprintln("PCR: No pushed records to clean up."),
@@ -66,17 +104,14 @@ pub fn run(_mode: OutputMode, args: GcArgs) -> ExitCode {
 
     let days = match args.older_than.as_deref() {
         None | Some("") => 30i64,
-        Some(s) => {
-            let raw = s.trim_end_matches('d');
-            match raw.parse::<i64>() {
-                Ok(n) if n > 0 => n,
-                _ => {
-                    display::print_error("gc", &format!("invalid --older-than value: {s:?}"));
-                    display::print_hint("examples:  --older-than 30d   --older-than 7");
-                    return ExitCode::Usage;
-                }
+        Some(s) => match parse_days(s) {
+            Ok(d) => d,
+            Err(bad) => {
+                display::print_error("gc", &format!("invalid --older-than value: {bad:?}"));
+                display::print_hint("examples:  --older-than 30d   --older-than 7");
+                return ExitCode::Usage;
             }
-        }
+        },
     };
 
     match store::gc_pushed(days) {
@@ -91,4 +126,15 @@ pub fn run(_mode: OutputMode, args: GcArgs) -> ExitCode {
         }
     }
     ExitCode::Success
+}
+
+/// Accept `30d`, `30`, `7d`, or `7` as a positive day count. On failure
+/// returns the original (unparseable) input borrowed back so the caller
+/// can quote it in a flag-specific error message.
+fn parse_days(raw: &str) -> Result<i64, &str> {
+    let trimmed = raw.trim().trim_end_matches('d');
+    match trimmed.parse::<i64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(raw),
+    }
 }

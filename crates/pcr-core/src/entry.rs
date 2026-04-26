@@ -192,6 +192,12 @@ pub struct GcArgs {
     /// Discard all unpushed committed bundles
     #[arg(long)]
     pub unpushed: bool,
+    /// Delete every unbundled draft prompt across all projects
+    #[arg(long)]
+    pub drafts: bool,
+    /// Delete unbundled drafts older than N days (e.g. `7d` or just `7`)
+    #[arg(long = "drafts-older-than")]
+    pub drafts_older_than: Option<String>,
 }
 
 /// Parse `argv` and dispatch to the matching command. Returns the process exit code.

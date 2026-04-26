@@ -129,16 +129,38 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             ));
         }
         KeyCode::Char('d') => {
-            state.copy_flash = Some((
-                "To delete a draft, exit (q) and run: pcr gc --unpushed (or remove via pcr bundle)"
-                    .into(),
-                6,
-            ));
+            // Delete the focused draft from the local store and drop it
+            // from the in-memory list. Cursor is moved to the nearest
+            // surviving sibling. No confirmation modal — the user is
+            // explicitly choosing this and the action is local-only
+            // (nothing was pushed); if they want it back, the original
+            // session in Cursor / Claude Code will re-capture it on the
+            // next watcher pass.
+            if let Some(d) = state.drafts.get(state.focus).cloned() {
+                let display_idx = state.focus + 1;
+                match crate::store::delete_drafts(std::slice::from_ref(&d.id)) {
+                    Ok(()) => {
+                        state.drafts.remove(state.focus);
+                        if state.drafts.is_empty() {
+                            state.focus = 0;
+                            state.list_state.select(None);
+                        } else {
+                            if state.focus >= state.drafts.len() {
+                                state.focus = state.drafts.len() - 1;
+                            }
+                            state.list_state.select(Some(state.focus));
+                        }
+                        state.copy_flash = Some((format!("Deleted draft #{display_idx}"), 4));
+                    }
+                    Err(e) => {
+                        state.copy_flash = Some((format!("Delete failed: {e}"), 6));
+                    }
+                }
+            }
         }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "j/k move · g/G top/bottom · c copy · b bundle hint · d delete hint · q quit"
-                    .into(),
+                "j/k move · g/G top/bottom · c copy · b bundle hint · d delete · q quit".into(),
                 8,
             ));
         }
@@ -206,6 +228,18 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             theme::dim(),
         )));
 
+    // Each row is `▸ NNN G preview` with a fixed prefix width:
+    //   pointer(1) + space(1) + index(3) + space(1) + glyph(1) + space(1) = 8
+    // Clamp the preview text to whatever's left of the inner column width so
+    // long prompts don't soft-wrap onto the next ListItem and visually
+    // contaminate adjacent rows.
+    const PREFIX_WIDTH: usize = 8;
+    const MIN_PREVIEW_WIDTH: usize = 8;
+    let inner_width = (area.width as usize).saturating_sub(2); // minus borders
+    let preview_max = inner_width
+        .saturating_sub(PREFIX_WIDTH)
+        .max(MIN_PREVIEW_WIDTH);
+
     let items: Vec<ListItem<'_>> = state
         .drafts
         .iter()
@@ -216,7 +250,7 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             } else {
                 " "
             };
-            let preview = crate::util::text::prompt_preview(&d.prompt_text, 22);
+            let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
             let (g, gs) = source_glyph(&d.source);
             ListItem::new(Line::from(vec![
                 Span::styled(pointer, theme::accent()),
@@ -440,7 +474,9 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         Span::styled("g/G", theme::accent()),
         Span::styled(" top/bottom  ", theme::dim()),
         Span::styled("c", theme::accent()),
-        Span::styled(" copy prompt  ", theme::dim()),
+        Span::styled(" copy  ", theme::dim()),
+        Span::styled("d", theme::accent()),
+        Span::styled(" delete  ", theme::dim()),
         Span::styled("b", theme::accent()),
         Span::styled(" bundle hint  ", theme::dim()),
         Span::styled("?", theme::accent()),

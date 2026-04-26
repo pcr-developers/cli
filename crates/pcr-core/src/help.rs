@@ -166,16 +166,18 @@ pub const HELP: &[HelpEntry] = &[
     HelpEntry {
         command: "gc",
         short: "Reclaim space in the local store",
-        purpose: "Delete pushed records older than N days, discard unpushed bundles, or remove orphaned bundles whose git SHA no longer exists.",
-        when_to_use: "When `~/.pcr-dev/drafts.db` is growing or you want to throw away abandoned drafts.",
+        purpose: "Delete pushed records older than N days, discard unpushed bundles, remove orphaned bundles whose git SHA no longer exists, or clear out stale unbundled drafts.",
+        when_to_use: "When `~/.pcr-dev/drafts.db` is growing, your `pcr bundle` list is full of old experiments, or you want to throw away abandoned drafts.",
         examples: &[
             ("pcr gc", "delete pushed records older than 30 days"),
             ("pcr gc --older-than 7d", "delete pushed records older than 7 days"),
             ("pcr gc --all-pushed", "delete every pushed record locally"),
             ("pcr gc --unpushed", "discard every unpushed bundle"),
             ("pcr gc --orphaned", "delete unpushed bundles whose HEAD SHA is gone"),
+            ("pcr gc --drafts-older-than 7d", "drop unbundled drafts older than 7 days"),
+            ("pcr gc --drafts", "drop every unbundled draft (bundled / pushed untouched)"),
         ],
-        see_also: &["log", "push"],
+        see_also: &["log", "push", "bundle"],
         runnable: Runnable::Direct,
     },
     HelpEntry {
