@@ -112,15 +112,20 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
             let focus = if n > hidden { n - 1 - hidden } else { 0 };
             (capped, hidden, focus)
         };
-        if let Err(e) = crate::tui::screens::show::run_focused_with_hidden(
+        match crate::tui::screens::show::run_focused_with_hidden(
             display_drafts,
             focus_in_view,
             hidden,
         ) {
-            display::print_error("show", &e.to_string());
-            return ExitCode::GenericError;
+            Ok(crate::tui::screens::show::ShowOutcome::PushAfterExit) => {
+                return crate::commands::push::run(mode);
+            }
+            Ok(_) => return ExitCode::Success,
+            Err(e) => {
+                display::print_error("show", &e.to_string());
+                return ExitCode::GenericError;
+            }
         }
-        return ExitCode::Success;
     }
 
     let proj_by_id = load_proj_by_id();

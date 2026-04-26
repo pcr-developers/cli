@@ -8,17 +8,25 @@
 //! │ ✓ 1 ▸ pcr-dev  fix t  │ "fix the bug in render"     │ src/page.tsx  │
 //! │   2   cli      add r  │                             │ src/main.rs   │
 //! │ ✓ 3   docs     wire   │ RESPONSE                    │               │
-//! │                     │ Done — applied 2 edits.       │ TOOL CALLS    │
-//! │                     │                               │ Write × 2     │
-//! │                     │ METADATA                      │ Read  × 5     │
-//! │                     │ branch · main                 │               │
-//! │                     │ source · cursor               │               │
-//! │                     │ model  · claude-sonnet-4-6    │               │
-//! │                     │ mode   · agent                │               │
-//! │                     │ when   · 14:08                │               │
+//! │                       │ Done — applied 2 edits.     │ TOOL CALLS    │
+//! │                       │                             │ Write × 2     │
+//! │                       │ METADATA                    │ Read  × 5     │
+//! │                       │ branch · main               │               │
+//! │                       │ source · cursor             │               │
 //! └─────────────────────────────────────────────────────────────────────┘
-//!  j/k move · space select · a select-all · enter bundle · d delete · q
+//!  j/k move · enter/space select · a all · b bundle · d delete · q quit
 //! ```
+//!
+//! Selection / bundle flow:
+//!
+//! * `enter` and `space` both toggle a row's selection mark (`✓`).
+//!   Selected rows render in bold white so they stand out from the
+//!   regular text — the user always knows what `b` is about to bundle.
+//! * `b` opens an inline name prompt for the current selection (or the
+//!   focused row if nothing's marked).
+//! * After a successful bundle the footer offers `p` to push
+//!   immediately — `p` cleanly tears down the TUI and runs `pcr push`
+//!   as if the user had typed it.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -26,7 +34,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
@@ -41,7 +49,18 @@ use crate::util::id::generate_hex_id;
 use crate::util::time::{fmt_time, local_hms};
 use crate::VERSION;
 
-pub fn run(drafts: Vec<DraftRecord>) -> Result<()> {
+/// What the user did on the way out of the TUI. The caller acts on
+/// this — currently just runs `pcr push` if the user hit `p` after a
+/// successful bundle. Returning an outcome (instead of side-effecting
+/// from inside the TUI) keeps the TUI thread purely a renderer + input
+/// loop and lets all blocking network code run with the terminal
+/// already restored.
+pub enum ShowOutcome {
+    Quit,
+    PushAfterExit,
+}
+
+pub fn run(drafts: Vec<DraftRecord>) -> Result<ShowOutcome> {
     run_focused(drafts, 0)
 }
 
@@ -49,7 +68,7 @@ pub fn run(drafts: Vec<DraftRecord>) -> Result<()> {
 /// `pcr show <n>` to land on the requested draft instead of the first one,
 /// and by `pcr bundle` to focus on the most recent draft. Out-of-range
 /// indices are clamped to the last valid row.
-pub fn run_focused(drafts: Vec<DraftRecord>, initial_focus: usize) -> Result<()> {
+pub fn run_focused(drafts: Vec<DraftRecord>, initial_focus: usize) -> Result<ShowOutcome> {
     run_focused_with_hidden(drafts, initial_focus, 0)
 }
 
@@ -61,7 +80,7 @@ pub fn run_focused_with_hidden(
     drafts: Vec<DraftRecord>,
     initial_focus: usize,
     hidden_count: usize,
-) -> Result<()> {
+) -> Result<ShowOutcome> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
     let focus = if drafts.is_empty() {
@@ -77,6 +96,8 @@ pub fn run_focused_with_hidden(
         hidden_count,
         selected: HashSet::new(),
         prompt: None,
+        push_armed: false,
+        outcome: ShowOutcome::Quit,
     };
     state.list_state.select(Some(focus));
 
@@ -95,6 +116,11 @@ pub fn run_focused_with_hidden(
                     *ttl = ttl.saturating_sub(1);
                     if *ttl == 0 {
                         state.copy_flash = None;
+                        // Also disarm the push shortcut when the flash
+                        // expires — keeping `p` live indefinitely after
+                        // the bundle confirmation scrolls off screen
+                        // would be a footgun.
+                        state.push_armed = false;
                     }
                 }
             }
@@ -104,7 +130,7 @@ pub fn run_focused_with_hidden(
     }
 
     restore_terminal()?;
-    Ok(())
+    Ok(state.outcome)
 }
 
 struct ShowState {
@@ -121,10 +147,20 @@ struct ShowState {
     /// row alone is the fallback when this set is empty, so casual
     /// users never need to learn multi-select to ship a single draft.
     selected: HashSet<String>,
-    /// Inline name prompt shown when the user presses Enter / `b`. While
+    /// Inline name prompt shown when the user presses `b`. While
     /// `Some`, all key input goes to the modal (text input, Enter to
-    /// confirm, Esc to cancel) instead of list navigation.
+    /// confirm, Esc/q to cancel) instead of list navigation.
     prompt: Option<NamePrompt>,
+    /// Set by a successful bundle and cleared when the confirmation
+    /// flash expires. While true, pressing `p` quits the TUI and
+    /// signals the caller to run `pcr push`. Without this gate, `p`
+    /// would either be a noop or a hidden push trigger that fires
+    /// whenever the user's typing wandered past it.
+    push_armed: bool,
+    /// Where the TUI hands control back to the caller. Default is a
+    /// plain quit; set to `PushAfterExit` when the user opts into the
+    /// post-bundle push shortcut.
+    outcome: ShowOutcome,
 }
 
 /// Modal name input shown over the list when the user is about to
@@ -186,9 +222,13 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 ));
             }
         }
-        KeyCode::Char(' ') => {
-            // Toggle multi-select on the focused draft. Auto-advance so
-            // the user can hold space-j-space-j to mark a contiguous run.
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            // Toggle multi-select on the focused draft. Both Space and
+            // Enter mark a row — Enter is the natural "do the thing on
+            // this row" key, and the original behavior (Enter immediately
+            // popping the bundle prompt) felt abrupt; selection is the
+            // safer default. Both keys auto-advance so the user can hold
+            // enter-j-enter-j to mark a contiguous run.
             if let Some(d) = state.drafts.get(state.focus) {
                 if state.selected.contains(&d.id) {
                     state.selected.remove(&d.id);
@@ -219,11 +259,11 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 state.copy_flash = Some((format!("Cleared {n} selection{}", plural(n)), 3));
             }
         }
-        KeyCode::Enter | KeyCode::Char('b') => {
+        KeyCode::Char('b') => {
             // Open the inline name prompt. If the user has multi-
-            // selected with Space, those are the targets; otherwise
-            // we fall back to the focused row so single-draft bundling
-            // is a two-keystroke flow (Enter, type name, Enter).
+            // selected, those are the targets; otherwise we fall back
+            // to the focused row so the single-draft case stays a
+            // three-keystroke flow (b, type name, Enter).
             let targets: Vec<String> = if state.selected.is_empty() {
                 match state.drafts.get(state.focus) {
                     Some(d) => vec![d.id.clone()],
@@ -250,6 +290,16 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                     targets,
                 });
             }
+        }
+        KeyCode::Char('p') if state.push_armed => {
+            // Push shortcut, only live during the post-bundle flash.
+            // Setting the outcome and breaking the loop hands control
+            // back to the caller, which tears down the TUI and runs
+            // `pcr push` with the terminal already restored — so push's
+            // own progress output renders normally instead of colliding
+            // with leftover ratatui frames.
+            state.outcome = ShowOutcome::PushAfterExit;
+            return false;
         }
         KeyCode::Char('d') => {
             // Delete the focused draft from the local store and drop it
@@ -284,9 +334,9 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "j/k move · space select · a select-all · enter bundle · c copy · d delete · ? help · q quit  ·  source/branch shown in the detail pane"
+                "j/k move · enter/space select · a select-all · b bundle (then p to push) · c copy · d delete · q quit  ·  source/branch in detail pane"
                     .into(),
-                10,
+                12,
             ));
         }
         _ => {}
@@ -305,6 +355,7 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
     match k.code {
         KeyCode::Esc => {
             state.prompt = None;
+            state.copy_flash = Some(("Bundle cancelled.".into(), 3));
         }
         KeyCode::Backspace => {
             prompt.buf.pop();
@@ -337,12 +388,13 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
                         }
                         state.list_state.select(Some(state.focus));
                     }
+                    state.push_armed = true;
                     state.copy_flash = Some((
                         format!(
-                            "Bundled {count} draft{} as {name:?} — run `pcr push` to ship",
+                            "Bundled {count} draft{} as {name:?} — press p to push, q to quit",
                             plural(count)
                         ),
-                        8,
+                        12,
                     ));
                 }
                 Err(e) => {
@@ -351,11 +403,16 @@ fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
             }
         }
         KeyCode::Char(c) => {
-            // Treat Ctrl-U as line-clear; everything else printable just
-            // appends. We don't intercept Ctrl-C — the global terminal
-            // SIGINT handler still tears the TUI down cleanly.
+            // Treat Ctrl-U as line-clear; `q` while the buffer is empty
+            // is a cancel shortcut (matches the user's expectation that
+            // q always quits whatever modal they're in). Once they've
+            // typed anything, q is a literal character — otherwise you
+            // could never type a bundle name containing a `q`.
             if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
                 prompt.buf.clear();
+            } else if (c == 'q' || c == 'Q') && prompt.buf.is_empty() {
+                state.prompt = None;
+                state.copy_flash = Some(("Bundle cancelled.".into(), 3));
             } else if !k.modifiers.contains(KeyModifiers::CONTROL) {
                 // Soft cap so a runaway paste can't blow the terminal width.
                 if prompt.buf.chars().count() < 120 {
@@ -550,7 +607,7 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
         Paragraph::new(Line::from(vec![
             Span::styled("enter", theme::accent()),
             Span::styled(" confirm   ", theme::dim()),
-            Span::styled("esc", theme::accent()),
+            Span::styled("esc/q", theme::accent()),
             Span::styled(" cancel   ", theme::dim()),
             Span::styled("ctrl-u", theme::accent()),
             Span::styled(" clear", theme::dim()),
@@ -593,29 +650,44 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             } else {
                 " "
             };
-            let mark = if state.selected.contains(&d.id) {
-                "✓"
-            } else {
-                " "
-            };
+            let is_selected = state.selected.contains(&d.id);
+            let mark = if is_selected { "✓" } else { " " };
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
+            // Selected rows render the *whole row* in bold white so the
+            // selection state is obvious at scanning distance — the user
+            // shouldn't have to hunt for tiny ✓ marks to see what `b` is
+            // about to bundle. Unselected rows keep the normal hierarchy
+            // (chrome index, soft repo, light preview).
+            let (mark_style, idx_style, repo_style, preview_style) = if is_selected {
+                let bold_white = Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD);
+                (theme::success(), bold_white, bold_white, bold_white)
+            } else {
+                (
+                    theme::dim(),
+                    theme::chrome(),
+                    theme::pending(),
+                    theme::text(),
+                )
+            };
             let mut spans = vec![
-                Span::styled(mark, theme::success()),
+                Span::styled(mark, mark_style),
                 Span::raw(" "),
                 Span::styled(pointer, theme::accent()),
                 Span::raw(" "),
-                Span::styled(format!("{:>3}", i + 1), theme::chrome()),
+                Span::styled(format!("{:>3}", i + 1), idx_style),
                 Span::raw(" "),
             ];
             if any_repo {
                 let repo = truncate_for_column(&d.project_name, REPO_WIDTH);
                 spans.push(Span::styled(
                     format!("{:<width$}", repo, width = REPO_WIDTH),
-                    theme::pending(),
+                    repo_style,
                 ));
                 spans.push(Span::raw(" "));
             }
-            spans.push(Span::styled(preview, theme::text()));
+            spans.push(Span::styled(preview, preview_style));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -864,11 +936,11 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
     let mut hints = vec![
         Span::styled("j/k", theme::accent()),
         Span::styled(" move  ", theme::dim()),
-        Span::styled("space", theme::accent()),
+        Span::styled("enter/space", theme::accent()),
         Span::styled(" select  ", theme::dim()),
         Span::styled("a", theme::accent()),
         Span::styled(" all  ", theme::dim()),
-        Span::styled("enter", theme::accent()),
+        Span::styled("b", theme::accent()),
         Span::styled(" bundle  ", theme::dim()),
         Span::styled("c", theme::accent()),
         Span::styled(" copy  ", theme::dim()),

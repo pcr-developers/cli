@@ -128,12 +128,16 @@ fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
     // almost always what the user wants to see when they open `pcr
     // bundle` to triage their pending work.
     let last = display_drafts.len() - 1;
-    if let Err(e) = crate::tui::screens::show::run_focused_with_hidden(display_drafts, last, hidden)
-    {
-        display::print_error("bundle", &e.to_string());
-        return ExitCode::GenericError;
+    match crate::tui::screens::show::run_focused_with_hidden(display_drafts, last, hidden) {
+        Ok(crate::tui::screens::show::ShowOutcome::PushAfterExit) => {
+            crate::commands::push::run(crate::agent::OutputMode::Auto)
+        }
+        Ok(_) => ExitCode::Success,
+        Err(e) => {
+            display::print_error("bundle", &e.to_string());
+            ExitCode::GenericError
+        }
     }
-    ExitCode::Success
 }
 
 // ─── Core flows ────────────────────────────────────────────────────────────
