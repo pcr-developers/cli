@@ -144,6 +144,9 @@ pub fn invalidate_session_cache(session_id: &str) {
     if let Ok(mut guard) = cache().lock() {
         guard.remove(session_id);
     }
+    if let Ok(mut guard) = full_cache().lock() {
+        guard.remove(session_id);
+    }
 }
 
 /// One-shot per-session warning when Cursor writes a row without a
@@ -337,6 +340,43 @@ fn store_meta_cache(session_id: &str, meta: Option<SessionMeta>) {
     }
 }
 
+// Full session data cache. Mirrors the SessionMeta cache: same 60s TTL,
+// same per-session keying. Without this the watcher re-parses the full
+// composerData JSON (often 50–500 KB) on every save_completed_turn for
+// the same session, even though it's already in the SessionMeta cache.
+struct FullCacheEntry {
+    data: Option<SessionData>,
+    ts: Instant,
+}
+
+static FULL_CACHE: OnceLock<Mutex<HashMap<String, FullCacheEntry>>> = OnceLock::new();
+
+fn full_cache() -> &'static Mutex<HashMap<String, FullCacheEntry>> {
+    FULL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_full_session_cache(session_id: &str) -> Option<Option<SessionData>> {
+    let guard = full_cache().lock().ok()?;
+    let entry = guard.get(session_id)?;
+    if entry.ts.elapsed() < CACHE_TTL {
+        Some(entry.data.clone())
+    } else {
+        None
+    }
+}
+
+fn insert_full_session_cache(session_id: &str, data: Option<SessionData>) {
+    if let Ok(mut guard) = full_cache().lock() {
+        guard.insert(
+            session_id.to_string(),
+            FullCacheEntry {
+                data,
+                ts: Instant::now(),
+            },
+        );
+    }
+}
+
 // ─── Full session data ───────────────────────────────────────────────────────
 
 static STRIPPED_FIELDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
@@ -389,6 +429,15 @@ fn structured_fields() -> &'static HashSet<&'static str> {
 }
 
 pub fn get_full_session_data(session_id: &str) -> Option<SessionData> {
+    if let Some(cached) = lookup_full_session_cache(session_id) {
+        return cached;
+    }
+    let result = read_full_session_data(session_id);
+    insert_full_session_cache(session_id, result.clone());
+    result
+}
+
+fn read_full_session_data(session_id: &str) -> Option<SessionData> {
     let guard = open_cursor_db()?;
     let db = guard.as_ref()?;
     let composer_key = format!("composerData:{session_id}");
