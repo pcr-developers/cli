@@ -4,35 +4,40 @@
 //!
 //! ```text
 //! ┌─ HEADER ────────────────────────────────────────────────────────────┐
-//! │ DRAFTS ▼          │ PROMPT                          │ CHANGED FILES │
-//! │  1 cur ▸ pcr-dev  │ "fix the bug in render"         │ src/page.tsx  │
-//! │  2 cld   cli      │                                 │ src/main.rs   │
-//! │  3   func     │ RESPONSE                            │               │
-//! │              │ Done — applied 2 edits.             │ TOOL CALLS    │
-//! │              │                                     │ Write × 2     │
-//! │              │ METADATA                            │ Read  × 5     │
-//! │              │ branch · main                       │               │
-//! │              │ source · cursor                     │               │
-//! │              │ model  · claude-sonnet-4-6          │               │
-//! │              │ mode   · agent                      │               │
-//! │              │ when   · 14:08                      │               │
+//! │ DRAFTS ▼            │ PROMPT                        │ CHANGED FILES │
+//! │ ✓ 1 cur ▸ pcr-dev   │ "fix the bug in render"       │ src/page.tsx  │
+//! │   2 cld   cli       │                               │ src/main.rs   │
+//! │ ✓ 3 cur   docs      │ RESPONSE                      │               │
+//! │                     │ Done — applied 2 edits.       │ TOOL CALLS    │
+//! │                     │                               │ Write × 2     │
+//! │                     │ METADATA                      │ Read  × 5     │
+//! │                     │ branch · main                 │               │
+//! │                     │ source · cursor               │               │
+//! │                     │ model  · claude-sonnet-4-6    │               │
+//! │                     │ mode   · agent                │               │
+//! │                     │ when   · 14:08                │               │
 //! └─────────────────────────────────────────────────────────────────────┘
-//!  j/k move · enter open file · c copy prompt · b bundle · d delete · ?
+//!  j/k move · space select · a select-all · enter bundle · d delete · q
 //! ```
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::store::DraftRecord;
+use crate::commands::helpers::{current_branch, draft_ids};
+use crate::commands::project_context::resolve;
+use crate::store::{self, DraftRecord};
 use crate::tui::app::{restore_terminal, setup_terminal};
 use crate::tui::events::{Event, EventSource};
 use crate::tui::theme::{self, glyphs};
 use crate::tui::widgets::header_bar::HeaderBar;
+use crate::util::id::generate_hex_id;
 use crate::util::time::{fmt_time, local_hms};
 use crate::VERSION;
 
@@ -70,6 +75,8 @@ pub fn run_focused_with_hidden(
         list_state: ListState::default(),
         copy_flash: None,
         hidden_count,
+        selected: HashSet::new(),
+        prompt: None,
     };
     state.list_state.select(Some(focus));
 
@@ -110,9 +117,36 @@ struct ShowState {
     /// cap in `pcr show` / `pcr bundle`). Surfaced in the footer so the
     /// user knows the list isn't the complete history and how to widen it.
     hidden_count: usize,
+    /// Draft IDs the user has marked with Space. Bundling the focused
+    /// row alone is the fallback when this set is empty, so casual
+    /// users never need to learn multi-select to ship a single draft.
+    selected: HashSet<String>,
+    /// Inline name prompt shown when the user presses Enter / `b`. While
+    /// `Some`, all key input goes to the modal (text input, Enter to
+    /// confirm, Esc to cancel) instead of list navigation.
+    prompt: Option<NamePrompt>,
+}
+
+/// Modal name input shown over the list when the user is about to
+/// create a bundle. We render an overlay box near the bottom so the
+/// list and detail view stay visible underneath — handy for spelling
+/// the name from what's on screen.
+struct NamePrompt {
+    /// Current text the user has typed.
+    buf: String,
+    /// Snapshot of the draft IDs that will go into the bundle when the
+    /// user confirms. Captured at prompt-open time so subsequent `j/k`
+    /// (which we still allow during the prompt? — no, we don't) can't
+    /// shift the target set behind the prompt's back.
+    targets: Vec<String>,
 }
 
 fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
+    // Modal-first. While the name prompt is open, the list is frozen
+    // and every keystroke goes into the prompt buffer (or controls it).
+    if state.prompt.is_some() {
+        return handle_prompt_key(k, state);
+    }
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => return false,
         KeyCode::Down | KeyCode::Char('j') => {
@@ -152,11 +186,70 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 ));
             }
         }
-        KeyCode::Char('b') => {
-            state.copy_flash = Some((
-                "To bundle this draft, run: pcr bundle \"name\" --select <number>".into(),
-                6,
-            ));
+        KeyCode::Char(' ') => {
+            // Toggle multi-select on the focused draft. Auto-advance so
+            // the user can hold space-j-space-j to mark a contiguous run.
+            if let Some(d) = state.drafts.get(state.focus) {
+                if state.selected.contains(&d.id) {
+                    state.selected.remove(&d.id);
+                } else {
+                    state.selected.insert(d.id.clone());
+                }
+            }
+            if !state.drafts.is_empty() && state.focus + 1 < state.drafts.len() {
+                state.focus += 1;
+                state.list_state.select(Some(state.focus));
+            }
+        }
+        KeyCode::Char('a') => {
+            // Toggle "select all visible" / "clear all". If anything is
+            // selected, the first press clears (matches the gmail-style
+            // mental model). Otherwise selects every visible draft.
+            if state.selected.is_empty() {
+                for d in &state.drafts {
+                    state.selected.insert(d.id.clone());
+                }
+                state.copy_flash = Some((
+                    format!("Selected all {} visible drafts", state.drafts.len()),
+                    3,
+                ));
+            } else {
+                let n = state.selected.len();
+                state.selected.clear();
+                state.copy_flash = Some((format!("Cleared {n} selection{}", plural(n)), 3));
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('b') => {
+            // Open the inline name prompt. If the user has multi-
+            // selected with Space, those are the targets; otherwise
+            // we fall back to the focused row so single-draft bundling
+            // is a two-keystroke flow (Enter, type name, Enter).
+            let targets: Vec<String> = if state.selected.is_empty() {
+                match state.drafts.get(state.focus) {
+                    Some(d) => vec![d.id.clone()],
+                    None => Vec::new(),
+                }
+            } else {
+                // Preserve list order, not insertion order, so the
+                // bundle's draft sequence reads top-to-bottom on push.
+                state
+                    .drafts
+                    .iter()
+                    .filter(|d| state.selected.contains(&d.id))
+                    .map(|d| d.id.clone())
+                    .collect()
+            };
+            if targets.is_empty() {
+                state.copy_flash = Some((
+                    "No drafts to bundle — nothing selected and list empty.".into(),
+                    4,
+                ));
+            } else {
+                state.prompt = Some(NamePrompt {
+                    buf: String::new(),
+                    targets,
+                });
+            }
         }
         KeyCode::Char('d') => {
             // Delete the focused draft from the local store and drop it
@@ -168,6 +261,7 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
             // next watcher pass.
             if let Some(d) = state.drafts.get(state.focus).cloned() {
                 let display_idx = state.focus + 1;
+                state.selected.remove(&d.id);
                 match crate::store::delete_drafts(std::slice::from_ref(&d.id)) {
                     Ok(()) => {
                         state.drafts.remove(state.focus);
@@ -190,14 +284,143 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "labels: cur=cursor · cld=claude-code · vsc=vscode  ·  keys: j/k move · g/G top/bottom · c copy · d delete · b bundle · q quit"
+                "labels: cur=cursor · cld=claude-code · vsc=vscode  ·  keys: j/k move · space select · a select-all · enter/b bundle · c copy · d delete · q quit"
                     .into(),
-                10,
+                12,
             ));
         }
         _ => {}
     }
     true
+}
+
+/// Key dispatch while the name prompt is on screen. Returns false to
+/// quit the TUI (we never quit from inside the prompt — Esc just
+/// dismisses the prompt itself, matching how every other modal in
+/// Cursor / VS Code works).
+fn handle_prompt_key(k: KeyEvent, state: &mut ShowState) -> bool {
+    let Some(prompt) = state.prompt.as_mut() else {
+        return true;
+    };
+    match k.code {
+        KeyCode::Esc => {
+            state.prompt = None;
+        }
+        KeyCode::Backspace => {
+            prompt.buf.pop();
+        }
+        KeyCode::Enter => {
+            let name = prompt.buf.trim().to_string();
+            if name.is_empty() {
+                state.copy_flash = Some(("Bundle name can't be empty — Esc to cancel.".into(), 4));
+                return true;
+            }
+            let targets = std::mem::take(&mut prompt.targets);
+            // Drop the prompt before calling out so the success flash
+            // renders on a clean footer.
+            state.prompt = None;
+            match create_bundle_from_targets(&name, &targets) {
+                Ok(count) => {
+                    // Drop bundled drafts from the in-memory list so the
+                    // user can immediately see they've moved out of the
+                    // draft pool. The store has already migrated them to
+                    // the bundle in the same transaction.
+                    let bundled: HashSet<String> = targets.into_iter().collect();
+                    state.drafts.retain(|d| !bundled.contains(&d.id));
+                    state.selected.retain(|id| !bundled.contains(id));
+                    if state.drafts.is_empty() {
+                        state.focus = 0;
+                        state.list_state.select(None);
+                    } else {
+                        if state.focus >= state.drafts.len() {
+                            state.focus = state.drafts.len() - 1;
+                        }
+                        state.list_state.select(Some(state.focus));
+                    }
+                    state.copy_flash = Some((
+                        format!(
+                            "Bundled {count} draft{} as {name:?} — run `pcr push` to ship",
+                            plural(count)
+                        ),
+                        8,
+                    ));
+                }
+                Err(e) => {
+                    state.copy_flash = Some((format!("Bundle failed: {e}"), 8));
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            // Treat Ctrl-U as line-clear; everything else printable just
+            // appends. We don't intercept Ctrl-C — the global terminal
+            // SIGINT handler still tears the TUI down cleanly.
+            if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
+                prompt.buf.clear();
+            } else if !k.modifiers.contains(KeyModifiers::CONTROL) {
+                // Soft cap so a runaway paste can't blow the terminal width.
+                if prompt.buf.chars().count() < 120 {
+                    prompt.buf.push(c);
+                }
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Tiny pluralizer helper local to this file — `crate::util::text::plural`
+/// returns "s" or "" but we want it inline without the import dance.
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Create a sealed bundle from the given draft IDs, mirroring the
+/// non-interactive `pcr bundle "name" --select` codepath. Returns the
+/// number of drafts actually bundled or a user-facing error string.
+fn create_bundle_from_targets(name: &str, draft_ids_in: &[String]) -> Result<usize, String> {
+    if draft_ids_in.is_empty() {
+        return Err("nothing to bundle".into());
+    }
+    // Pull the same draft pool the non-interactive path sees so we can
+    // map the IDs back into full records and inherit the same project
+    // attribution rules.
+    let ctx = resolve();
+    let drafts = store::get_drafts_by_status(store::DraftStatus::Draft, &ctx.ids, &ctx.names)
+        .map_err(|e| e.to_string())?;
+    let staged = store::get_staged_drafts().map_err(|e| e.to_string())?;
+    let mut pool: Vec<DraftRecord> = drafts;
+    pool.extend(staged);
+
+    let id_set: HashSet<&String> = draft_ids_in.iter().collect();
+    let selected: Vec<DraftRecord> = pool
+        .into_iter()
+        .filter(|d| id_set.contains(&d.id))
+        .collect();
+    if selected.is_empty() {
+        return Err("none of the selected drafts are still available".into());
+    }
+
+    let project_id = ctx.ids.first().cloned().unwrap_or_default();
+    let project_name = ctx.name.clone();
+    let branch = current_branch();
+    let sha = format!("bundle-{}", generate_hex_id());
+
+    store::create_commit(
+        name,
+        &sha,
+        &draft_ids(&selected),
+        &project_id,
+        &project_name,
+        &branch,
+        "closed",
+        ctx.single_repo,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(selected.len())
 }
 
 fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
@@ -248,23 +471,102 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     draw_detail(frame, cols[1], state);
     draw_sidebar(frame, cols[2], state);
     draw_footer(frame, chunks[2], state);
+
+    // Modal overlay last so it paints on top of the list / detail.
+    if state.prompt.is_some() {
+        draw_name_prompt(frame, chunks[1], state);
+    }
+}
+
+/// Centered overlay that takes user input for the bundle name.
+/// Rendered on top of the body chunk after the list / detail / sidebar
+/// are drawn, with `Clear` to wipe whatever was underneath the box.
+fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
+    let Some(prompt) = state.prompt.as_ref() else {
+        return;
+    };
+    // Box: 60 cols wide (or body width), 5 rows tall, centered horizontally,
+    // anchored a little above body center so the user's eyes find it fast.
+    let width = 64.min(body.width.saturating_sub(4));
+    let height = 7u16;
+    let x = body.x + body.width.saturating_sub(width) / 2;
+    let y = body.y + body.height.saturating_sub(height) / 3;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::accent())
+        .title(Line::from(Span::styled(
+            format!(
+                " Bundle name · {} draft{} ",
+                prompt.targets.len(),
+                plural(prompt.targets.len())
+            ),
+            theme::accent_bold(),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // hint
+            Constraint::Length(1), // input
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // controls
+        ])
+        .split(inner.inner(ratatui::layout::Margin {
+            vertical: 0,
+            horizontal: 1,
+        }));
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Name your bundle (e.g. \"auth fix\"):",
+            theme::dim(),
+        ))),
+        chunks[0],
+    );
+
+    // Input line with a trailing block cursor so the user can see where
+    // they're typing. We append `▌` rather than relying on terminal
+    // cursor positioning — much simpler and works under tmux/screen.
+    let cursor_style = Style::default().add_modifier(Modifier::SLOW_BLINK);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", theme::accent()),
+            Span::styled(prompt.buf.clone(), theme::text()),
+            Span::styled("▌", cursor_style),
+        ])),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("enter", theme::accent()),
+            Span::styled(" confirm   ", theme::dim()),
+            Span::styled("esc", theme::accent()),
+            Span::styled(" cancel   ", theme::dim()),
+            Span::styled("ctrl-u", theme::accent()),
+            Span::styled(" clear", theme::dim()),
+        ])),
+        chunks[3],
+    );
 }
 
 fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::chrome())
-        .title(Line::from(Span::styled(
-            format!(" Drafts · {} ", state.drafts.len()),
-            theme::dim(),
-        )));
-
-    // Each row is `▸ NNN LBL preview` with a fixed prefix width:
-    //   pointer(1) + space(1) + index(3) + space(1) + label(3) + space(1) = 10
+    // Each row is `M ▸ NNN LBL preview` with a fixed prefix width:
+    //   mark(1) + space(1) + pointer(1) + space(1) + index(3) + space(1)
+    //   + label(3) + space(1) = 12
     // Clamp the preview text to whatever's left of the inner column width so
     // long prompts don't soft-wrap onto the next ListItem and visually
     // contaminate adjacent rows.
-    const PREFIX_WIDTH: usize = 10;
+    const PREFIX_WIDTH: usize = 12;
     const MIN_PREVIEW_WIDTH: usize = 8;
     let inner_width = (area.width as usize).saturating_sub(2); // minus borders
     let preview_max = inner_width
@@ -281,9 +583,16 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
             } else {
                 " "
             };
+            let mark = if state.selected.contains(&d.id) {
+                "✓"
+            } else {
+                " "
+            };
             let preview = crate::util::text::prompt_preview(&d.prompt_text, preview_max);
             let (label, label_style) = source_label(&d.source);
             ListItem::new(Line::from(vec![
+                Span::styled(mark, theme::success()),
+                Span::raw(" "),
                 Span::styled(pointer, theme::accent()),
                 Span::raw(" "),
                 Span::styled(format!("{:>3}", i + 1), theme::chrome()),
@@ -296,6 +605,22 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
         .collect();
 
     let mut ls = state.list_state.clone();
+    // Title now shows the selection count when something is marked, so
+    // the user has constant feedback on how many drafts will go into a
+    // bundle if they hit Enter.
+    let title = if state.selected.is_empty() {
+        format!(" Drafts · {} ", state.drafts.len())
+    } else {
+        format!(
+            " Drafts · {}  ·  ✓ {} selected ",
+            state.drafts.len(),
+            state.selected.len()
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::chrome())
+        .title(Line::from(Span::styled(title, theme::dim())));
     let widget = List::new(items).block(block);
     frame.render_stateful_widget(widget, area, &mut ls);
 }
@@ -517,14 +842,16 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
     let mut hints = vec![
         Span::styled("j/k", theme::accent()),
         Span::styled(" move  ", theme::dim()),
-        Span::styled("g/G", theme::accent()),
-        Span::styled(" top/bottom  ", theme::dim()),
+        Span::styled("space", theme::accent()),
+        Span::styled(" select  ", theme::dim()),
+        Span::styled("a", theme::accent()),
+        Span::styled(" all  ", theme::dim()),
+        Span::styled("enter", theme::accent()),
+        Span::styled(" bundle  ", theme::dim()),
         Span::styled("c", theme::accent()),
         Span::styled(" copy  ", theme::dim()),
         Span::styled("d", theme::accent()),
         Span::styled(" delete  ", theme::dim()),
-        Span::styled("b", theme::accent()),
-        Span::styled(" bundle  ", theme::dim()),
         Span::styled("?", theme::accent()),
         Span::styled(" help  ", theme::dim()),
         Span::styled("q", theme::accent()),
