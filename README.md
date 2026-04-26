@@ -1,7 +1,5 @@
 <div align="center">
 
-<a href="https://pcr.dev"><img src="https://pcr.dev/og.png" alt="PCR.dev" width="640" /></a>
-
 # pcr — Prompt & Code Review CLI
 
 Capture the prompts your team sends to AI coding assistants. Review them like a code review.
@@ -9,7 +7,6 @@ Capture the prompts your team sends to AI coding assistants. Review them like a 
 [![npm version](https://img.shields.io/npm/v/pcr-dev?style=flat-square&color=cb3837)](https://www.npmjs.com/package/pcr-dev)
 [![Homebrew](https://img.shields.io/badge/homebrew-pcr-orange?style=flat-square)](https://github.com/pcr-developers/homebrew-pcr)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/pcr-developers/cli/release.yml?style=flat-square&label=ci)](https://github.com/pcr-developers/cli/actions)
 
 [Website](https://pcr.dev) · [Docs](https://pcr.dev/docs) · [Quickstart](#quickstart) · [Discussions](https://github.com/pcr-developers/cli/discussions)
 
@@ -107,7 +104,7 @@ Run `pcr <cmd> --help` for examples. Full reference at [pcr.dev/docs](https://pc
 registered projects, the live event log, and the draft → bundled → pushed pipeline:
 
 ```text
-PCR.dev · start · v0.2.5  ✓ bhada@pcr.dev                            14:08:42
+PCR.dev · start · v0.2.6  ✓ bhada@pcr.dev                            14:08:42
 
   Capturing — 7 exchanges this session, 3 unbundled across 2 projects   ▁▃▆█▇▅▂
 
