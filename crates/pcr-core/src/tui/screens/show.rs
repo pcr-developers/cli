@@ -466,10 +466,7 @@ fn confirm_delete_drafts_modal(state: &mut ShowState) {
                 }
                 state.list_state.select(Some(state.focus));
             }
-            state.copy_flash = Some((
-                format!("Deleted {total} draft{}", plural(total)),
-                4,
-            ));
+            state.copy_flash = Some((format!("Deleted {total} draft{}", plural(total)), 4));
         }
         Err(e) => {
             state.copy_flash = Some((format!("Delete failed: {e}"), 6));
@@ -1336,11 +1333,12 @@ fn draw_name_prompt(frame: &mut ratatui::Frame, body: Rect, state: &ShowState) {
             }
         }
         ModalKind::RangeSelect => "Type draft numbers — comma + dash, e.g. 1-5,8,12-15 (or `all`):",
-        ModalKind::DeleteDrafts => "This permanently removes the selected drafts from the local store.",
+        ModalKind::DeleteDrafts => {
+            "This permanently removes the selected drafts from the local store."
+        }
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, theme::dim())))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(Line::from(Span::styled(hint, theme::dim()))).wrap(Wrap { trim: false }),
         chunks[0],
     );
 
