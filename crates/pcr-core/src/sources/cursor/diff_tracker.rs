@@ -66,9 +66,8 @@ impl DiffTracker {
             return;
         }
 
-        // Track whether any project's hash table moved this poll. If not,
-        // skip the disk write at the end — saving a few KB of JSON every
-        // 3s adds up when nothing's changed.
+        // Track whether to persist state at the end; skip the write when
+        // no project's hashes moved.
         let mut any_state_changed = false;
 
         let now = Utc::now();
@@ -167,22 +166,10 @@ fn save_state(inner: &Arc<Mutex<Inner>>) {
     let _ = std::fs::write(state_path(), bytes);
 }
 
-/// Compute the set of relative paths that changed between two dirty-
-/// file snapshots. Iterates the union of keys so all three cases are
-/// caught:
-///
-/// 1. **Appeared** — present in `current` but not in `prev`. A file the
-///    user just started editing.
-/// 2. **Modified** — present in both with different hashes. A file
-///    edited again since the last poll.
-/// 3. **Disappeared** — present in `prev` but not in `current`. The
-///    file went from dirty to clean — committed, reverted, or stashed.
-///    Iterating only `current` would miss this case and any agent turn
-///    whose `Bash` tool committed mid-stream would lose attribution.
-///
-/// Returns paths in sorted order so test snapshots are stable.
-/// Production callers re-order these via the per-event JSON encode
-/// anyway, so the cost of the sort is irrelevant.
+/// Relative paths that changed between two dirty-file snapshots.
+/// Iterates the union of keys so files that went dirty→clean (e.g. a
+/// mid-turn `Bash` commit) still surface as changes. Returns sorted
+/// paths so test snapshots are stable.
 fn changed_relpaths(
     prev: &HashMap<String, String>,
     current: &HashMap<String, String>,
@@ -231,29 +218,17 @@ fn dirty_hashes(project_path: &str) -> HashMap<String, String> {
     result
 }
 
-/// Hash a dirty file's content for change detection. We don't need a
-/// cryptographically meaningful digest; we just need "did this file
-/// change since the last poll".
+/// Short fingerprint for change detection on a dirty file.
 ///
-/// To keep the watcher's CPU + memory bounded for huge accidentally-
-/// dirty files (a stray `.log`, a build artifact, a `node_modules`
-/// fixture), we:
-///
-/// 1. Skip files larger than `MAX_HASH_BYTES` entirely — beyond that
-///    size the file is almost certainly not source code we care about
-///    attributing.
-/// 2. For everything else, hash the first `HASH_PREFIX_BYTES` only.
-///    Combined with the file size in the digest, this catches every
-///    real edit (size or near-the-top content always shifts) without
-///    paying to read multi-megabyte files every 3 seconds.
+/// Bounds the per-poll cost on accidentally-dirty large files:
+/// files above `MAX_HASH_BYTES` are tracked by `(size, mtime)` only,
+/// everything else hashes the first `HASH_PREFIX_BYTES` plus the size
+/// (which catches appends past the prefix).
 fn file_short_hash(path: &Path) -> Option<String> {
     use std::io::Read;
-    /// Hard ceiling. Files above this are assumed irrelevant build
-    /// products and tracked only by their (size, mtime) signature.
+    /// Files above this are fingerprinted by `(size, mtime)` only.
     const MAX_HASH_BYTES: u64 = 50 * 1024 * 1024;
-    /// Bytes actually fed into SHA-256. 256 KB is enough to discriminate
-    /// real source files; the file size component below makes append-
-    /// only modifications detectable too.
+    /// Maximum bytes fed into SHA-256 for files below the ceiling.
     const HASH_PREFIX_BYTES: u64 = 256 * 1024;
 
     let meta = std::fs::metadata(path).ok()?;
@@ -262,8 +237,6 @@ fn file_short_hash(path: &Path) -> Option<String> {
         return Some("0:empty".into());
     }
     if size > MAX_HASH_BYTES {
-        // Cheap fingerprint only — no read at all. mtime nanos give us
-        // enough resolution to detect edits without scanning content.
         let mtime_ns = meta
             .modified()
             .ok()
@@ -283,8 +256,7 @@ fn file_short_hash(path: &Path) -> Option<String> {
 
     let mut h = Sha256::new();
     h.update(&buf);
-    // Mix in size so an append past HASH_PREFIX_BYTES still shifts the
-    // digest. Same as the Go implementation's behavior on small files.
+    // Mix in size so appends past HASH_PREFIX_BYTES still shift the digest.
     h.update(size.to_le_bytes());
     let digest = h.finalize();
     let hex_full = hex::encode(digest);
@@ -292,14 +264,10 @@ fn file_short_hash(path: &Path) -> Option<String> {
     Some(short)
 }
 
-/// Parse `git status --porcelain=v1 -z` output into a list of file paths,
-/// always taking the destination side for renames (`R`) and copies (`C`).
-///
-/// `-z` is NUL-terminated and emits paths verbatim — no shell escaping,
-/// no quoting, no surprises with embedded quotes / spaces / newlines.
-/// Each entry is `XY <SP> path<NUL>`, and rename / copy entries are
-/// two entries (`R  newpath<NUL>oldpath<NUL>` — new path first under
-/// `-z`, opposite of the human porcelain order).
+/// Parse `git status --porcelain=v1 -z` output to file paths,
+/// taking the destination side for renames (`R`) and copies (`C`).
+/// Each entry is `XY <SP> path<NUL>`; rename / copy entries are
+/// followed by an additional `<source><NUL>` we discard.
 fn parse_porcelain_z(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut iter = bytes.split(|b| *b == 0);
@@ -307,16 +275,14 @@ fn parse_porcelain_z(bytes: &[u8]) -> Vec<String> {
         if field.len() < 4 {
             continue;
         }
-        // First two bytes are the XY status code, then a space, then the
-        // path (which under -z runs to the NUL terminator with no quoting).
+        // First two bytes are the XY status code, then a space, then path.
         let xy = &field[..2];
         let path_bytes = &field[3..];
         let Ok(path) = std::str::from_utf8(path_bytes) else {
             continue;
         };
         out.push(path.to_string());
-        // For renames (R) and copies (C), the next field is the source
-        // path. Skip it — we only want the destination.
+        // Discard the source-path entry that follows R / C.
         if xy[0] == b'R' || xy[0] == b'C' {
             iter.next();
         }
@@ -352,10 +318,8 @@ mod tests {
         assert_eq!(changed_relpaths(&prev, &current), vec!["src/a.rs"]);
     }
 
-    /// A file that was dirty in the previous poll but is now clean
-    /// (committed, reverted, or stashed) must appear in the changed
-    /// set — otherwise agent turns whose `Bash` tool committed mid-
-    /// stream lose attribution.
+    /// Dirty→clean files must surface as changes so mid-turn `Bash`
+    /// commits don't lose attribution.
     #[test]
     fn disappeared_files_are_recorded() {
         let prev = map(&[("src/a.rs", "h1"), ("src/b.rs", "h2")]);
@@ -392,8 +356,6 @@ mod tests {
         assert!(changed_relpaths(&empty, &empty).is_empty());
     }
 
-    /// `file_short_hash` must produce stable output for identical bytes
-    /// and a different output when content changes.
     #[test]
     fn file_short_hash_is_deterministic_and_change_sensitive() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -408,8 +370,6 @@ mod tests {
         assert_ne!(h1, h3, "edited content must shift the digest");
     }
 
-    /// Empty files get a sentinel rather than a real digest. Avoids
-    /// SHA-256-of-empty collisions across hosts and is cheap to compute.
     #[test]
     fn file_short_hash_handles_empty_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -419,9 +379,6 @@ mod tests {
         assert_eq!(h, "0:empty");
     }
 
-    /// Two files smaller than HASH_PREFIX_BYTES with identical content
-    /// produce identical digests (independent of name). This verifies
-    /// the size mix-in still yields stable output for the common case.
     #[test]
     fn file_short_hash_matches_for_identical_small_files() {
         let dir = tempfile::tempdir().expect("tempdir");

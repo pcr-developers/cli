@@ -95,20 +95,12 @@ fn run_bundle_browse(repo_filter: Option<&str>, show_all: bool) -> ExitCode {
     browse_drafts(repo_filter, show_all, None, "bundle")
 }
 
-/// Shared draft browser used by both `pcr bundle` (no args) and
-/// `pcr show [n]`. The two commands are intentionally the same
-/// experience — `pcr show <n>` is just `pcr bundle` opened to a
-/// specific draft. Keeping a single implementation means selection,
-/// bundling, the post-bundle push shortcut, the recency cap, and the
-/// `--all` widening behave identically no matter how the user got here.
+/// Shared TUI entrypoint for `pcr show [n]` and `pcr bundle` (no args).
 ///
-/// `focus_number` is 1-based against the *full* draft list (matching
-/// `pcr log` numbering). When the requested draft falls inside the
-/// hidden tail of the recency cap, we expand to the full list so the
-/// user always lands on the draft they asked for.
-///
-/// `caller` is just the prefix used in error messages so the user sees
-/// the command they actually typed in any failure output.
+/// `focus_number` is 1-based against the full draft list. If it falls
+/// inside the hidden tail of the recency cap, the full list is shown
+/// so the requested draft stays reachable. `caller` is the command
+/// name used as a prefix in error messages.
 pub fn browse_drafts(
     repo_filter: Option<&str>,
     show_all: bool,
@@ -144,11 +136,8 @@ pub fn browse_drafts(
         }
     }
 
-    // Cap to the most recent N unless `--all` was passed *or* the
-    // requested focus would land in the hidden tail. Heavy users
-    // accumulate hundreds of drafts and the list otherwise becomes
-    // unscannable; the older tail stays reachable via `--all` and via
-    // `pcr gc --drafts-older-than` for permanent cleanup.
+    // Cap to the most recent N unless `--all` was passed or the focus
+    // would otherwise land in the hidden tail.
     let want_all = show_all
         || focus_number
             .map(|n| n + crate::commands::helpers::DEFAULT_RECENT_DRAFTS_CAP <= total)
@@ -162,10 +151,8 @@ pub fn browse_drafts(
         )
     };
 
-    // Default focus = newest draft (last index, since the list is sorted
-    // captured_at ASC). With an explicit number we re-anchor it against
-    // the kept slice — the cap is a window, not a deletion, so #N still
-    // means "the Nth draft overall".
+    // Default focus = newest (the list is captured_at ASC). An explicit
+    // number is re-anchored against the kept slice.
     let last = display_drafts.len() - 1;
     let focus = match focus_number {
         Some(n) => n.saturating_sub(1).saturating_sub(hidden).min(last),
@@ -186,12 +173,8 @@ pub fn browse_drafts(
 
 // ─── Core flows ────────────────────────────────────────────────────────────
 
-/// Passthrough: every captured draft surfaces in the bundle list. The
-/// watcher tags Cursor agent turns that didn't edit any file with
-/// `file_context.agent_no_edits = true`, so any future "hide no-edit
-/// agent turns" filter can read that flag — but we ship opt-in, not
-/// opt-out, since analytical prompts ("explain this", "find the bug")
-/// are legitimate work and the user's most common questions.
+/// Passthrough today. Reserved for a future opt-in filter that hides
+/// agent turns flagged with `file_context.agent_no_edits = true`.
 fn filter_with_changed_files(drafts: Vec<DraftRecord>) -> Vec<DraftRecord> {
     drafts
 }

@@ -27,17 +27,14 @@ pub fn current_branch() -> String {
     }
 }
 
-/// Default ceiling on how many drafts the interactive browser shows
-/// without `--all`. Heavy users accumulate hundreds of drafts and the
-/// list becomes unscannable; this bounds the visible set to the most
-/// recent slice while leaving the full history reachable via `--all`
-/// or `pcr gc --drafts-older-than`.
+/// Default cap on how many drafts the interactive browser shows
+/// without `--all`. Older drafts stay reachable via `--all` or
+/// `pcr gc --drafts-older-than`.
 pub const DEFAULT_RECENT_DRAFTS_CAP: usize = 100;
 
-/// Drop everything but the most recent `cap` entries from a draft list
-/// that's already sorted ascending by `captured_at`. Returns the kept
-/// slice plus the number that was hidden so the TUI can advertise the
-/// truncation.
+/// Trim a draft list (assumed sorted ascending by `captured_at`) to
+/// the newest `cap` entries. Returns the kept slice and how many
+/// were hidden.
 pub fn cap_recent_drafts(drafts: Vec<DraftRecord>, cap: usize) -> (Vec<DraftRecord>, usize) {
     if drafts.len() <= cap {
         return (drafts, 0);

@@ -40,17 +40,9 @@ fn file_path() -> PathBuf {
     config::pcr_dir().join("projects.json")
 }
 
-/// Returns the registered project list. Cached per-process and
-/// invalidated automatically when `projects.json`'s mtime changes, so
-/// the high-frequency watchers (cursor scan every 20s, diff_tracker
-/// every 3s, session_state_watcher every 2s) don't re-read and
-/// re-deserialize the file on every poll.
-///
-/// In the steady state — where `projects.json` doesn't change between
-/// polls — every call after the first returns the cached `Vec` for the
-/// cost of a single `metadata()` syscall (~10µs). Without this, the same
-/// file was being read + JSON-parsed roughly 30 times per minute on a
-/// typical setup.
+/// Registered project list. Cached per-process; the cache is reused
+/// while `projects.json`'s mtime is unchanged so the high-frequency
+/// watchers don't re-parse it on every poll.
 pub fn load() -> Vec<Project> {
     let path = file_path();
     let mtime = mtime_of(&path);
@@ -82,18 +74,11 @@ fn save(projects: &[Project]) -> anyhow::Result<()> {
     };
     let data = serde_json::to_vec_pretty(&reg)?;
     fs::write(&path, data)?;
-    // Drop the cache so the next `load()` picks up the fresh write
-    // without waiting for an mtime miss (some filesystems coalesce
-    // mtimes at second-level resolution and we'd otherwise serve a
-    // stale snapshot for up to a second).
+    // Drop the cache up-front: some filesystems coalesce mtimes to
+    // second resolution and would otherwise serve a stale snapshot.
     invalidate_cache();
     Ok(())
 }
-
-// ─── Cache plumbing ─────────────────────────────────────────────────────────
-//
-// One slot, no eviction. The on-disk file is small (KB) and projects
-// turn over rarely; storing the full Vec is fine.
 
 struct CacheSlot {
     mtime: Option<SystemTime>,
