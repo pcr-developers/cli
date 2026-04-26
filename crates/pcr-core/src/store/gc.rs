@@ -41,6 +41,29 @@ pub fn gc_unpushed() -> Result<i64> {
     delete_commits(&ids)
 }
 
+/// Delete every unbundled draft (status = 'draft') across all projects.
+/// Returns the number of rows removed. Bundled / pushed prompts are
+/// untouched — they only disappear via `gc_unpushed` or `gc_pushed`.
+pub fn gc_drafts() -> Result<i64> {
+    let conn = open();
+    let n = conn.execute("DELETE FROM drafts WHERE status = 'draft'", [])?;
+    Ok(n as i64)
+}
+
+/// Delete unbundled drafts older than `older_than_days`. Useful when a
+/// draft list has accumulated stale prompts from old experiments and
+/// the user wants to reclaim the view without losing recent work.
+pub fn gc_drafts_older_than(older_than_days: i64) -> Result<i64> {
+    let cutoff = (Utc::now() - Duration::days(older_than_days))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let conn = open();
+    let n = conn.execute(
+        "DELETE FROM drafts WHERE status = 'draft' AND captured_at < ?",
+        params![cutoff],
+    )?;
+    Ok(n as i64)
+}
+
 pub fn gc_orphaned(project_path: &Path) -> Result<i64> {
     let rows: Vec<(String, String)> = {
         let conn = open();
