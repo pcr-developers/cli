@@ -157,8 +157,8 @@ fn launch_drafts_view(start_on_bundles: bool) -> crate::tui::NavTarget {
     };
     let ctx = crate::commands::project_context::resolve();
     let proj_by_id = crate::commands::project_context::load_proj_by_id();
-    let drafts =
-        crate::commands::bundle::get_available_drafts_pub(&ctx, "", &proj_by_id).unwrap_or_default();
+    let drafts = crate::commands::bundle::get_available_drafts_pub(&ctx, "", &proj_by_id)
+        .unwrap_or_default();
     let (display_drafts, hidden) = crate::commands::helpers::cap_recent_drafts(
         drafts,
         crate::commands::helpers::DEFAULT_RECENT_DRAFTS_CAP,

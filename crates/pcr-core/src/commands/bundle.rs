@@ -235,13 +235,13 @@ pub fn browse_drafts_full(
     let reload_repo_filter = repo_filter.to_string();
     let reload_want_all = want_all;
     let reloader: Box<dyn Fn() -> Vec<DraftRecord>> = Box::new(move || {
-        let fresh =
-            match get_available_drafts(&reload_ctx, &reload_repo_filter, &reload_proj_by_id) {
-                Ok(v) => v,
-                // Keep the TUI alive on a transient store error — the
-                // user can press Left/Right again after the debounce.
-                Err(_) => return Vec::new(),
-            };
+        let fresh = match get_available_drafts(&reload_ctx, &reload_repo_filter, &reload_proj_by_id)
+        {
+            Ok(v) => v,
+            // Keep the TUI alive on a transient store error — the
+            // user can press Left/Right again after the debounce.
+            Err(_) => return Vec::new(),
+        };
         if reload_want_all {
             fresh
         } else {
@@ -285,8 +285,7 @@ pub fn browse_drafts_full(
             // can in turn cycle back here. Keep the alt-screen guard
             // alive across the dispatcher so the transition never
             // briefly exposes the cooked terminal buffer.
-            let exit =
-                crate::commands::start::run_tui_cycle(crate::tui::NavTarget::Start);
+            let exit = crate::commands::start::run_tui_cycle(crate::tui::NavTarget::Start);
             drop(outer_guard);
             exit
         }
