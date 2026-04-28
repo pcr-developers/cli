@@ -14,7 +14,7 @@
 //!   `d` deletes the focused bundle (drafts return to the pool).
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -30,16 +30,15 @@ use crate::tui::app::{restore_terminal, setup_terminal};
 use crate::tui::events::{Event, EventSource};
 use crate::tui::theme::{self, glyphs};
 use crate::tui::widgets::header_bar::HeaderBar;
+use crate::tui::NavTarget;
 use crate::util::id::generate_hex_id;
 use crate::util::time::{fmt_time, local_hms};
 use crate::VERSION;
 
-/// What the caller should do after the TUI exits.
-pub enum ShowOutcome {
-    Quit,
-    /// Run `pcr push` against every sealed bundle.
-    PushAfterExit,
-}
+/// Re-exported alias so callers reading the source see what the
+/// browser was historically returning. New code should prefer
+/// [`crate::tui::NavTarget`] directly.
+pub type ShowOutcome = NavTarget;
 
 /// Which top-level view the browser should open in. Callers pick this
 /// based on the command name (`pcr show` → Drafts, `pcr bundle` →
@@ -89,6 +88,29 @@ pub fn run_focused_with_view_and_prefill(
     initial_view: InitialView,
     prefill_bundle_name: Option<String>,
 ) -> Result<ShowOutcome> {
+    run_focused_with_reload(
+        drafts,
+        initial_focus,
+        hidden_count,
+        initial_view,
+        prefill_bundle_name,
+        None,
+    )
+}
+
+/// Full entry point that also accepts a reloader closure invoked
+/// (debounced) when the user flips between Drafts and Bundles via
+/// Tab / Left / Right, so the view always shows the latest persisted
+/// state. Callers that don't have a way to re-query (e.g. tests)
+/// can pass `None`.
+pub fn run_focused_with_reload(
+    drafts: Vec<DraftRecord>,
+    initial_focus: usize,
+    hidden_count: usize,
+    initial_view: InitialView,
+    prefill_bundle_name: Option<String>,
+    reload_drafts: Option<Box<dyn Fn() -> Vec<DraftRecord>>>,
+) -> Result<ShowOutcome> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
     let focus = if drafts.is_empty() {
@@ -109,7 +131,7 @@ pub fn run_focused_with_view_and_prefill(
         selected: HashSet::new(),
         prompt: None,
         push_armed: false,
-        outcome: ShowOutcome::Quit,
+        outcome: NavTarget::Quit,
         nav_dir: NavDir::Down,
         mode,
         bundles: load_bundles(),
@@ -118,6 +140,8 @@ pub fn run_focused_with_view_and_prefill(
         prefill_bundle_name: prefill_bundle_name
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
+        reload_drafts,
+        last_mode_switch: None,
     };
     state.list_state.select(Some(focus));
     if !state.bundles.is_empty() {
@@ -168,7 +192,7 @@ struct ShowState {
     prompt: Option<Modal>,
     /// Whether the post-bundle `p` push shortcut is currently live.
     push_armed: bool,
-    outcome: ShowOutcome,
+    outcome: NavTarget,
     /// Last navigation direction; drives the auto-advance after a
     /// select so it follows the user's scroll instead of always
     /// jumping down.
@@ -186,6 +210,16 @@ struct ShowState {
     /// first time it's opened, then cleared so subsequent `b` presses
     /// start with an empty input.
     prefill_bundle_name: Option<String>,
+    /// Closure that re-queries the store for the current draft list.
+    /// Invoked (debounced) on tab switches so the view always reflects
+    /// the latest persisted state. `None` for callers that can't
+    /// reload (e.g. unit tests with hand-constructed drafts).
+    reload_drafts: Option<Box<dyn Fn() -> Vec<DraftRecord>>>,
+    /// Timestamp of the last Drafts ↔ Bundles toggle. Used to debounce
+    /// rapid Left/Right spam so we don't hammer SQLite (and on slow
+    /// terminals, don't render-storm). `None` means "never toggled",
+    /// which always allows the next toggle through.
+    last_mode_switch: Option<Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -241,19 +275,23 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
     if state.prompt.is_some() {
         return handle_prompt_key(k, state);
     }
-    if k.code == KeyCode::Tab {
-        toggle_mode(state);
-        return true;
+    // Cross-screen tab cycle: Start → Drafts → Bundles → Start.
+    // Right/Tab advance forward, Left rewinds. Debounced inside the
+    // helpers so a held key won't thrash the SQLite reload.
+    match k.code {
+        KeyCode::Tab | KeyCode::Right => {
+            return advance_screen(state, NavDirection::Forward);
+        }
+        KeyCode::Left => {
+            return advance_screen(state, NavDirection::Backward);
+        }
+        _ => {}
     }
     if state.mode == BrowseMode::Bundles {
         return handle_bundles_key(k, state);
     }
     match k.code {
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => return false,
-        KeyCode::Right | KeyCode::Left => {
-            toggle_mode(state);
-            return true;
-        }
         KeyCode::Down | KeyCode::Char('j') => {
             if !state.drafts.is_empty() {
                 state.focus = (state.focus + 1).min(state.drafts.len() - 1);
@@ -381,7 +419,7 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         KeyCode::Char('p') if state.push_armed => {
             // Hand control back to the caller so it can run `pcr push`
             // with the terminal already restored.
-            state.outcome = ShowOutcome::PushAfterExit;
+            state.outcome = NavTarget::PushAfterExit;
             return false;
         }
         KeyCode::Char('d') => {
@@ -504,23 +542,90 @@ fn delete_focused(state: &mut ShowState) {
 }
 
 /// Key dispatch while a modal prompt is on screen. Esc / empty-buf q
-/// dismiss the prompt; the TUI itself never quits from inside a modal.
-/// Switch between Drafts and Bundles browser views.
-fn toggle_mode(state: &mut ShowState) {
-    state.mode = match state.mode {
-        BrowseMode::Drafts => BrowseMode::Bundles,
-        BrowseMode::Bundles => BrowseMode::Drafts,
-    };
-    if state.mode == BrowseMode::Bundles {
-        // Refresh on every entry — bundles can change between visits if
-        // the user added drafts to one mid-session.
-        state.bundles = load_bundles();
-        if state.bundle_focus >= state.bundles.len() {
-            state.bundle_focus = state.bundles.len().saturating_sub(1);
+/// Direction the user pressed for cross-screen navigation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavDirection {
+    /// Tab / Right.
+    Forward,
+    /// Left.
+    Backward,
+}
+
+/// Three-way Tab / Left / Right cycle: Start → Drafts → Bundles → Start.
+///
+/// Returns `false` when the caller should break the event loop because
+/// we're handing control back to the dispatcher (typically because the
+/// user wants to jump to the live `pcr start` dashboard).
+///
+/// Debounced at 150 ms so spamming arrow keys never thrashes SQLite or
+/// the terminal renderer.
+fn advance_screen(state: &mut ShowState, dir: NavDirection) -> bool {
+    const SWITCH_DEBOUNCE: Duration = Duration::from_millis(150);
+    if let Some(last) = state.last_mode_switch {
+        if last.elapsed() < SWITCH_DEBOUNCE {
+            return true;
         }
-        state
-            .bundles_state
-            .select((!state.bundles.is_empty()).then_some(state.bundle_focus));
+    }
+    state.last_mode_switch = Some(Instant::now());
+
+    match (state.mode, dir) {
+        (BrowseMode::Drafts, NavDirection::Forward) => {
+            switch_to_bundles(state);
+            true
+        }
+        (BrowseMode::Bundles, NavDirection::Backward) => {
+            switch_to_drafts(state);
+            true
+        }
+        (BrowseMode::Drafts, NavDirection::Backward)
+        | (BrowseMode::Bundles, NavDirection::Forward) => {
+            // Exit the show TUI and tell the dispatcher to bring up the
+            // live `pcr start` dashboard.
+            state.outcome = NavTarget::Start;
+            false
+        }
+    }
+}
+
+fn switch_to_bundles(state: &mut ShowState) {
+    state.mode = BrowseMode::Bundles;
+    // Refresh on every entry — bundles can change between visits if
+    // the user added drafts to one mid-session.
+    state.bundles = load_bundles();
+    if state.bundle_focus >= state.bundles.len() {
+        state.bundle_focus = state.bundles.len().saturating_sub(1);
+    }
+    state
+        .bundles_state
+        .select((!state.bundles.is_empty()).then_some(state.bundle_focus));
+}
+
+fn switch_to_drafts(state: &mut ShowState) {
+    state.mode = BrowseMode::Drafts;
+    let Some(reload) = state.reload_drafts.as_ref() else {
+        return;
+    };
+    // Re-query the store so newly captured drafts (from a parallel
+    // `pcr start`) and any drafts dropped into a bundle from the
+    // bundles view are reflected. Preserve the focused draft id so
+    // the cursor sticks to the same prompt across the refresh.
+    let prior_focus_id = state.drafts.get(state.focus).map(|d| d.id.clone());
+    let fresh = reload();
+    // Drop stale selections so we never try to bundle an id the
+    // store no longer reports as a draft.
+    let live: HashSet<&str> = fresh.iter().map(|d| d.id.as_str()).collect();
+    state.selected.retain(|id| live.contains(id.as_str()));
+    state.drafts = fresh;
+    if state.drafts.is_empty() {
+        state.focus = 0;
+        state.list_state.select(None);
+    } else {
+        let new_focus = prior_focus_id
+            .as_deref()
+            .and_then(|id| state.drafts.iter().position(|d| d.id == id))
+            .unwrap_or_else(|| state.drafts.len() - 1);
+        state.focus = new_focus;
+        state.list_state.select(Some(new_focus));
     }
 }
 
@@ -528,10 +633,6 @@ fn toggle_mode(state: &mut ShowState) {
 fn handle_bundles_key(k: KeyEvent, state: &mut ShowState) -> bool {
     match k.code {
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => return false,
-        KeyCode::Right | KeyCode::Left => {
-            toggle_mode(state);
-            return true;
-        }
         KeyCode::Down | KeyCode::Char('j') => {
             if !state.bundles.is_empty() {
                 state.bundle_focus = (state.bundle_focus + 1).min(state.bundles.len() - 1);
@@ -560,7 +661,7 @@ fn handle_bundles_key(k: KeyEvent, state: &mut ShowState) -> bool {
             if state.bundles.is_empty() {
                 state.copy_flash = Some(("No bundles to push.".into(), 3));
             } else {
-                state.outcome = ShowOutcome::PushAfterExit;
+                state.outcome = NavTarget::PushAfterExit;
                 return false;
             }
         }
@@ -1546,6 +1647,23 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
 
     let mut lines: Vec<Line<'_>> = Vec::new();
 
+    // Top-of-detail context line: when this prompt was captured plus
+    // the originating source. Time is the most important orientation
+    // signal when scrolling a long list, so we surface it before the
+    // prompt body instead of leaving it buried in the metadata block
+    // at the bottom.
+    let captured = fmt_time(&d.captured_at);
+    let header_right = if d.source.is_empty() {
+        captured.clone()
+    } else {
+        format!("{captured}  ·  {}", d.source)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("captured ", theme::dim()),
+        Span::styled(header_right, theme::text()),
+    ]));
+    lines.push(Line::from(""));
+
     // Section: PROMPT
     lines.push(Line::from(vec![
         Span::styled(glyphs::PROMPT, theme::accent()),
@@ -1612,7 +1730,6 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
                 })
                 .unwrap_or_else(|| "—".into()),
         ),
-        ("captured", fmt_time(&d.captured_at)),
         (
             "project",
             if d.project_name.is_empty() {

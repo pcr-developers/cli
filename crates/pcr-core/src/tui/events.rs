@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, KeyEvent};
+use crossterm::event::{self, KeyEvent, KeyEventKind};
 
 use crate::display::{install_sink, take_sink, DisplayEvent};
 
@@ -43,10 +43,19 @@ impl EventSource {
         let (tx, rx) = mpsc::channel();
 
         // ── Keyboard ───────────────────────────────────────────────────
+        // On Windows, crossterm reports both `Press` and `Release` for
+        // every keystroke. Forwarding both means handlers fire twice —
+        // arrow keys jump 2 rows, single 'q' presses register as two
+        // quits, etc. Filter to `Press` (and `Repeat` for held keys)
+        // so Linux/macOS — which only ever emit `Press` — behave
+        // identically.
         let tx_keys = tx.clone();
         thread::spawn(move || loop {
             if event::poll(Duration::from_millis(100)).unwrap_or(false) {
                 if let Ok(event::Event::Key(k)) = event::read() {
+                    if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                        continue;
+                    }
                     if tx_keys.send(Event::Key(k)).is_err() {
                         return;
                     }

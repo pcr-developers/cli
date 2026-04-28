@@ -6,7 +6,9 @@
 //! adds them to an open bundle (or creates a new one).
 
 use anyhow::Result;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use crate::sources::shared::git::git_output;

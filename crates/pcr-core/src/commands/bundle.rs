@@ -226,20 +226,73 @@ pub fn browse_drafts_full(
         }
     };
 
-    match crate::tui::screens::show::run_focused_with_view_and_prefill(
+    // Reloader closure used by the TUI when the user switches tabs.
+    // Captures the same context + filter args we used for the initial
+    // load, plus the recency cap, so the refreshed list is shaped
+    // identically to what's already on screen.
+    let reload_ctx = ctx.clone();
+    let reload_proj_by_id = proj_by_id.clone();
+    let reload_repo_filter = repo_filter.to_string();
+    let reload_want_all = want_all;
+    let reloader: Box<dyn Fn() -> Vec<DraftRecord>> = Box::new(move || {
+        let fresh =
+            match get_available_drafts(&reload_ctx, &reload_repo_filter, &reload_proj_by_id) {
+                Ok(v) => v,
+                // Keep the TUI alive on a transient store error — the
+                // user can press Left/Right again after the debounce.
+                Err(_) => return Vec::new(),
+            };
+        if reload_want_all {
+            fresh
+        } else {
+            crate::commands::helpers::cap_recent_drafts(
+                fresh,
+                crate::commands::helpers::DEFAULT_RECENT_DRAFTS_CAP,
+            )
+            .0
+        }
+    });
+
+    let outer_guard = crate::tui::app::AltScreenGuard::enter();
+    let outcome = match crate::tui::screens::show::run_focused_with_reload(
         display_drafts,
         focus,
         hidden,
         initial_view,
         prefill_bundle_name,
+        Some(reloader),
     ) {
-        Ok(crate::tui::screens::show::ShowOutcome::PushAfterExit) => {
+        Ok(o) => o,
+        Err(e) => {
+            drop(outer_guard);
+            display::print_error(caller, &e.to_string());
+            return ExitCode::GenericError;
+        }
+    };
+    match outcome {
+        crate::tui::NavTarget::PushAfterExit => {
+            // Drop the alt-screen guard BEFORE pushing so the review
+            // URL and per-bundle status lines `push::run` writes to
+            // stderr land on the cooked terminal — otherwise they'd
+            // be drawn onto the alt screen and wiped on exit, leaving
+            // the user with a successful push and no link.
+            drop(outer_guard);
             crate::commands::push::run(crate::agent::OutputMode::Auto)
         }
-        Ok(_) => ExitCode::Success,
-        Err(e) => {
-            display::print_error(caller, &e.to_string());
-            ExitCode::GenericError
+        crate::tui::NavTarget::Start => {
+            // User pressed Tab/Right out of Bundles (or Left out of
+            // Drafts) — hand off to the live dashboard. The dashboard
+            // can in turn cycle back here. Keep the alt-screen guard
+            // alive across the dispatcher so the transition never
+            // briefly exposes the cooked terminal buffer.
+            let exit =
+                crate::commands::start::run_tui_cycle(crate::tui::NavTarget::Start);
+            drop(outer_guard);
+            exit
+        }
+        _ => {
+            drop(outer_guard);
+            ExitCode::Success
         }
     }
 }
@@ -279,6 +332,17 @@ fn filter_by_repo(
             false
         })
         .collect()
+}
+
+/// Public re-export of `get_available_drafts` for the cross-screen
+/// dispatcher in `commands::start::run_tui_cycle`. Keeps the internal
+/// helper signature intact.
+pub fn get_available_drafts_pub(
+    ctx: &ProjectContext,
+    repo_filter: &str,
+    proj_by_id: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<DraftRecord>> {
+    get_available_drafts(ctx, repo_filter, proj_by_id)
 }
 
 fn get_available_drafts(

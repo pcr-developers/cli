@@ -22,3 +22,23 @@ pub mod widgets;
 
 pub use app::{restore_terminal, setup_terminal, Term};
 pub use events::{Event, EventSource};
+
+/// Cross-screen navigation target. `pcr start`, `pcr show`, and `pcr
+/// bundle` all share a Tab / Left / Right cycle so the user can flip
+/// between the live dashboard, the drafts list, and the bundles list
+/// without re-running a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavTarget {
+    /// Stay on the current screen.
+    Stay,
+    /// Quit the TUI entirely.
+    Quit,
+    /// Jump to the live `pcr start` dashboard.
+    Start,
+    /// Jump to the drafts list.
+    Drafts,
+    /// Jump to the bundles list.
+    Bundles,
+    /// Quit the TUI and run `pcr push` against every sealed bundle.
+    PushAfterExit,
+}
