@@ -20,7 +20,9 @@ use pcr_core::projects::Project;
 use pcr_core::sources::shared::git::{get_branch, get_head_sha, is_git_repo};
 use pcr_core::sources::shared::path_norm::proj_id_to_canonical_paths;
 #[cfg(unix)]
-use pcr_core::sources::shared::path_norm::{canonicalize_project_path, normalize_path, path_is_under};
+use pcr_core::sources::shared::path_norm::{
+    canonicalize_project_path, normalize_path, path_is_under,
+};
 use pcr_core::sources::shared::tool_calls::{
     extract_paths_from_tool_call, repo_snapshots, repo_snapshots_for_ids, touched_project_ids,
 };

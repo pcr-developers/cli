@@ -104,7 +104,7 @@ Run `pcr <cmd> --help` for examples. Full reference at [pcr.dev/docs](https://pc
 registered projects, the live event log, and the draft → bundled → pushed pipeline:
 
 ```text
-PCR.dev · start · v0.2.6  ✓ bhada@pcr.dev                            14:08:42
+PCR.dev · start · v0.2.7  ✓ bhada@pcr.dev                            14:08:42
 
   Capturing — 7 exchanges this session, 3 unbundled across 2 projects   ▁▃▆█▇▅▂
 
