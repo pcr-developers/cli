@@ -9,7 +9,13 @@ use crate::projects::{self, Project};
 #[derive(Debug, Clone)]
 pub struct WorkspaceMatch {
     pub hash: String,
+    /// Legacy `GitHub.copilot-chat/transcripts/` directory. Kept for
+    /// older Copilot Chat versions that still use it.
     pub transcript_dir: PathBuf,
+    /// New `chatSessions/` directory introduced in vscode 1.117 /
+    /// copilot-chat 0.45+. Holds the actual conversation transcripts
+    /// in a CRDT-style JSONL format (see `chatsession_parser`).
+    pub chat_sessions_dir: PathBuf,
     pub folder_path: PathBuf,
     pub projects: Vec<Project>,
 }
@@ -54,9 +60,11 @@ pub fn scan_workspaces() -> Vec<WorkspaceMatch> {
                 continue;
             }
             let transcript_dir = hash_dir.join("GitHub.copilot-chat").join("transcripts");
+            let chat_sessions_dir = hash_dir.join("chatSessions");
             matches.push(WorkspaceMatch {
                 hash: entry.file_name().to_string_lossy().into_owned(),
                 transcript_dir,
+                chat_sessions_dir,
                 folder_path,
                 projects: matched,
             });
@@ -78,17 +86,20 @@ fn uri_to_path(uri: &str) -> String {
         return uri.to_string();
     }
     let rest = uri.trim_start_matches("file://");
+    // Decode percent-encoding first — VS Code emits URIs like
+    // `file:///c%3A/Users/...` where the drive-letter colon is encoded.
+    let decoded = urlencoding::decode(rest)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| rest.to_string());
     // On Windows, `file:///C:/...` — strip the leading slash before the drive letter.
     #[cfg(windows)]
     {
-        let bytes = rest.as_bytes();
+        let bytes = decoded.as_bytes();
         if bytes.len() > 2 && bytes[0] == b'/' && bytes[2] == b':' {
-            return rest[1..].to_string();
+            return decoded[1..].to_string();
         }
     }
-    urlencoding::decode(rest)
-        .map(|s| s.into_owned())
-        .unwrap_or_else(|_| rest.to_string())
+    decoded
 }
 
 fn match_projects(workspace_folder: &Path, all: &[Project]) -> Vec<Project> {
@@ -192,5 +203,44 @@ fn config_base(home: &Path) -> PathBuf {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         home.join(".config")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uri_to_path;
+
+    #[cfg(windows)]
+    #[test]
+    fn decodes_percent_encoded_drive_letter() {
+        // VS Code emits this exact form for a folder URI on Windows.
+        assert_eq!(
+            uri_to_path("file:///c%3A/Users/admin/Desktop/rust-experiment"),
+            "c:/Users/admin/Desktop/rust-experiment"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strips_leading_slash_with_plain_drive_letter() {
+        assert_eq!(
+            uri_to_path("file:///C:/Users/admin/Desktop/rust-experiment"),
+            "C:/Users/admin/Desktop/rust-experiment"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decodes_percent_encoded_spaces() {
+        assert_eq!(
+            uri_to_path("file:///c%3A/Users/admin/Desktop/tobii%20lsl"),
+            "c:/Users/admin/Desktop/tobii lsl"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_uri_decodes() {
+        assert_eq!(uri_to_path("file:///home/foo/bar"), "/home/foo/bar");
     }
 }

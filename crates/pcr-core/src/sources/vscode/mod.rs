@@ -6,6 +6,7 @@
 //! - [`parser`]   — parses Copilot's chat transcript JSONL into `ParsedExchange`s
 //! - [`empty_window`] — handles the "window with no workspace" global-storage format
 
+pub mod chatsession_parser;
 pub mod empty_window;
 pub mod parser;
 pub mod watcher;

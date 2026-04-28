@@ -19,6 +19,7 @@ use crate::sources::shared::{
     tool_calls::{repo_snapshots, touched_project_ids},
     Deduplicator, FileState,
 };
+use crate::sources::vscode::chatsession_parser::parse_chatsession;
 use crate::sources::vscode::parser::{
     exchange_to_prompt_record, parse_transcript, ParsedExchange, ParsedTranscript,
 };
@@ -67,6 +68,7 @@ pub fn run(user_id: &str, _dir: &Path) {
         };
         for ws in workspaces.iter() {
             watch_transcript_dir(&mut watcher, &ws.transcript_dir, &state);
+            watch_transcript_dir(&mut watcher, &ws.chat_sessions_dir, &state);
         }
     }
     let mut parent_dirs: HashSet<PathBuf> = HashSet::new();
@@ -120,11 +122,28 @@ pub fn run(user_id: &str, _dir: &Path) {
         }
     });
 
+    // Periodic full rescan: catches the cases the create-event path
+    // misses \u2014 user re-registered a project, re-cloned a repo to a new
+    // path, or VS Code created the chatSessions/transcripts subdir
+    // before our parent watch existed. Cheap (one stat per workspace
+    // hash) so we tick every 10 s.
+    let mut last_rescan = Instant::now();
+    let rescan_interval = Duration::from_secs(10);
+
     loop {
-        let Ok(event) = rx.recv() else {
-            return;
+        let event = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(ev)) => Some(ev),
+            Ok(Err(_)) => None,
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
-        let Ok(event) = event else {
+
+        if last_rescan.elapsed() >= rescan_interval {
+            rescan_workspaces(&mut watcher, &workspaces_arc, &state);
+            last_rescan = Instant::now();
+        }
+
+        let Some(event) = event else {
             continue;
         };
         if matches!(event.kind, EventKind::Create(_)) {
@@ -147,6 +166,36 @@ pub fn run(user_id: &str, _dir: &Path) {
                 schedule_process(&timers, p.to_string_lossy().into_owned(), debounce);
             }
         }
+    }
+}
+
+/// Re-scan the projects.json + workspaceStorage tree and watch any
+/// newly-matched workspace. Existing watches are kept (notify de-dups
+/// duplicate `watch` calls). Doesn't unwatch removed workspaces \u2014 a
+/// disappeared transcript dir simply emits no more events.
+fn rescan_workspaces(
+    watcher: &mut notify::RecommendedWatcher,
+    workspaces_arc: &Arc<Mutex<Vec<WorkspaceMatch>>>,
+    state: &FileState,
+) {
+    let new_matches = scan_workspaces();
+    let Ok(mut workspaces) = workspaces_arc.lock() else {
+        return;
+    };
+    for nm in new_matches {
+        if workspaces.iter().any(|w| w.hash == nm.hash) {
+            // Workspace already known, but its chatSessions/transcripts
+            // dir may have appeared since the last scan \u2014 re-watch is
+            // idempotent so just call it again.
+            watch_transcript_dir(watcher, &nm.transcript_dir, state);
+            watch_transcript_dir(watcher, &nm.chat_sessions_dir, state);
+            continue;
+        }
+        let td = nm.transcript_dir.clone();
+        let cs = nm.chat_sessions_dir.clone();
+        workspaces.push(nm);
+        watch_transcript_dir(watcher, &td, state);
+        watch_transcript_dir(watcher, &cs, state);
     }
 }
 
@@ -230,8 +279,10 @@ fn handle_new_dir(
         let found = workspaces.iter().any(|w| w.hash == nm.hash);
         if !found {
             let td = nm.transcript_dir.clone();
+            let cs = nm.chat_sessions_dir.clone();
             workspaces.push(nm);
             watch_transcript_dir(watcher, &td, state);
+            watch_transcript_dir(watcher, &cs, state);
         }
     }
 }
@@ -262,12 +313,24 @@ fn process_file(
 
     let lines = count_non_empty_lines(&bytes);
     let prev = state.get(file_path);
-    if lines <= prev {
+    let is_chat_sessions = file_path.contains("chatSessions");
+    // Legacy transcripts are append-only — short-circuit when no new
+    // lines have arrived. The new chatSessions format rewrites the
+    // file in place (kind=0 snapshot can collapse many ops), so the
+    // line-count guard would skip valid updates; always re-parse it.
+    if !is_chat_sessions && lines <= prev {
         return;
     }
     state.set(file_path, lines);
 
-    let transcript = parse_transcript(&content);
+    // Dispatch to the matching parser by source layout. Both produce
+    // the same `ParsedTranscript` shape so the rest of process_file
+    // works unchanged.
+    let transcript: ParsedTranscript = if is_chat_sessions {
+        parse_chatsession(&content)
+    } else {
+        parse_transcript(&content)
+    };
 
     if !self_session_id.is_empty() && transcript.session_id == self_session_id {
         return;
@@ -513,11 +576,14 @@ fn find_workspace<'a>(
     workspaces: &'a [WorkspaceMatch],
 ) -> Option<&'a WorkspaceMatch> {
     for ws in workspaces {
-        let Some(parent) = ws.transcript_dir.parent() else {
-            continue;
-        };
-        if file_path.starts_with(parent.to_string_lossy().as_ref()) {
-            return Some(ws);
+        // The hash_dir is the common ancestor of both `transcripts/` and
+        // `chatSessions/` — match against it so either layout resolves to
+        // the same workspace entry.
+        let hash_dir = ws.transcript_dir.parent().and_then(|p| p.parent());
+        if let Some(hash_dir) = hash_dir {
+            if file_path.starts_with(hash_dir.to_string_lossy().as_ref()) {
+                return Some(ws);
+            }
         }
     }
     None
@@ -560,18 +626,26 @@ fn project_for_exchange<'a>(
             }
         }
     }
-    if hits.is_empty() {
-        return None;
-    }
-    let mut best_idx: Option<usize> = None;
-    let mut best_count = 0usize;
-    for (idx, count) in hits {
-        if count > best_count {
-            best_count = count;
-            best_idx = Some(idx);
+    if !hits.is_empty() {
+        let mut best_idx: Option<usize> = None;
+        let mut best_count = 0usize;
+        for (idx, count) in hits {
+            if count > best_count {
+                best_count = count;
+                best_idx = Some(idx);
+            }
+        }
+        if let Some(p) = best_idx.and_then(|i| ws_projects.get(i)) {
+            return Some(p);
         }
     }
-    best_idx.and_then(|i| ws_projects.get(i))
+    // No file references in this exchange (a pure Q&A turn with no
+    // tool calls, edits, or `relevant_files`). Fall back to the
+    // workspace's primary registered project so the prompt is still
+    // attributed correctly. Without this fallback every conversational
+    // prompt lands in the store with `project_id = NULL`, which makes
+    // them invisible on the dashboard once pushed.
+    ws_projects.iter().find(|p| !p.path.is_empty())
 }
 
 fn extract_tool_call_path(tc: &Value) -> Option<String> {

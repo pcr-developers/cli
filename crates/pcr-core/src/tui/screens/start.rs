@@ -29,6 +29,7 @@ use crate::tui::widgets::{
     source_row::{render as render_source_row, SourceRowData},
     sparkline::Pulse,
 };
+use crate::tui::NavTarget;
 use crate::util::time::local_hms;
 use crate::VERSION;
 
@@ -158,7 +159,7 @@ fn shortest_branch_for_project(path: &str) -> String {
     crate::sources::shared::git::get_branch(path)
 }
 
-pub fn run(_project_count: usize) -> Result<()> {
+pub fn run(_project_count: usize) -> Result<NavTarget> {
     let mut term = setup_terminal()?;
     let events = EventSource::spawn(Duration::from_millis(500));
     let mut log = EventLog::new("Events", 500);
@@ -166,16 +167,19 @@ pub fn run(_project_count: usize) -> Result<()> {
     state.refresh_counts();
 
     let user = auth::load().map(|a| a.user_id);
+    let mut next: NavTarget = NavTarget::Quit;
 
     loop {
         term.draw(|f| draw(f, &state, &log, user.as_deref()))?;
 
         match events.rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Event::Key(k)) => {
-                if !handle_key(k, &mut state, &mut log) {
+            Ok(Event::Key(k)) => match handle_key(k, &mut state, &mut log) {
+                NavTarget::Stay => {}
+                target => {
+                    next = target;
                     break;
                 }
-            }
+            },
             Ok(Event::Tick(_)) => {
                 state.tick_counter = state.tick_counter.wrapping_add(1);
                 state.pulse.advance();
@@ -195,14 +199,18 @@ pub fn run(_project_count: usize) -> Result<()> {
     }
 
     restore_terminal()?;
-    Ok(())
+    Ok(next)
 }
 
-fn handle_key(k: KeyEvent, state: &mut DashboardState, log: &mut EventLog) -> bool {
+fn handle_key(k: KeyEvent, state: &mut DashboardState, log: &mut EventLog) -> NavTarget {
     match (k.code, k.modifiers) {
         (KeyCode::Char('q'), _)
         | (KeyCode::Esc, _)
-        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return false,
+        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return NavTarget::Quit,
+        (KeyCode::Tab, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
+            return NavTarget::Drafts;
+        }
+        (KeyCode::Left, _) | (KeyCode::Char('h'), _) => return NavTarget::Bundles,
         (KeyCode::Char('v'), _) => {
             state.verbose = !state.verbose;
             log.verbose = state.verbose;
@@ -224,7 +232,7 @@ fn handle_key(k: KeyEvent, state: &mut DashboardState, log: &mut EventLog) -> bo
         }
         _ => {}
     }
-    true
+    NavTarget::Stay
 }
 
 fn draw(frame: &mut ratatui::Frame, state: &DashboardState, log: &EventLog, user: Option<&str>) {
@@ -441,6 +449,10 @@ fn draw_projects(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState)
 
 fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     let mut hints: Vec<Span<'_>> = vec![
+        Span::styled("tab/→", theme::accent()),
+        Span::styled(" drafts  ", theme::dim()),
+        Span::styled("←", theme::accent()),
+        Span::styled(" bundles  ", theme::dim()),
         Span::styled("↑↓/jk", theme::accent()),
         Span::styled(" project  ", theme::dim()),
         Span::styled("v", theme::accent()),

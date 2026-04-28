@@ -28,7 +28,10 @@ pub fn format_captured_at(s: &str) -> String {
     dt.with_timezone(&Local).format("%b %e %H:%M").to_string()
 }
 
-/// Format an RFC3339 timestamp as `2006-01-02 15:04`. Matches `cmd/log.go::fmtTime`.
+/// Format an RFC3339 timestamp as `2006-01-02 15:04` in the LOCAL
+/// timezone. Matches `cmd/log.go::fmtTime`. Stamps captured by the
+/// watchers are stored as UTC, so without the conversion the user sees
+/// a wall-clock time several hours off from the prompt they just sent.
 pub fn fmt_time(iso: &str) -> String {
     if iso.is_empty() {
         return String::new();
@@ -36,7 +39,7 @@ pub fn fmt_time(iso: &str) -> String {
     let Ok(t) = DateTime::parse_from_rfc3339(iso) else {
         return iso.to_string();
     };
-    t.format("%Y-%m-%d %H:%M").to_string()
+    t.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Current local clock formatted as `15:04:05`. Matches `display.go::timestamp`.
