@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
@@ -1254,7 +1254,7 @@ fn draw_bundles_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) 
     let mut ls = state.bundles_state.clone();
     let widget = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::Rgb(34, 46, 62)));
+        .highlight_style(Style::default().bg(theme::FOCUS_ROW_BG));
     frame.render_stateful_widget(widget, area, &mut ls);
 }
 
@@ -1537,7 +1537,7 @@ fn draw_bundle_picker(frame: &mut ratatui::Frame, area: Rect, prompt: &Modal) {
             let count = format!("({})", c.count);
             let name_style = if is_picked {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::EMPHASIS)
                     .add_modifier(Modifier::BOLD)
             } else {
                 theme::text()
@@ -1579,7 +1579,7 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
                         .fg(theme::SUCCESS)
                         .add_modifier(Modifier::BOLD),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(theme::EMPHASIS)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
@@ -1621,7 +1621,7 @@ fn draw_list(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
     // user can always see where the cursor is.
     let widget = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::Rgb(34, 46, 62)));
+        .highlight_style(Style::default().bg(theme::FOCUS_ROW_BG));
     frame.render_stateful_widget(widget, area, &mut ls);
 }
 

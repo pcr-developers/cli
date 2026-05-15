@@ -78,7 +78,7 @@ pub const HELP: &[HelpEntry] = &[
     HelpEntry {
         command: "start",
         short: "Watch for prompts and capture them as drafts",
-        purpose: "Run a foreground watcher that listens to Cursor, Claude Code, and VS Code Copilot session files. Each user prompt becomes a local draft you can later bundle and push.",
+        purpose: "Run a foreground watcher that listens to Cursor, Claude Code, and VS Code Copilot session files (both the legacy `transcripts/` layout and the newer `chatSessions/` JSONL). Each user prompt becomes a local draft you can later bundle and push.",
         when_to_use: "Keep `pcr start` running in a terminal alongside your editor. Press `q` to stop.",
         examples: &[
             ("pcr start", "watch with the default TUI"),

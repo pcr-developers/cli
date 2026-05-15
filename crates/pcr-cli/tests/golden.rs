@@ -138,3 +138,52 @@ fn pull_without_auth_exits_auth_required() {
         .code(10)
         .stderr(predicate::str::contains("not logged in"));
 }
+
+#[test]
+fn log_json_empty_store_is_stable() {
+    let (mut cmd, _tmp) = pcr();
+    // Pin cwd to a fresh non-project temp dir so `resolve()` returns an
+    // empty context and the empty-state branch of `log.rs` runs.
+    let cwd = TempDir::new().expect("cwd tempdir");
+    let out = cmd
+        .arg("--json")
+        .arg("log")
+        .current_dir(cwd.path())
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        let s = String::from_utf8_lossy(&out.stdout);
+        panic!("expected JSON, got {s:?}: {e}")
+    });
+    let obj = parsed
+        .as_object()
+        .unwrap_or_else(|| panic!("expected JSON object, got {parsed}"));
+    for key in ["project_name", "pushed", "unpushed", "drafts"] {
+        assert!(obj.contains_key(key), "missing key {key}: {parsed}");
+    }
+    for key in ["pushed", "unpushed", "drafts"] {
+        let arr = obj[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} not an array: {parsed}"));
+        assert!(arr.is_empty(), "{key} expected empty, got {arr:?}");
+    }
+}
+
+#[test]
+fn log_plain_empty_store_messaging() {
+    let (mut cmd, _tmp) = pcr();
+    let cwd = TempDir::new().expect("cwd tempdir");
+    // `NO_COLOR=1` strips ANSI escapes from `display::cstr` so the
+    // substring match below stays stable across terminals.
+    cmd.env("NO_COLOR", "1")
+        .arg("--plain")
+        .arg("log")
+        .current_dir(cwd.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "no project is registered for this directory",
+        ));
+}

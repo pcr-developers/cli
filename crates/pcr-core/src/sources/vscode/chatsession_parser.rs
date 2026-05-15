@@ -389,4 +389,57 @@ mod tests {
         assert_eq!(t.exchanges[0].tool_calls.len(), 1);
         assert_eq!(t.exchanges[0].relevant_files, vec!["/x.rs"]);
     }
+
+    #[test]
+    fn skips_malformed_jsonl_lines_and_keeps_valid_neighbors() {
+        // Three lines: a snapshot, a junk line, and an extend op. The
+        // malformed middle line must not poison the replay.
+        let jsonl = "{\"kind\":0,\"v\":{\"sessionId\":\"sx\",\"requests\":[{\"requestId\":\"r1\",\"timestamp\":1,\"message\":{\"text\":\"first\"},\"response\":[{\"value\":\"a1\"}],\"result\":{\"metadata\":{}}}]}}\n\
+this is not json {{{\n\
+{\"kind\":2,\"k\":[\"requests\"],\"v\":[{\"requestId\":\"r2\",\"timestamp\":2,\"message\":{\"text\":\"second\"},\"response\":[{\"value\":\"a2\"}],\"result\":{\"metadata\":{}}}]}";
+        let t = parse_chatsession(jsonl);
+        assert_eq!(t.session_id, "sx");
+        assert_eq!(t.exchanges.len(), 2);
+        assert_eq!(t.exchanges[0].prompt_text, "first");
+        assert_eq!(t.exchanges[0].response_text, "a1");
+        assert_eq!(t.exchanges[1].prompt_text, "second");
+        assert_eq!(t.exchanges[1].response_text, "a2");
+    }
+
+    #[test]
+    fn normalizes_windows_drive_letter_path_from_codeblocks() {
+        // VS Code emits URIs like `vscode-userdata:///c%3A/...`; after
+        // URI decoding the `path` lands as `/c:/Users/...`. The parser
+        // strips the leading slash so downstream matchers see a plain
+        // Windows path.
+        let jsonl = r#"{"kind":0,"v":{"sessionId":"sw","requests":[{"requestId":"r","timestamp":1,"message":{"text":"q"},"response":[],"result":{"metadata":{"codeBlocks":[{"uri":{"path":"/c:/Users/me/app/main.rs"}}]}}}]}}"#;
+        let t = parse_chatsession(jsonl);
+        assert_eq!(t.exchanges.len(), 1);
+        assert_eq!(
+            t.exchanges[0].changed_files,
+            vec!["c:/Users/me/app/main.rs"]
+        );
+    }
+
+    #[test]
+    fn normalizes_drive_letter_path_from_response_base_uri() {
+        let jsonl = r#"{"kind":0,"v":{"sessionId":"sw2","requests":[{"requestId":"r","timestamp":1,"message":{"text":"q"},"response":[{"baseUri":{"path":"/d:/work/proj/lib.rs"}}],"result":{"metadata":{}}}]}}"#;
+        let t = parse_chatsession(jsonl);
+        assert_eq!(t.exchanges.len(), 1);
+        assert_eq!(t.exchanges[0].relevant_files, vec!["d:/work/proj/lib.rs"]);
+    }
+
+    #[test]
+    fn empty_input_returns_empty_transcript() {
+        let t = parse_chatsession("");
+        assert_eq!(t.session_id, "");
+        assert!(t.exchanges.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_input_returns_empty_transcript() {
+        let t = parse_chatsession("   \n\n\t  \n");
+        assert_eq!(t.session_id, "");
+        assert!(t.exchanges.is_empty());
+    }
 }
