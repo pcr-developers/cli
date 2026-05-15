@@ -27,7 +27,6 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::Color as RColor;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -232,7 +231,7 @@ fn draw_pipeline(frame: &mut ratatui::Frame, area: Rect, snap: &StatusSnapshot) 
         Segment {
             label: "drafts",
             count: snap.pipeline.drafts,
-            color: RColor::Rgb(80, 80, 95),
+            color: theme::STATUS_MUTED_FRAME,
         },
         Segment {
             label: "staged",

@@ -269,22 +269,24 @@ impl PromptScanner {
             }
         }
 
-        if proj.is_none() {
-            if candidates.len() == 1 {
-                proj = Some(candidates[0].clone());
-            } else if candidates.len() > 1 {
-                let first = candidates[0].clone();
-                for c in candidates {
-                    if !c.project_id.is_empty() {
-                        touched_ids.push(c.project_id.clone());
+        let proj = match proj {
+            Some(p) => p,
+            None => {
+                if candidates.len() == 1 {
+                    candidates[0].clone()
+                } else if candidates.len() > 1 {
+                    let first = candidates[0].clone();
+                    for c in candidates {
+                        if !c.project_id.is_empty() {
+                            touched_ids.push(c.project_id.clone());
+                        }
                     }
+                    first
+                } else {
+                    Project::default()
                 }
-                proj = Some(first);
-            } else {
-                proj = Some(Project::default());
             }
-        }
-        let proj = proj.unwrap();
+        };
 
         // Agent turns that don't edit any file are still real prompts —
         // analytical questions like "explain this", "find the bug",

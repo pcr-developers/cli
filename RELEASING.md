@@ -9,8 +9,8 @@ the repo root:
 2. **napi-rs `.node` addons** packaged as the `pcr-dev` npm meta package plus
    seven `@pcr-dev/<triple>` per-platform optional subpackages.
 
-The Go tree under `cli/` is retained during the transition for rollback. Its
-build is not used by the release workflow anymore.
+The repo is pure Rust as of v0.2.x — the Go tree was removed in the rust-port
+merge. The last Go release lives behind the `v0.1.17` tag if you ever need it.
 
 ## Cutting a stable release (`v0.2.0` and onward)
 

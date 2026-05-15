@@ -20,6 +20,19 @@ pub const PENDING: Color = Color::Rgb(232, 195, 102); // yellow
 pub const DANGER: Color = Color::Rgb(232, 102, 102); // red
 pub const INFO: Color = Color::Rgb(120, 192, 232); // soft cyan
 
+/// Subtle dark-blue background marking the focused row in `show`'s
+/// drafts/bundles lists. Stays visible behind selection styling so
+/// the user can read focus and selection independently.
+pub const FOCUS_ROW_BG: Color = Color::Rgb(34, 46, 62);
+/// Brighter-than-`TEXT` foreground used to emphasize the picked /
+/// selected row label in the `show` screen. Pure white provides the
+/// extra contrast that `TEXT` alone (already a light gray) cannot.
+pub const EMPHASIS: Color = Color::White;
+/// Muted gray-violet for the "drafts" segment in the status pipeline
+/// bar — softer than `PENDING` so unstaged work reads as neutral,
+/// not warning-bright.
+pub const STATUS_MUTED_FRAME: Color = Color::Rgb(80, 80, 95);
+
 /// Single-glyph status indicators that match the line-mode display.
 pub mod glyphs {
     /// Successful capture / sync.
