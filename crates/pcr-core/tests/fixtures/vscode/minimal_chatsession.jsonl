@@ -1,0 +1,2 @@
+{"kind":0,"v":{"sessionId":"vscode-fixture-001","requests":[]}}
+{"kind":2,"k":["requests"],"v":[{"requestId":"r1","timestamp":1714060800000,"message":{"text":"summarize the failing test"},"response":[{"value":"It panics at line 218 because clock_override is None."}],"result":{"metadata":{"toolCallRounds":[{"toolCalls":[{"name":"read_file","id":"rc1","arguments":"{\"filePath\":\"/repo/src/main.rs\"}"}]}]}}}]}

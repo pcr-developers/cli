@@ -1,0 +1,47 @@
+name: CI
+
+# `release.yml` already runs `lint` on every tag push. This workflow
+# covers everything else: pull requests targeting `main`, and direct
+# pushes to any non-main branch (so the author sees a green check
+# before opening the PR). `main` is protected — push events on main
+# only come from squash-merges, which the PR's own check already
+# validated.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        # `Cargo.lock` is gitignored (see `.gitignore`), so `--locked`
+        # would fail on a fresh clone before `cargo` resolved deps.
+        # Match `release.yml`'s `lint` job exactly.
+        run: cargo test --workspace
+      - name: doc (non-failing signal)
+        # Best-effort docs build — no `-D warnings` yet. Once doc
+        # warnings are under control, promote this to a hard gate.
+        run: cargo doc --workspace --no-deps
+        continue-on-error: true

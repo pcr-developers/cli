@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::agent::OutputMode;
 use crate::auth;
-use crate::display;
+use crate::display::{self, Color};
 use crate::entry::InitArgs;
 use crate::exit::ExitCode;
 use crate::projects;
@@ -30,7 +30,7 @@ pub fn run(_mode: OutputMode, args: InitArgs) -> ExitCode {
 
     if is_git_repo(&project_path) {
         register_one(&project_path);
-        display::eprintln("\nPCR: Run `pcr start` to begin capturing prompts.");
+        print_init_summary(1);
         return ExitCode::Success;
     }
 
@@ -68,8 +68,21 @@ pub fn run(_mode: OutputMode, args: InitArgs) -> ExitCode {
         register_one(sub);
         display::eprintln("");
     }
-    display::eprintln("PCR: Run `pcr start` to begin capturing prompts.");
+    print_init_summary(found.len());
     ExitCode::Success
+}
+
+/// Closing summary for `pcr init`. Matches the push close-out so both
+/// state-changing commands end the same way: glyph in success tone,
+/// count, and a one-line "what to do next" hint.
+fn print_init_summary(n: usize) {
+    display::eprintln("");
+    display::eprintln(&format!(
+        "{} {}",
+        display::cstr(Color::Green, "▲"),
+        display::cstr(Color::Bold, &format!("registered {n} project{}", plural(n)),),
+    ));
+    display::print_hint("run `pcr start` to begin capturing prompts");
 }
 
 fn register_one(project_path: &str) {

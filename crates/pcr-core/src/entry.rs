@@ -5,7 +5,7 @@
 //! `pcr help` (interactive) and `pcr <cmd> --help` (line) say the same
 //! thing forever, without us having to maintain two copies.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::agent::OutputMode;
 use crate::exit::ExitCode;
@@ -211,7 +211,21 @@ pub struct GcArgs {
 
 /// Parse `argv` and dispatch to the matching command. Returns the process exit code.
 pub fn run(argv: Vec<String>) -> i32 {
-    let cli = match Cli::try_parse_from(argv) {
+    // Inject rich `long_about` + `after_help` for every subcommand from
+    // the help.rs single-source-of-truth so `pcr <cmd> --help` shows the
+    // same purpose / when-to-use / examples / see-also that the
+    // interactive `pcr help` TUI does. clap derive can't take runtime
+    // strings, so we splice them in on the builder side here.
+    let cmd = decorate_subcommand_help(Cli::command());
+    let matches = match cmd.try_get_matches_from(argv) {
+        Ok(m) => m,
+        Err(e) => {
+            let code = e.exit_code();
+            let _ = e.print();
+            return code;
+        }
+    };
+    let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => {
             let code = e.exit_code();
@@ -247,3 +261,60 @@ pub fn run(argv: Vec<String>) -> i32 {
 // Re-export a render helper for the command implementations that want to
 // emit the long-form help in plain mode.
 pub use help::render_plain as render_command_help;
+
+/// Map clap's subcommand name back to the `help.rs` entry key. Keep this
+/// centralised — clap subcommand names are kebab-cased while help keys
+/// stay lower-case-with-underscores, so an exact 1:1 lookup misses the
+/// nuance and dead-codes the rich help.
+fn help_key_for(clap_name: &str) -> &'static str {
+    match clap_name {
+        "login" => "login",
+        "logout" => "logout",
+        "init" => "init",
+        "start" => "start",
+        "mcp" => "mcp",
+        "status" => "status",
+        "bundle" => "bundle",
+        "push" => "push",
+        "log" => "log",
+        "show" => "show",
+        "pull" => "pull",
+        "gc" => "gc",
+        "help" => "help",
+        "hook" => "hook",
+        _ => "",
+    }
+}
+
+/// Walk every visible subcommand of the parsed `Cli::command()` tree and
+/// splice the help.rs `long_about` + `after_help` into it. Non-visible
+/// commands (today: just `hook`) are left alone — their help text is
+/// internal and we'd rather they not show up under `--help` at all.
+fn decorate_subcommand_help(mut cmd: clap::Command) -> clap::Command {
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|sc| sc.get_name().to_string())
+        .collect();
+    for name in names {
+        let key = help_key_for(&name);
+        if key.is_empty() {
+            continue;
+        }
+        let Some(entry) = help::entry(key) else {
+            continue;
+        };
+        // `help` is a synthetic command that just opens the interactive
+        // index; rich `--help` output for it would just duplicate the
+        // root long_about. Skip.
+        if key == "help" {
+            continue;
+        }
+        let long_about = help::render_long_about(entry);
+        let after_help = help::render_after_help(entry);
+        cmd = cmd.mut_subcommand(&name, |sc| {
+            sc.long_about(long_about.clone())
+                .after_help(after_help.clone())
+        });
+    }
+    cmd
+}

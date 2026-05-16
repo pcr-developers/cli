@@ -83,3 +83,84 @@ impl HeaderBar {
         self.render(frame, inner);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render `bar` onto an 80×3 test backend and return the flattened
+    /// row-major text content (no styles). Styles are intentionally
+    /// dropped — asserting on `Cell` styling makes tests fragile to
+    /// theme tweaks. The cell glyphs alone catch the regressions we
+    /// actually care about (missing version, brand, user, clock).
+    fn render_to_text(bar: &HeaderBar, width: u16) -> String {
+        let backend = TestBackend::new(width, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, 1);
+                bar.render(frame, area);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn renders_brand_command_version_and_user() {
+        let bar = HeaderBar {
+            version: "0.2.8".into(),
+            user: Some("dev@example.com".into()),
+            command: "status",
+            clock: "12:34:56".into(),
+        };
+        let text = render_to_text(&bar, 80);
+        assert!(text.contains("PCR"), "brand missing: {text:?}");
+        assert!(text.contains(".dev"), "tld missing: {text:?}");
+        assert!(text.contains("status"), "command missing: {text:?}");
+        assert!(text.contains("v0.2.8"), "version missing: {text:?}");
+        assert!(text.contains("dev@example.com"), "user missing: {text:?}");
+        assert!(text.contains("12:34:56"), "clock missing: {text:?}");
+    }
+
+    #[test]
+    fn version_string_strips_leading_v_so_we_never_render_double() {
+        // Release CI passes the version straight from the git tag
+        // (`v0.2.8`). Without the strip in `render`, the header would
+        // print `vv0.2.8`. This regression was a real bug — keep it
+        // pinned.
+        let bar = HeaderBar {
+            version: "v0.2.8".into(),
+            user: None,
+            command: "status",
+            clock: "00:00:00".into(),
+        };
+        let text = render_to_text(&bar, 80);
+        assert!(text.contains("v0.2.8"));
+        assert!(!text.contains("vv0.2.8"), "doubled v: {text:?}");
+    }
+
+    #[test]
+    fn shows_not_signed_in_when_user_is_none_and_wide_enough() {
+        let bar = HeaderBar {
+            version: "0.2.8".into(),
+            user: None,
+            command: "status",
+            clock: "00:00:00".into(),
+        };
+        let text = render_to_text(&bar, 80);
+        assert!(
+            text.contains("not signed in"),
+            "anonymous label missing: {text:?}"
+        );
+    }
+}
