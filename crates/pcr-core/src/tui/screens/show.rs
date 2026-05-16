@@ -35,6 +35,10 @@ use crate::util::id::generate_hex_id;
 use crate::util::time::{fmt_time, local_hms};
 use crate::VERSION;
 
+/// Refresh "last push age" every ~2s. 500 ms tick × 4 = 2 s — same
+/// cadence the `pcr start` dashboard refreshes its project counts at.
+const STATUS_STRIP_REFRESH_TICKS: u32 = 4;
+
 /// Re-exported alias so callers reading the source see what the
 /// browser was historically returning. New code should prefer
 /// [`crate::tui::NavTarget`] directly.
@@ -122,6 +126,8 @@ pub fn run_focused_with_reload(
         InitialView::Drafts => BrowseMode::Drafts,
         InitialView::Bundles => BrowseMode::Bundles,
     };
+    let bundles = load_bundles();
+    let status_strip = build_status_strip(drafts.len(), &bundles);
     let mut state = ShowState {
         drafts,
         focus,
@@ -134,7 +140,7 @@ pub fn run_focused_with_reload(
         outcome: NavTarget::Quit,
         nav_dir: NavDir::Down,
         mode,
-        bundles: load_bundles(),
+        bundles,
         bundle_focus: 0,
         bundles_state: ListState::default(),
         prefill_bundle_name: prefill_bundle_name
@@ -142,6 +148,8 @@ pub fn run_focused_with_reload(
             .filter(|s| !s.is_empty()),
         reload_drafts,
         last_mode_switch: None,
+        status_strip,
+        tick_counter: 0,
     };
     state.list_state.select(Some(focus));
     if !state.bundles.is_empty() {
@@ -167,6 +175,10 @@ pub fn run_focused_with_reload(
                         state.copy_flash = None;
                         state.push_armed = false;
                     }
+                }
+                state.tick_counter = state.tick_counter.wrapping_add(1);
+                if state.tick_counter % STATUS_STRIP_REFRESH_TICKS == 0 {
+                    state.status_strip = build_status_strip(state.drafts.len(), &state.bundles);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -220,6 +232,26 @@ struct ShowState {
     /// terminals, don't render-storm). `None` means "never toggled",
     /// which always allows the next toggle through.
     last_mode_switch: Option<Instant>,
+    /// Context strip data — surfaces project / branch / pending / last
+    /// push at the top of the screen so the user never has to bounce
+    /// back to `pcr status` to remember where they are. Refreshed on
+    /// init + every 2 s (`STATUS_STRIP_REFRESH_TICKS`).
+    status_strip: StatusStrip,
+    /// Tick counter for the status-strip refresh cadence.
+    tick_counter: u32,
+}
+
+/// Snapshot of the context strip rendered just under the header. All
+/// fields are owned strings so the renderer doesn't need access to
+/// state-resolving helpers — just read these and lay them out.
+struct StatusStrip {
+    project: String,
+    branch: String,
+    pending: usize,
+    /// ISO-8601 timestamp of the most recent push, or empty when the
+    /// user hasn't pushed yet. The strip renders it as a human age
+    /// ("3m ago") at draw time.
+    last_push_at: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -332,6 +364,42 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 ));
             }
         }
+        KeyCode::Char('y') => {
+            // vim-style yank: copy the focused draft's *id* so users
+            // can paste it into `pcr show <id>`, an issue tracker, etc.
+            // The prompt body is on `c`; this is the cheap addressable
+            // handle.
+            if let Some(d) = state.drafts.get(state.focus) {
+                let copied = copy_to_clipboard(&d.id);
+                state.copy_flash = Some((
+                    if copied {
+                        format!("Yanked draft id ({}…)", short_id(&d.id))
+                    } else {
+                        "Couldn't access clipboard.".into()
+                    },
+                    3,
+                ));
+            }
+        }
+        KeyCode::Char('o') => {
+            // Open the project dashboard for the focused draft, or the
+            // root dashboard if the draft has no remote project_id yet.
+            // No-op (with a flash) when neither path is reachable.
+            let url = state
+                .drafts
+                .get(state.focus)
+                .map(draft_dashboard_url)
+                .unwrap_or_else(|| crate::config::APP_URL.to_string());
+            let ok = webbrowser::open(&url).is_ok();
+            state.copy_flash = Some((
+                if ok {
+                    format!("Opened {url}")
+                } else {
+                    format!("Couldn't open browser — visit {url}")
+                },
+                4,
+            ));
+        }
         KeyCode::Char(' ') | KeyCode::Enter => {
             toggle_focused(state);
             advance_focus(state);
@@ -435,7 +503,7 @@ fn handle_key(k: KeyEvent, state: &mut ShowState) -> bool {
         }
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "j/k move · enter/space select · J/K select+move · : range · a all · b bundle · p push · tab bundles view · c copy · d delete (focused, or all selected with confirmation) · q quit"
+                "j/k move · enter/space select · J/K select+move · : range · a all · b bundle · p push · tab bundles view · c copy prompt · y yank id · o open in browser · d delete (focused, or all selected with confirmation) · q quit"
                     .into(),
                 14,
             ));
@@ -665,10 +733,54 @@ fn handle_bundles_key(k: KeyEvent, state: &mut ShowState) -> bool {
                 return false;
             }
         }
+        KeyCode::Char('y') => {
+            // Yank the focused bundle's id (remote_id if it's been
+            // pushed, otherwise the local bundle id). Mirrors the
+            // dashboard URL bar's "copy bundle link" affordance.
+            if let Some(b) = state.bundles.get(state.bundle_focus) {
+                let id = if b.remote_id.is_empty() {
+                    &b.id
+                } else {
+                    &b.remote_id
+                };
+                let copied = copy_to_clipboard(id);
+                state.copy_flash = Some((
+                    if copied {
+                        format!("Yanked bundle id ({}…)", short_id(id))
+                    } else {
+                        "Couldn't access clipboard.".into()
+                    },
+                    3,
+                ));
+            }
+        }
+        KeyCode::Char('o') => {
+            // Open the review URL on PCR.dev — works whether the bundle
+            // has been pushed (real remote_id) or only sealed locally
+            // (we still link to /review/<local_id> so the dashboard
+            // shows a "not yet pushed" surface instead of a 404).
+            if let Some(b) = state.bundles.get(state.bundle_focus) {
+                let id = if b.remote_id.is_empty() {
+                    &b.id
+                } else {
+                    &b.remote_id
+                };
+                let url = format!("{}/review/{}", crate::config::APP_URL, id);
+                let ok = webbrowser::open(&url).is_ok();
+                state.copy_flash = Some((
+                    if ok {
+                        format!("Opened {url}")
+                    } else {
+                        format!("Couldn't open browser — visit {url}")
+                    },
+                    4,
+                ));
+            }
+        }
         KeyCode::Char('d') => delete_focused_bundle(state),
         KeyCode::Char('?') => {
             state.copy_flash = Some((
-                "tab back to drafts · j/k move · p push all · d delete focused · q quit".into(),
+                "tab back to drafts · j/k move · p push all · y yank id · o open · d delete · q quit".into(),
                 10,
             ));
         }
@@ -1012,6 +1124,111 @@ fn load_bundles() -> Vec<PromptCommit> {
     all
 }
 
+/// Build the context strip data once. Reads the project context (cheap,
+/// in-process) and queries the store for the newest pushed commit's
+/// `pushed_at` timestamp. Falls back to empty strings when any of the
+/// reads fail so the strip never panics on a fresh install.
+fn build_status_strip(pending: usize, bundles: &[PromptCommit]) -> StatusStrip {
+    let ctx = resolve();
+    let _ = bundles;
+    // Newest pushed commit's `pushed_at`. We rely on the store's
+    // descending sort (newest first); the lookup is a single small
+    // query so we can afford to redo it every 2 s.
+    let last_push_at = store::list_pushed_commits()
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|c| c.pushed_at)
+        .unwrap_or_default();
+    StatusStrip {
+        project: ctx.name,
+        branch: current_branch(),
+        pending,
+        last_push_at,
+    }
+}
+
+/// Render the 1-row context strip: project · branch · drafts · last
+/// push. Mirrors the dashboard's "at a glance" header so terminal users
+/// don't have to bounce back to `pcr status` to remember what they're
+/// looking at.
+fn draw_status_strip(frame: &mut ratatui::Frame, area: Rect, state: &ShowState) {
+    let s = &state.status_strip;
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    spans.push(Span::raw("  "));
+
+    if s.project.is_empty() {
+        spans.push(Span::styled("no project", theme::pending()));
+    } else {
+        spans.push(Span::styled(s.project.clone(), theme::accent_bold()));
+    }
+
+    if !s.branch.is_empty() {
+        spans.push(Span::styled("  ·  ", theme::chrome()));
+        spans.push(Span::styled(format!("⎇ {}", s.branch), theme::text()));
+    }
+
+    spans.push(Span::styled("  ·  ", theme::chrome()));
+    let pending_glyph = if s.pending == 0 {
+        glyphs::SUCCESS
+    } else {
+        glyphs::PENDING
+    };
+    let pending_style = if s.pending == 0 {
+        theme::dim()
+    } else {
+        theme::pending()
+    };
+    spans.push(Span::styled(
+        format!("{} {} draft{}", pending_glyph, s.pending, plural(s.pending)),
+        pending_style,
+    ));
+
+    spans.push(Span::styled("  ·  ", theme::chrome()));
+    let push_label = if s.last_push_at.is_empty() {
+        "↑ never pushed".to_string()
+    } else {
+        format!("↑ {}", time_ago_short(&s.last_push_at))
+    };
+    let push_style = if s.last_push_at.is_empty() {
+        theme::dim()
+    } else {
+        theme::text()
+    };
+    spans.push(Span::styled(push_label, push_style));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Compact "Nm ago" / "Nh ago" / "Nd ago" formatter for the status
+/// strip. Always returns a short string so the strip stays scannable
+/// on a 80-column terminal. Returns `now` for sub-minute deltas.
+fn time_ago_short(iso: &str) -> String {
+    use chrono::{DateTime, Utc};
+    let Ok(t) = DateTime::parse_from_rfc3339(iso) else {
+        return "—".into();
+    };
+    let secs = (Utc::now() - t.with_timezone(&Utc)).num_seconds();
+    if secs < 0 {
+        return "now".into();
+    }
+    if secs < 60 {
+        return "now".into();
+    }
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h ago", secs / 3600);
+    }
+    if secs < 86_400 * 30 {
+        return format!("{}d ago", secs / 86_400);
+    }
+    // Anything older than a month: stop being precise — long enough
+    // that you'd open the dashboard for context anyway.
+    let months = secs / (86_400 * 30);
+    format!("{}mo ago", months)
+}
+
 fn bundle_choices_from(bundles: &[PromptCommit]) -> Vec<BundleChoice> {
     // Every unpushed bundle is a valid add target — the store's
     // `add_drafts_to_bundle` re-opens sealed bundles automatically.
@@ -1093,6 +1310,7 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
+            Constraint::Length(1), // status strip
             Constraint::Min(10),   // body
             Constraint::Length(1), // footer
         ])
@@ -1110,9 +1328,11 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     }
     .render(frame, chunks[0]);
 
+    draw_status_strip(frame, chunks[1], state);
+
     if state.mode == BrowseMode::Bundles {
-        draw_bundles_view(frame, chunks[1], state);
-        draw_footer(frame, chunks[2], state);
+        draw_bundles_view(frame, chunks[2], state);
+        draw_footer(frame, chunks[3], state);
         return;
     }
 
@@ -1133,8 +1353,8 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
         ])
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: false });
-        frame.render_widget(empty, chunks[1]);
-        draw_footer(frame, chunks[2], state);
+        frame.render_widget(empty, chunks[2]);
+        draw_footer(frame, chunks[3], state);
         return;
     }
 
@@ -1149,7 +1369,7 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
                 Constraint::Min(40),    // detail
                 Constraint::Length(28), // changed files / tools
             ])
-            .split(chunks[1])
+            .split(chunks[2])
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -1157,7 +1377,7 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
                 Constraint::Length(28), // drafts list
                 Constraint::Min(40),    // detail (gets the sidebar's columns)
             ])
-            .split(chunks[1])
+            .split(chunks[2])
     };
 
     draw_list(frame, cols[0], state);
@@ -1165,10 +1385,10 @@ fn draw(frame: &mut ratatui::Frame, state: &ShowState) {
     if show_sidebar {
         draw_sidebar(frame, cols[2], state);
     }
-    draw_footer(frame, chunks[2], state);
+    draw_footer(frame, chunks[3], state);
 
     if state.prompt.is_some() {
-        draw_name_prompt(frame, chunks[1], state);
+        draw_name_prompt(frame, chunks[2], state);
     }
 }
 
@@ -1924,6 +2144,10 @@ fn bundles_view_hints() -> Vec<Span<'static>> {
         Span::styled(" move  ", theme::dim()),
         Span::styled("p", theme::accent()),
         Span::styled(" push all  ", theme::dim()),
+        Span::styled("y", theme::accent()),
+        Span::styled(" yank id  ", theme::dim()),
+        Span::styled("o", theme::accent()),
+        Span::styled(" open  ", theme::dim()),
         Span::styled("d", theme::accent()),
         Span::styled(" delete  ", theme::dim()),
         Span::styled("q", theme::accent()),
@@ -1938,6 +2162,26 @@ fn short_path(p: &str) -> String {
     }
     let tail = &parts[parts.len() - 3..];
     format!("…/{}", tail.join("/"))
+}
+
+/// First 8 chars of an id for the copy-flash banner. Bundle ids look
+/// like `bundle-<32hex>` and draft ids are uuid-shaped; either way the
+/// first 8 chars are enough to identify a row in the active screen
+/// without bleeding clipboard contents into the flash.
+fn short_id(id: &str) -> String {
+    let take = id.strip_prefix("bundle-").unwrap_or(id);
+    take.chars().take(8).collect()
+}
+
+/// Dashboard URL for the project a draft belongs to. Falls back to the
+/// app root when the draft hasn't been attributed to a remote project
+/// yet (e.g. anonymous capture).
+fn draft_dashboard_url(d: &DraftRecord) -> String {
+    if d.project_id.is_empty() {
+        crate::config::APP_URL.to_string()
+    } else {
+        format!("{}/projects/{}", crate::config::APP_URL, d.project_id)
+    }
 }
 
 /// Best-effort clipboard copy via `pbcopy` / `wl-copy` / `xclip` /

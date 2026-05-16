@@ -2,7 +2,7 @@
 
 use crate::agent::{self, OutputMode};
 use crate::auth;
-use crate::display;
+use crate::display::{self, Color};
 use crate::entry::PullArgs;
 use crate::exit::ExitCode;
 use crate::store;
@@ -89,11 +89,18 @@ pub fn run(_mode: OutputMode, args: PullArgs) -> ExitCode {
             restored += 1;
         }
     }
+    display::eprintln("");
     display::eprintln(&format!(
-        "PCR: Restored {} prompt{} from prompt bundle {}",
-        restored,
-        plural(restored),
-        remote_id
+        "{} {}",
+        display::cstr(Color::Green, "▲"),
+        display::cstr(
+            Color::Bold,
+            &format!(
+                "restored {restored} prompt{} from bundle {remote_id}",
+                plural(restored)
+            ),
+        ),
     ));
+    display::print_hint("inspect them with `pcr show` or re-bundle and push when ready");
     ExitCode::Success
 }

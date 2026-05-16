@@ -3,11 +3,12 @@
 //! `upsert_bundle_prompts`.
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use crate::agent::OutputMode;
 use crate::auth;
 use crate::config;
-use crate::display;
+use crate::display::{self, Color};
 use crate::exit::ExitCode;
 use crate::projects;
 use crate::sources::shared::git;
@@ -52,7 +53,9 @@ pub fn run(_mode: OutputMode) -> ExitCode {
         commits.push(c);
     }
 
-    let mut pushed = 0usize;
+    let started = Instant::now();
+    let mut pushed_bundles = 0usize;
+    let mut pushed_prompts = 0usize;
     // The cwd's current branch is wherever the user happens to be when
     // they run `pcr push` — not where the prompts were captured. Pass
     // it as a last-ditch fallback only; per-bundle and per-prompt
@@ -60,22 +63,57 @@ pub fn run(_mode: OutputMode) -> ExitCode {
     // normalizes detached-HEAD to empty.
     let cwd_branch_fallback = crate::commands::helpers::current_branch();
     for commit in &commits {
-        pushed += push_bundle(&commit.id, &cwd_branch_fallback, &a.user_id);
+        let (ok, n_prompts) = push_bundle(&commit.id, &cwd_branch_fallback, &a.user_id);
+        pushed_bundles += ok;
+        pushed_prompts += n_prompts;
     }
-    if pushed == 0 {
+    if pushed_bundles == 0 {
         display::eprintln("PCR: Nothing new pushed.");
+        return ExitCode::Success;
     }
+    print_push_summary(pushed_prompts, pushed_bundles, started.elapsed());
     ExitCode::Success
 }
 
-fn push_bundle(local_id: &str, cwd_branch_fallback: &str, user_id: &str) -> usize {
+/// Reward-the-user closing line. Mirrors the dashboard's "shipped"
+/// surface: glyph + count + duration in success tone, with a tight hint
+/// for the next move so review-flow momentum doesn't stall here.
+fn print_push_summary(prompts: usize, bundles: usize, dur: std::time::Duration) {
+    let secs = dur.as_secs_f64();
+    let took = if secs < 1.0 {
+        format!("{:.0}ms", dur.as_millis())
+    } else {
+        format!("{:.1}s", secs)
+    };
+    display::eprintln("");
+    display::eprintln(&format!(
+        "{} {}",
+        display::cstr(Color::Green, "▲"),
+        display::cstr(
+            Color::Bold,
+            &format!(
+                "pushed {prompts} prompt{} in {bundles} bundle{} · {took}",
+                plural(prompts),
+                plural(bundles),
+            ),
+        ),
+    ));
+    display::print_hint("review on PCR.dev or run `pcr pull <id>` to restore drafts elsewhere");
+}
+
+/// Push a single sealed bundle. Returns `(bundles_pushed, prompts_pushed)`
+/// — both are 1+N on success and 0/0 on any failure. Splitting them
+/// lets the caller assemble a one-line summary without re-querying the
+/// store for prompt counts.
+fn push_bundle(local_id: &str, cwd_branch_fallback: &str, user_id: &str) -> (usize, usize) {
     let Some(c) = store::get_commit_with_items(local_id).ok().flatten() else {
-        return 0;
+        return (0, 0);
     };
 
     let source = dominant_source(&c.items);
     let touched = collect_touched_projects(&c.items, cwd_branch_fallback);
 
+    let prompt_count = c.items.len();
     let remote_id = match supabase::upsert_bundle(
         "",
         &BundleData {
@@ -97,7 +135,8 @@ fn push_bundle(local_id: &str, cwd_branch_fallback: &str, user_id: &str) -> usiz
                 "PCR: Failed to push prompt bundle {:?}: {e}",
                 c.message
             ));
-            return 0;
+            display::print_hint("retry with `pcr push` — sealed bundles persist locally");
+            return (0, 0);
         }
     };
 
@@ -138,7 +177,7 @@ fn push_bundle(local_id: &str, cwd_branch_fallback: &str, user_id: &str) -> usiz
     if let Some(pr_url) = detect_github_pr() {
         display::eprintln(&format!("    PR:      {pr_url}"));
     }
-    1
+    (1, prompt_count)
 }
 
 /// Pick the bundle's branch from what the watchers actually captured.

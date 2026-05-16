@@ -452,11 +452,20 @@ fn run_bundle_create(name: &str, select_arg: &str, repo_filter: Option<&str>) ->
         return ExitCode::GenericError;
     }
 
+    display::eprintln("");
     display::eprintln(&format!(
-        "PCR: Created prompt bundle {name:?} ({} prompt{}) — push with `pcr push`",
-        selected.len(),
-        plural(selected.len()),
+        "{} {}",
+        display::cstr(Color::Green, "▲"),
+        display::cstr(
+            Color::Bold,
+            &format!(
+                "bundled {} prompt{} as {name:?}",
+                selected.len(),
+                plural(selected.len()),
+            ),
+        ),
     ));
+    display::print_hint("push it to PCR.dev with `pcr push`");
     ExitCode::Success
 }
 
@@ -501,11 +510,20 @@ fn run_bundle_add(name: &str, select_arg: &str) -> ExitCode {
         display::print_error("bundle", &e.to_string());
         return ExitCode::GenericError;
     }
+    display::eprintln("");
     display::eprintln(&format!(
-        "PCR: Added {} prompt{} to {name:?} — push with `pcr push`",
-        selected.len(),
-        plural(selected.len())
+        "{} {}",
+        display::cstr(Color::Green, "▲"),
+        display::cstr(
+            Color::Bold,
+            &format!(
+                "added {} prompt{} to {name:?}",
+                selected.len(),
+                plural(selected.len())
+            ),
+        ),
     ));
+    display::print_hint("push it to PCR.dev with `pcr push`");
     ExitCode::Success
 }
 

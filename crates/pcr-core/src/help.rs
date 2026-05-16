@@ -241,3 +241,52 @@ pub fn render_plain(entry: &HelpEntry) -> String {
     out.push_str(&format!("\nMore: https://pcr.dev/docs/{}\n", entry.command));
     out
 }
+
+/// Concise `long_about` for `pcr <cmd> --help`. Pairs with
+/// [`render_after_help`] so clap's two help slots split cleanly:
+/// `long_about` carries purpose + the "when to use" paragraph (always
+/// shown above the auto-generated USAGE / OPTIONS), and `after_help`
+/// carries the worked examples + cross-refs (always shown below).
+pub fn render_long_about(entry: &HelpEntry) -> String {
+    let mut out = String::new();
+    out.push_str(entry.purpose);
+    out.push_str("\n\nWhen to use:\n  ");
+    out.push_str(entry.when_to_use);
+    out
+}
+
+/// Render the worked examples + see-also block for clap's `after_help`.
+/// Falls under USAGE in `pcr <cmd> --help` so newcomers always get a
+/// copy-pasteable command instead of having to read the prose.
+pub fn render_after_help(entry: &HelpEntry) -> String {
+    let mut out = String::new();
+    if !entry.examples.is_empty() {
+        out.push_str("Examples:\n");
+        for (cmd, desc) in entry.examples {
+            out.push_str(&format!("  $ {cmd}\n      {desc}\n"));
+        }
+    }
+    if !entry.see_also.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("See also:  ");
+        out.push_str(
+            &entry
+                .see_also
+                .iter()
+                .map(|s| format!("pcr {s}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "Docs:      https://pcr.dev/docs/{}",
+        entry.command
+    ));
+    out
+}
