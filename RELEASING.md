@@ -1,5 +1,9 @@
 # Releasing `pcr-dev`
 
+> `main` is protected — direct pushes are rejected. All releases must
+> go through a PR (`gh pr create … && gh pr merge --squash
+> --delete-branch`) before the tag push step below.
+
 This repo now produces two artifacts from a single Rust codebase rooted at
 the repo root:
 
@@ -23,13 +27,28 @@ merge. The last Go release lives behind the `v0.1.17` tag if you ever need it.
    # crates/pcr-napi/package.json — optionalDependencies entries
    ```
 
-2. Commit, tag, push.
+2. Land the bump via a PR, then tag the merge commit.
+
+   `main` is protected; direct pushes are rejected. Open a PR with the
+   version-bump commit, get the PR-CI workflow green, squash-merge, and
+   then tag the resulting merge commit:
 
    ```bash
+   # On a release branch:
+   git checkout -b release/v0.2.0
    git add -A
    git commit -m "release v0.2.0"
-   git tag v0.2.0
-   git push && git push --tags
+   git push -u origin HEAD
+
+   # Open + merge the PR (squash to keep a single release commit on main):
+   gh pr create --fill --base main
+   gh pr merge --squash --delete-branch
+
+   # Once the squash-merge lands, tag the merge commit on main and push:
+   git checkout main
+   git pull --ff-only
+   git tag -a v0.2.0 -m "v0.2.0"
+   git push origin v0.2.0
    ```
 
    The tag push triggers `.github/workflows/release.yml`, which runs:

@@ -7,22 +7,11 @@
 //! The Go CLI's stdout for the same inputs is expected to differ only in
 //! trailing whitespace, which assert_cmd's `contains` predicates tolerate.
 
-use assert_cmd::Command;
+mod common;
+
+use common::pcr;
 use predicates::prelude::*;
 use tempfile::TempDir;
-
-/// Build a cmd bound to an isolated `$HOME` so the test doesn't touch the
-/// developer's real `~/.pcr-dev/` state.
-fn pcr() -> (Command, TempDir) {
-    let tmp = TempDir::new().expect("tempdir");
-    let mut cmd = Command::cargo_bin("pcr").expect("binary built");
-    cmd.env("HOME", tmp.path())
-        .env("USERPROFILE", tmp.path())
-        .env_remove("CI")
-        .env_remove("NO_COLOR")
-        .env_remove("CURSOR_AGENT");
-    (cmd, tmp)
-}
 
 #[test]
 fn help_mentions_pcr_dev_and_every_subcommand() {
@@ -186,4 +175,43 @@ fn log_plain_empty_store_messaging() {
         .stderr(predicate::str::contains(
             "no project is registered for this directory",
         ));
+}
+
+// ─── Exit-code matrix gap-fillers (Step 5) ──────────────────────────────────
+
+#[test]
+fn push_without_auth_exits_auth_required() {
+    // `pcr push` reaches Supabase, which requires an auth token; with
+    // an empty `~/.pcr-dev/auth.json` we should bail with the
+    // AuthRequired code (10) before any network call.
+    let (mut cmd, _tmp) = pcr();
+    cmd.arg("--plain")
+        .arg("push")
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("Not logged in"));
+}
+
+#[test]
+fn bundle_with_unknown_flag_exits_usage() {
+    // clap rejects unknown args with exit code 2 (Usage) — pin the code
+    // so a refactor that swaps clap for hand-rolled parsing keeps the
+    // contract.
+    let (mut cmd, _tmp) = pcr();
+    cmd.arg("--plain")
+        .arg("bundle")
+        .arg("--nonexistent-flag")
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn bundle_delete_without_name_exits_usage() {
+    let (mut cmd, _tmp) = pcr();
+    cmd.arg("--plain")
+        .arg("bundle")
+        .arg("--delete")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--delete requires a bundle name"));
 }

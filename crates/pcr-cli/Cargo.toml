@@ -20,3 +20,6 @@ assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3.10"
 serde_json = { workspace = true }
+# Already a workspace dep — reused here so the migration smoke test can
+# build a v1-schema fixture DB and re-query it after migrations run.
+rusqlite = { workspace = true }
