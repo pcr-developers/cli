@@ -5,6 +5,7 @@
 //! correctly against rows written by previous Go builds.
 
 use anyhow::{anyhow, Result};
+use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -117,10 +118,35 @@ pub fn prompt_content_hash(session_id: &str, prompt_text: &str, response_text: &
     sha256_hex(&format!("{session_id}\x00{prompt_text}\x00{response_text}"))
 }
 
+/// Normalise an ISO-8601 / RFC-3339 timestamp to a single canonical form
+/// (UTC, millisecond precision, trailing `Z`) before hashing so two
+/// captures of the same prompt that differ only in timestamp formatting
+/// — e.g. `…23.123Z` vs `…23.123456Z` vs `…23.123+00:00` — produce the
+/// same `content_hash` and dedupe against the live unique constraint.
+///
+/// Falls back to the raw string when parsing fails so any pre-existing
+/// hashes computed over non-ISO `captured_at` values stay stable.
+fn normalize_captured_at(captured_at: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(captured_at) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        Err(_) => captured_at.to_string(),
+    }
+}
+
 /// V2 hash: includes `captured_at` instead of the response so two identical
 /// prompts sent at different times in the same session get distinct IDs.
+///
+/// The captured_at value is normalised first (see `normalize_captured_at`)
+/// because the legacy `transcripts/` parser keeps VS Code's raw timestamp
+/// string while the modern `chatSessions/` parser reformats via
+/// `SecondsFormat::Millis`. Without normalisation those two paths hash
+/// differently for the same exchange and bypass the unique constraint
+/// on `prompts.content_hash`.
 pub fn prompt_content_hash_v2(session_id: &str, prompt_text: &str, captured_at: &str) -> String {
-    sha256_hex(&format!("{session_id}\x00{prompt_text}\x00{captured_at}"))
+    let normalized = normalize_captured_at(captured_at);
+    sha256_hex(&format!("{session_id}\x00{prompt_text}\x00{normalized}"))
 }
 
 pub fn prompt_id(session_id: &str, prompt_text: &str, response_text: &str) -> String {
@@ -415,6 +441,38 @@ mod tests {
             prompt_content_hash_v2("s", "p", "2026-04-24T10:00:00Z"),
             prompt_content_hash_v2("s", "p", "2026-04-24T10:00:00Z"),
         );
+    }
+
+    #[test]
+    fn v2_hash_normalizes_captured_at_format() {
+        // Same instant, different RFC-3339 spellings: VS Code's legacy
+        // transcripts/ parser keeps the raw timestamp string while the
+        // chatSessions/ parser reformats via SecondsFormat::Millis.
+        // Both paths must produce the same hash so the unique constraint
+        // on prompts.content_hash dedups them.
+        let millis_z = prompt_content_hash_v2("s", "p", "2026-05-11T10:52:23.123Z");
+        let micros_z = prompt_content_hash_v2("s", "p", "2026-05-11T10:52:23.123456Z");
+        let plus_zero = prompt_content_hash_v2("s", "p", "2026-05-11T10:52:23.123+00:00");
+        let plus_offset = prompt_content_hash_v2("s", "p", "2026-05-11T12:52:23.123+02:00");
+        assert_eq!(millis_z, micros_z);
+        assert_eq!(millis_z, plus_zero);
+        assert_eq!(millis_z, plus_offset);
+        // Same applies to the UUID-shape v2 id.
+        assert_eq!(
+            prompt_id_v2("s", "p", "2026-05-11T10:52:23.123Z"),
+            prompt_id_v2("s", "p", "2026-05-11T10:52:23.123456Z"),
+        );
+
+        // A meaningfully different timestamp must still hash differently.
+        let later = prompt_content_hash_v2("s", "p", "2026-05-11T10:52:24.000Z");
+        assert_ne!(millis_z, later);
+
+        // Unparseable strings preserve the legacy "raw bytes in, raw
+        // bytes hashed" behaviour so we don't silently break any
+        // pre-existing v2 hashes computed over non-RFC3339 inputs.
+        let raw_a = prompt_content_hash_v2("s", "p", "not-a-timestamp");
+        let raw_b = prompt_content_hash_v2("s", "p", "not-a-timestamp ");
+        assert_ne!(raw_a, raw_b);
     }
 
     #[test]

@@ -67,7 +67,9 @@ pub fn run(user_id: &str, _dir: &Path) {
             return;
         };
         for ws in workspaces.iter() {
-            watch_transcript_dir(&mut watcher, &ws.transcript_dir, &state);
+            if let Some(td) = ws.transcript_dir.as_ref() {
+                watch_transcript_dir(&mut watcher, td, &state);
+            }
             watch_transcript_dir(&mut watcher, &ws.chat_sessions_dir, &state);
         }
     }
@@ -186,15 +188,21 @@ fn rescan_workspaces(
         if workspaces.iter().any(|w| w.hash == nm.hash) {
             // Workspace already known, but its chatSessions/transcripts
             // dir may have appeared since the last scan \u2014 re-watch is
-            // idempotent so just call it again.
-            watch_transcript_dir(watcher, &nm.transcript_dir, state);
+            // idempotent so just call it again. `transcript_dir` is
+            // `None` once the modern `chatSessions/` dir exists; in that
+            // case we don't add a legacy watch so we don't dual-capture.
+            if let Some(td) = nm.transcript_dir.as_ref() {
+                watch_transcript_dir(watcher, td, state);
+            }
             watch_transcript_dir(watcher, &nm.chat_sessions_dir, state);
             continue;
         }
         let td = nm.transcript_dir.clone();
         let cs = nm.chat_sessions_dir.clone();
         workspaces.push(nm);
-        watch_transcript_dir(watcher, &td, state);
+        if let Some(td) = td.as_ref() {
+            watch_transcript_dir(watcher, td, state);
+        }
         watch_transcript_dir(watcher, &cs, state);
     }
 }
@@ -281,7 +289,9 @@ fn handle_new_dir(
             let td = nm.transcript_dir.clone();
             let cs = nm.chat_sessions_dir.clone();
             workspaces.push(nm);
-            watch_transcript_dir(watcher, &td, state);
+            if let Some(td) = td.as_ref() {
+                watch_transcript_dir(watcher, td, state);
+            }
             watch_transcript_dir(watcher, &cs, state);
         }
     }
@@ -314,6 +324,15 @@ fn process_file(
     let lines = count_non_empty_lines(&bytes);
     let prev = state.get(file_path);
     let is_chat_sessions = file_path.contains("chatSessions");
+    // Belt-and-braces guard for the dual-watch upgrade window: if a
+    // notify watch on the legacy `transcripts/` dir was registered
+    // before `chatSessions/` appeared (e.g. user upgraded VS Code
+    // mid-session), skip the legacy parser as soon as the modern dir
+    // exists. The chatsession parser owns dedup for that session
+    // going forward.
+    if !is_chat_sessions && ws.chat_sessions_dir.is_dir() {
+        return;
+    }
     // Legacy transcripts are append-only — short-circuit when no new
     // lines have arrived. The new chatSessions format rewrites the
     // file in place (kind=0 snapshot can collapse many ops), so the
@@ -578,8 +597,10 @@ fn find_workspace<'a>(
     for ws in workspaces {
         // The hash_dir is the common ancestor of both `transcripts/` and
         // `chatSessions/` — match against it so either layout resolves to
-        // the same workspace entry.
-        let hash_dir = ws.transcript_dir.parent().and_then(|p| p.parent());
+        // the same workspace entry. `chat_sessions_dir` is always
+        // populated (`<hash>/chatSessions`); its parent is the hash_dir
+        // regardless of whether the directory itself exists yet.
+        let hash_dir = ws.chat_sessions_dir.parent();
         if let Some(hash_dir) = hash_dir {
             if file_path.starts_with(hash_dir.to_string_lossy().as_ref()) {
                 return Some(ws);

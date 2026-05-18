@@ -9,9 +9,13 @@ use crate::projects::{self, Project};
 #[derive(Debug, Clone)]
 pub struct WorkspaceMatch {
     pub hash: String,
-    /// Legacy `GitHub.copilot-chat/transcripts/` directory. Kept for
-    /// older Copilot Chat versions that still use it.
-    pub transcript_dir: PathBuf,
+    /// Legacy `GitHub.copilot-chat/transcripts/` directory. `None` when
+    /// the modern `chatSessions/` directory is also present on disk —
+    /// VS Code Copilot Chat 0.45+ writes both locations during the
+    /// upgrade window, and watching both paths produces duplicate
+    /// captures (different `captured_at` formatting → different
+    /// content hash → no dedup). We prefer the modern format.
+    pub transcript_dir: Option<PathBuf>,
     /// New `chatSessions/` directory introduced in vscode 1.117 /
     /// copilot-chat 0.45+. Holds the actual conversation transcripts
     /// in a CRDT-style JSONL format (see `chatsession_parser`).
@@ -59,8 +63,17 @@ pub fn scan_workspaces() -> Vec<WorkspaceMatch> {
             if matched.is_empty() {
                 continue;
             }
-            let transcript_dir = hash_dir.join("GitHub.copilot-chat").join("transcripts");
+            let legacy_transcript_dir = hash_dir.join("GitHub.copilot-chat").join("transcripts");
             let chat_sessions_dir = hash_dir.join("chatSessions");
+            // Prefer the modern `chatSessions/` layout when it exists.
+            // Returning `None` here stops the watcher from registering a
+            // notify watch on the legacy `transcripts/` directory and
+            // dispatching the same prompt through both parsers.
+            let transcript_dir = if chat_sessions_dir.is_dir() {
+                None
+            } else {
+                Some(legacy_transcript_dir)
+            };
             matches.push(WorkspaceMatch {
                 hash: entry.file_name().to_string_lossy().into_owned(),
                 transcript_dir,
