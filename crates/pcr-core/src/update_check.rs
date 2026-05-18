@@ -59,17 +59,21 @@ struct NpmDistTag {
     version: String,
 }
 
-fn cache_path() -> PathBuf {
-    // `pcr_dir()` currently returns `PathBuf` infallibly (with a temp
-    // fallback). PR #86 changes it to `Result<PathBuf>` — when that
-    // lands, swap this for `pcr_dir().ok()?.join(...)` and downgrade
-    // the helper signature to `Option<PathBuf>`. Until then we keep
-    // the call shape simple.
-    crate::config::pcr_dir().join("update-check.json")
+fn cache_path() -> Option<PathBuf> {
+    // `pcr_dir()` returns `Result<PathBuf>` and errors when neither
+    // `$HOME` nor `%USERPROFILE%` resolves (sandboxes / locked-down
+    // containers). The whole update-notifier module is best-effort,
+    // so we collapse the Err into None and silently skip every cache
+    // operation rather than propagating up to the foreground command.
+    crate::config::pcr_dir()
+        .ok()
+        .map(|p| p.join("update-check.json"))
 }
 
 fn load_cache() -> CachedCheck {
-    let path = cache_path();
+    let Some(path) = cache_path() else {
+        return CachedCheck::default();
+    };
     let Ok(bytes) = std::fs::read(&path) else {
         return CachedCheck::default();
     };
@@ -77,7 +81,7 @@ fn load_cache() -> CachedCheck {
 }
 
 fn save_cache(cache: &CachedCheck) {
-    let path = cache_path();
+    let Some(path) = cache_path() else { return };
     // Make sure the parent dir exists. We don't `?` this because the
     // entire module is best-effort.
     if let Some(parent) = path.parent() {
