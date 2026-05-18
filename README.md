@@ -140,6 +140,24 @@ pcr --json status
 pcr --plain bundle "agent run" --select all && pcr --plain push   # plain mode keeps --select for scripts
 ```
 
+### Update notifier
+
+Every interactive `pcr` command checks the npm registry (at most once
+per 24 h, in a background thread that never blocks the command) for a
+newer `pcr-dev` release and prints a one-line "X is available" notice
+to stderr at the end of the command. The check is cached in
+`~/.pcr-dev/update-check.json` and the notice is throttled to once per
+hour, so back-to-back commands stay quiet. Suggested upgrade command
+is install-method-aware: `brew upgrade pcr` for Homebrew, `npm i -g
+pcr-dev@latest` for npm.
+
+```bash
+PCR_NO_UPDATE_CHECK=1 pcr status   # opt out for one command (or `export` it)
+```
+
+The notice is automatically skipped when `CI` is set, when `--json` is
+used, and for the internal `hook` and `mcp` subcommands.
+
 ## Privacy
 
 - Everything lives in `~/.pcr-dev/` until you explicitly run `pcr push`.

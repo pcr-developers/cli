@@ -234,6 +234,17 @@ pub fn run(argv: Vec<String>) -> i32 {
         }
     };
     let mode = cli.global.output_mode();
+
+    // Best-effort update-available notice. The background refresh runs
+    // for the whole duration of the command; the notice is printed at
+    // the end (after command output, before we return). Both calls are
+    // gated on subcommand kind + `--json` so machine output and the
+    // internal `hook` / `mcp` channels stay silent. See
+    // `update_check.rs` for the full rationale.
+    let subcommand_name = subcommand_name(&cli.command);
+    let json_output = cli.global.json;
+    crate::update_check::spawn_background_refresh(subcommand_name, json_output);
+
     let code: ExitCode = match cli.command {
         // No subcommand → open the interactive command browser. On a non-
         // TTY / `--plain` / `--json` / `CI` / `NO_COLOR`, the help command
@@ -255,7 +266,38 @@ pub fn run(argv: Vec<String>) -> i32 {
         Some(Command::Help) => crate::commands::help::run(mode),
         Some(Command::Hook) => crate::commands::hook::run(mode),
     };
+
+    // Notice runs after the command's own output so it never confuses
+    // the actual command result, and never delays the user's primary
+    // signal. If the background refresh hasn't completed yet, this is
+    // a no-op — the cache from a previous run is consulted on every
+    // invocation, so users see the notice on the *next* command after
+    // the first successful refresh.
+    crate::update_check::print_notice_if_due(subcommand_name, json_output);
+
     code.as_i32()
+}
+
+/// Maps the parsed `Command` variant back to the kebab-case clap name.
+/// Used by `update_check::*` to decide whether to suppress the notice
+/// for internal-only subcommands (`hook`, `mcp`).
+fn subcommand_name(cmd: &Option<Command>) -> Option<&'static str> {
+    Some(match cmd.as_ref()? {
+        Command::Login => "login",
+        Command::Logout => "logout",
+        Command::Init(_) => "init",
+        Command::Start(_) => "start",
+        Command::Mcp => "mcp",
+        Command::Status => "status",
+        Command::Bundle(_) => "bundle",
+        Command::Push => "push",
+        Command::Log => "log",
+        Command::Show(_) => "show",
+        Command::Pull(_) => "pull",
+        Command::Gc(_) => "gc",
+        Command::Help => "help",
+        Command::Hook => "hook",
+    })
 }
 
 // Re-export a render helper for the command implementations that want to
