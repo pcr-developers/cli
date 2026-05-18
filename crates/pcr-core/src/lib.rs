@@ -40,6 +40,7 @@ pub mod sources;
 pub mod store;
 pub mod supabase;
 pub mod tui;
+pub mod update_check;
 pub mod util;
 pub mod versions;
 
