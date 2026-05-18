@@ -411,9 +411,44 @@ pub fn update_draft_response(
         return Ok(());
     }
     let conn = open();
+    // The (session_id, prompt_text) pair isn't unique — Claude Code
+    // and Cursor both let users re-send the same prompt text inside
+    // one session, and we keep both drafts (they get distinct
+    // content_hash values via captured_at). An unscoped UPDATE would
+    // overwrite the older row's response with the newer turn's, so
+    // pin to a single id first.
+    //
+    // The audit suggested SELECT-then-UPDATE over `LIMIT 1` in the
+    // UPDATE itself: rusqlite's bundled SQLite isn't built with
+    // SQLITE_ENABLE_UPDATE_DELETE_LIMIT (verified locally — `UPDATE
+    // ... LIMIT 1` errors with "near \"LIMIT\": syntax error"), and
+    // the two-step shape is more portable across SQLite builds.
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM drafts
+             WHERE session_id = ? AND prompt_text = ? AND status = 'draft'
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 1",
+            params![session_id, prompt_text],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(());
+    };
+    // Apply the don't-shrink guard at UPDATE time (not at SELECT
+    // time): if the newest matching row already has a longer or
+    // equal response, we skip rather than fall back to an older
+    // row that happens to qualify. Otherwise the callers in
+    // `claudecode/watcher.rs::process_file` (which always target
+    // "the newest draft for this (session, prompt)") would
+    // accidentally rewrite an older draft on the second
+    // enrichment pass.
     conn.execute(
-        "UPDATE drafts SET response_text = ? WHERE session_id = ? AND prompt_text = ? AND status = 'draft' AND (response_text IS NULL OR LENGTH(response_text) < LENGTH(?))",
-        params![response_text, session_id, prompt_text, response_text],
+        "UPDATE drafts SET response_text = ?
+         WHERE id = ?
+               AND (response_text IS NULL OR LENGTH(response_text) < LENGTH(?))",
+        params![response_text, id, response_text],
     )?;
     Ok(())
 }
