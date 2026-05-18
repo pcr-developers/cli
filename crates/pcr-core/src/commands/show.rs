@@ -188,7 +188,16 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
                     display::cstr(Color::Cyan, "CHANGED FILES")
                 ));
                 for f in arr {
-                    let short = short_file_path(&format!("{}", f), &proj_by_id);
+                    // `Value::Display` for a JSON string emits the
+                    // surrounding quotes (e.g. `"src/foo.rs"`). Strip
+                    // them via `as_str` so the path renders bare; fall
+                    // back to the JSON form for anything that isn't a
+                    // string so legacy non-string entries still surface.
+                    let raw = f
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| f.to_string());
+                    let short = short_file_path(&raw, &proj_by_id);
                     display::eprintln(&display::cstr(Color::Dim, &format!("  {short}")));
                 }
             }
@@ -213,7 +222,11 @@ pub fn run(mode: OutputMode, args: ShowArgs) -> ExitCode {
                     display::cstr(Color::Gray, "FILES IN CONTEXT")
                 ));
                 for f in arr {
-                    let short = short_file_path(&format!("{}", f), &proj_by_id);
+                    let raw = f
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| f.to_string());
+                    let short = short_file_path(&raw, &proj_by_id);
                     display::eprintln(&display::cstr(Color::Dim, &format!("  {short}")));
                 }
             }
