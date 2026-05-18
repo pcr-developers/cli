@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::projects::{self, Project};
+use crate::projects;
 use crate::sources::shared::git;
 
 #[derive(Debug, Default, Clone)]
@@ -88,8 +88,4 @@ pub fn load_proj_by_id() -> std::collections::BTreeMap<String, String> {
         }
     }
     m
-}
-
-pub fn _unused_project(p: &Project) -> &Project {
-    p
 }
