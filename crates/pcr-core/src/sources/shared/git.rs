@@ -96,12 +96,30 @@ pub fn get_git_diff(project_path: &str) -> String {
     }
     const MAX: usize = 50_000;
     if combined.len() > MAX {
-        let mut out = combined[..MAX].to_string();
+        // Truncate on a char boundary; raw byte slicing panics when the
+        // ceiling lands inside a multi-byte sequence (UTF-8 source
+        // file, non-ASCII in a diff hunk).
+        let cut = floor_char_boundary(&combined, MAX);
+        let mut out = combined[..cut].to_string();
         out.push_str("\n[truncated]");
         out
     } else {
         combined
     }
+}
+
+/// Largest char-boundary index `<= idx` in `s`. Re-implementation of
+/// the unstable `str::floor_char_boundary` so we can keep using stable
+/// Rust on the workspace toolchain.
+pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn untracked_diff(project_path: &str) -> String {
@@ -217,4 +235,38 @@ pub fn git_output(args: &[&str]) -> String {
 
 pub fn git_output_in(dir: &str, args: &[&str]) -> String {
     run(args, Some(dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::floor_char_boundary;
+
+    #[test]
+    fn floor_char_boundary_handles_ascii() {
+        assert_eq!(floor_char_boundary("hello world", 5), 5);
+        assert_eq!(floor_char_boundary("hello world", 100), 11);
+    }
+
+    #[test]
+    fn floor_char_boundary_walks_back_past_multibyte() {
+        // `é` is 2 bytes (0xC3 0xA9) in UTF-8 — slicing at the middle
+        // byte (index 5) of "caf\u{00e9}" would panic; we expect to
+        // walk back to byte 3 (boundary right before `é`).
+        let s = "café"; // bytes: c a f 0xC3 0xA9 → len 5
+        assert_eq!(s.len(), 5);
+        assert_eq!(floor_char_boundary(s, 4), 3);
+    }
+
+    #[test]
+    fn floor_char_boundary_walks_back_from_mid_emoji() {
+        let s = "ab🦀cd"; // bytes: a b 🦀(4) c d → len 8
+        assert_eq!(s.len(), 8);
+        // Byte 6 is the start of `c` — already a boundary, leave alone.
+        assert_eq!(floor_char_boundary(s, 6), 6);
+        // Byte 4 lands inside the 🦀 sequence — walk back to byte 2.
+        let cut = floor_char_boundary(s, 4);
+        assert_eq!(cut, 2);
+        // Slicing must not panic.
+        let _ = &s[..cut];
+    }
 }
