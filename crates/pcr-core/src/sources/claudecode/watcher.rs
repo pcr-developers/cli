@@ -185,12 +185,19 @@ pub fn process_file(
     if !force_full_scan && line_count <= prev_count {
         return;
     }
-    state.set(file_path, line_count);
 
     let session = parse_claude_code_session(&content, &project_name, file_path);
     if session.prompts.is_empty() {
+        // Parse extracted nothing usable. Leave the state cursor alone so
+        // the next scan re-tries this file — otherwise a transient parse
+        // failure (corrupt JSONL, truncated write, schema drift) would
+        // silently advance the line count and stay invisible until a
+        // full rescan, which never happens in the steady-state watcher.
         return;
     }
+    // Parse produced prompts. Now it's safe to advance the state cursor
+    // so the next scan only considers freshly appended lines.
+    state.set(file_path, line_count);
 
     let schema_v = versions::CAPTURE_SCHEMA_VERSION;
     let mut base_file_context = serde_json::Map::new();

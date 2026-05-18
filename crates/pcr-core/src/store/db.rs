@@ -17,15 +17,21 @@ use crate::config;
 
 static CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
 
-fn db_path() -> PathBuf {
-    config::pcr_dir().join("drafts.db")
+fn db_path() -> anyhow::Result<PathBuf> {
+    Ok(config::pcr_dir()?.join("drafts.db"))
 }
 
 /// Open (and lazily create) the singleton database. Returns a locked guard
-/// around a `rusqlite::Connection`.
+/// around a `rusqlite::Connection`. Panics with a clear message if `$HOME`
+/// can't be resolved — the CLI can't function at all without its local
+/// store, so failing fast here is strictly better than the previous
+/// silent `/tmp` fallback (which evaporated drafts on reboot).
 pub fn open() -> MutexGuard<'static, Connection> {
     let mutex = CONN.get_or_init(|| {
-        let path = db_path();
+        let path = db_path().expect(
+            "pcr: cannot determine $HOME — refusing to open the draft store under /tmp \
+             (set HOME and re-run)",
+        );
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

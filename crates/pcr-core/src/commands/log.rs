@@ -32,8 +32,14 @@ fn short_sha(sha: &str) -> String {
     if sha.starts_with("manual-") {
         return "[manual]".to_string();
     }
-    if sha.len() >= 7 {
-        return sha[..7].to_string();
+    // Real SHAs are hex (ASCII), but `short_sha` is called on whatever
+    // sha string the store handed us — including the "manual-*"
+    // sentinels and any future non-ASCII tags. `chars().take(7)`
+    // matches the truncate-on-char-boundary fix in `util::text` and
+    // never panics on multi-byte input.
+    let short: String = sha.chars().take(7).collect();
+    if short.chars().count() == 7 {
+        return short;
     }
     sha.to_string()
 }

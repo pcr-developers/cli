@@ -129,8 +129,14 @@ impl DiffTracker {
         // Discard any diff events older than our start time — they came from
         // a previous run.
         let _ = store::prune_diff_events(self.started_at);
-        loop {
-            std::thread::sleep(self.poll_interval);
+        // Cooperative shutdown: see `crate::shutdown` — the tick stays
+        // 3 s (or whatever was configured) but the sleep is sliced so
+        // Ctrl-C lands within ~200 ms instead of waiting for the next
+        // tick boundary.
+        while crate::shutdown::sleep_unless_shutdown(self.poll_interval) {
+            if crate::shutdown::is_shutting_down() {
+                break;
+            }
             self.poll();
         }
     }
@@ -138,12 +144,19 @@ impl DiffTracker {
 
 // ─── State persistence ───────────────────────────────────────────────────────
 
-fn state_path() -> PathBuf {
-    config::pcr_dir().join("diff-tracker-state.json")
+fn state_path() -> Option<PathBuf> {
+    // Soft-state path: if `$HOME` can't be resolved, we just skip
+    // persistence entirely. The diff tracker still works in-memory
+    // — losing the previous-state snapshot means the next session
+    // starts fresh, which is the same behaviour as a first run.
+    Some(config::pcr_dir().ok()?.join("diff-tracker-state.json"))
 }
 
 fn load_state(inner: &mut Inner) {
-    let Ok(bytes) = std::fs::read(state_path()) else {
+    let Some(path) = state_path() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
         return;
     };
     if let Ok(loaded) = serde_json::from_slice::<HashMap<String, HashMap<String, String>>>(&bytes) {
@@ -152,6 +165,9 @@ fn load_state(inner: &mut Inner) {
 }
 
 fn save_state(inner: &Arc<Mutex<Inner>>) {
+    let Some(path) = state_path() else {
+        return;
+    };
     let Ok(guard) = inner.lock() else {
         return;
     };
@@ -160,10 +176,10 @@ fn save_state(inner: &Arc<Mutex<Inner>>) {
     let Ok(bytes) = serde_json::to_vec(&snapshot) else {
         return;
     };
-    if let Some(parent) = state_path().parent() {
+    if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(state_path(), bytes);
+    let _ = std::fs::write(&path, bytes);
 }
 
 /// Relative paths that changed between two dirty-file snapshots.
