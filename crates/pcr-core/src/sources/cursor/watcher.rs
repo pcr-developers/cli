@@ -3,12 +3,12 @@
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use notify::{EventKind, RecursiveMode, Watcher as NotifyWatcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use walkdir::WalkDir;
 
 use crate::display;
@@ -32,6 +32,25 @@ pub struct PromptScanner {
     diff_tracker: Option<Arc<DiffTracker>>,
     seen: Arc<Mutex<HashSet<String>>>,
     initial_scan: Arc<Mutex<bool>>,
+    /// Per-file mtime cache from the last completed walk. The
+    /// periodic scan path skips any file whose mtime is still
+    /// equal to the cached value — `process_session` is a no-op on
+    /// already-processed bubbles via the dedup hash, but for
+    /// hundreds of stable transcripts the open + walk + JSON
+    /// re-fetch cost dominates a `~/.cursor/projects/` tree. See
+    /// `collect_changed_transcripts` for the fast-path / per-file
+    /// skip logic.
+    mtime_cache: Arc<Mutex<HashMap<PathBuf, SystemTime>>>,
+    /// Top-level dir mtime from the last walk. A new project
+    /// subdirectory always changes the parent's mtime, so we can
+    /// shortcut "no new projects + no notify activity" into a
+    /// no-op without walking anything.
+    last_dir_mtime: Arc<Mutex<Option<SystemTime>>>,
+    /// Set by the `notify` fast-path the moment a transcript-shaped
+    /// path mutates; consumed (cleared) at the top of the next
+    /// scan so the periodic safety-net loop knows whether anything
+    /// happened since it last walked.
+    notify_event_pending: Arc<Mutex<bool>>,
 }
 
 impl PromptScanner {
@@ -42,6 +61,9 @@ impl PromptScanner {
             diff_tracker,
             seen: Arc::new(Mutex::new(HashSet::new())),
             initial_scan: Arc::new(Mutex::new(true)),
+            mtime_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_dir_mtime: Arc::new(Mutex::new(None)),
+            notify_event_pending: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -52,31 +74,114 @@ impl PromptScanner {
         } else {
             display::print_watcher_ready("Cursor", &self.dir.display().to_string());
         }
-        // Initial silent scan.
-        self.scan();
+        // Initial silent scan. Force the walk past the fast-path
+        // skip — the caches start empty so we need a full
+        // enumeration to populate them anyway.
+        self.scan_inner(true);
         if let Ok(mut flag) = self.initial_scan.lock() {
             *flag = false;
         }
         // Kick off fsnotify fast-path in a thread.
         let s2 = self.clone();
         thread::spawn(move || s2.watch_fsnotify());
-        // Periodic 20-second scan. `sleep_unless_shutdown` breaks the
-        // sleep into 200 ms slices so Ctrl-C lands within one slice
-        // instead of stalling up to 20 s. When it returns false the
-        // shutdown flag has flipped — exit cleanly so the parent
-        // `pcr start` can drop its PidFileGuard and return.
-        while crate::shutdown::sleep_unless_shutdown(Duration::from_secs(20)) {
+        // Periodic safety-net walk. `notify` is the primary signal
+        // for new transcripts (sub-second after a debounce); this
+        // loop only catches notify-misses, so 60 s is plenty —
+        // bumped from the previous 20 s after the audit flagged
+        // the CPU/disk cost of full WalkDir traversals over
+        // `~/.cursor/projects/` every 20 s at scale. With the
+        // mtime cache the per-iteration cost is also much lower:
+        // a single `stat` on the top-level dir plus only
+        // `stat + parse` on files whose mtime advanced since the
+        // last walk.
+        while crate::shutdown::sleep_unless_shutdown(Duration::from_secs(60)) {
             if crate::shutdown::is_shutting_down() {
                 break;
             }
-            self.scan();
+            self.scan_inner(false);
         }
     }
 
+    /// Public entry — calls into the shared scan path, letting the
+    /// fast-path / per-file cache decide whether work needs to
+    /// happen. Used by `watch_fsnotify` and by `force_sync` so a
+    /// notify hit always walks (the event-pending flag is set
+    /// before calling).
     fn scan(&self) {
+        self.scan_inner(false);
+    }
+
+    /// Inner scan with explicit force flag. `force = true` bypasses
+    /// the dir-mtime / event-pending fast-path skip (used on the
+    /// initial scan, when the caches are guaranteed empty).
+    fn scan_inner(&self, force: bool) {
         if let Some(dt) = &self.diff_tracker {
             dt.poll();
         }
+        let Some(changed) = self.collect_changed_transcripts(force) else {
+            return;
+        };
+        for path in changed {
+            let Some((project_slug, session_id)) = parse_transcript_path(&path) else {
+                continue;
+            };
+            self.process_session(&project_slug, &session_id);
+        }
+    }
+
+    /// Enumerate transcripts that need reprocessing this tick. Returns
+    /// `None` when the caller should skip the walk entirely (the
+    /// fast-path: top-level dir mtime unchanged AND no notify event
+    /// has landed since the last walk). Otherwise returns the subset
+    /// of transcripts whose per-file mtime moved since the last walk
+    /// — `process_session` is a no-op on unchanged content thanks to
+    /// the `seen` dedup, but the stat-loop savings dominate on
+    /// directories with hundreds of stable transcripts.
+    ///
+    /// Always populates `mtime_cache` with the full current snapshot
+    /// when a walk runs, so the next call has an accurate baseline.
+    fn collect_changed_transcripts(&self, force: bool) -> Option<Vec<PathBuf>> {
+        let dir_mtime = std::fs::metadata(&self.dir)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let prev_dir_mtime = self.last_dir_mtime.lock().ok().and_then(|g| *g);
+
+        // Consume the notify-event flag — whether or not we end up
+        // walking, the flag should reset, since "walk performed"
+        // observes everything notify could have hinted at.
+        let notify_event = {
+            let mut guard = self.notify_event_pending.lock().ok()?;
+            let was_set = *guard;
+            *guard = false;
+            was_set
+        };
+
+        // Top-level mtime updates only when a new project subdir is
+        // created/removed. Within an existing project, new sessions
+        // don't touch the parent's mtime, so we need the notify
+        // signal to cover that path. When both signals are quiet
+        // and we're not forced, nothing can have changed since the
+        // last walk → skip.
+        let dir_changed = dir_mtime.is_some() && dir_mtime != prev_dir_mtime;
+        if !force && !dir_changed && !notify_event {
+            return None;
+        }
+
+        if let Ok(mut guard) = self.last_dir_mtime.lock() {
+            *guard = dir_mtime;
+        }
+
+        let mut new_cache: HashMap<PathBuf, SystemTime> = HashMap::new();
+        let mut changed: Vec<PathBuf> = Vec::new();
+
+        // Snapshot the previous cache outside the walk so we hold
+        // the lock for as little time as possible.
+        let prev_cache: HashMap<PathBuf, SystemTime> = self
+            .mtime_cache
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
         for entry in WalkDir::new(&self.dir).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
@@ -85,11 +190,22 @@ impl PromptScanner {
             if !is_agent_transcript(path) {
                 continue;
             }
-            let Some((project_slug, session_id)) = parse_transcript_path(path) else {
-                continue;
-            };
-            self.process_session(&project_slug, &session_id);
+            let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+            if let Some(m) = mtime {
+                new_cache.insert(path.to_path_buf(), m);
+                if prev_cache.get(path).copied() == Some(m) {
+                    // Same mtime as last walk → no new bubbles to
+                    // observe. Skip the per-session work entirely.
+                    continue;
+                }
+            }
+            changed.push(path.to_path_buf());
         }
+
+        if let Ok(mut guard) = self.mtime_cache.lock() {
+            *guard = new_cache;
+        }
+        Some(changed)
     }
 
     fn process_session(&self, project_slug: &str, session_id: &str) {
@@ -569,6 +685,15 @@ impl PromptScanner {
             }
             for p in &event.paths {
                 if is_agent_transcript(p) {
+                    // Signal the periodic scan path that a notify
+                    // event has landed since the last walk, so the
+                    // next periodic tick doesn't short-circuit
+                    // even if the top-level dir mtime didn't move
+                    // (new bubbles in an existing session don't
+                    // change `~/.cursor/projects/`'s mtime).
+                    if let Ok(mut guard) = self.notify_event_pending.lock() {
+                        *guard = true;
+                    }
                     if let Ok(mut guard) = debounce_fire.lock() {
                         *guard = Some(Instant::now() + Duration::from_millis(500));
                     }
@@ -806,6 +931,156 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    /// Build a temp `~/.cursor/projects/`-shaped tree with one or
+    /// more transcripts. Returns the temp dir (held for lifetime)
+    /// and the absolute paths of the created transcripts.
+    fn make_transcript_tree(specs: &[(&str, &str)]) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for (slug, sid) in specs {
+            let dir = tmp.path().join(slug).join("agent-transcripts").join(sid);
+            std::fs::create_dir_all(&dir).expect("mkdir transcripts");
+            let p = dir.join(format!("{sid}.jsonl"));
+            std::fs::write(&p, b"placeholder\n").expect("write transcript");
+            paths.push(p);
+        }
+        (tmp, paths)
+    }
+
+    /// Bump the mtime of `path` to "now + 1s" so coarse-resolution
+    /// filesystems (ext4 with 1 s mtime quantization, HFS+, etc.)
+    /// still distinguish "previous walk" from "after this poke".
+    fn poke_mtime(path: &Path) {
+        // Re-write so the kernel updates mtime — `filetime` would
+        // be cleaner but we don't ship it; this avoids a dep.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut contents = std::fs::read(path).expect("read");
+        contents.push(b'\n');
+        std::fs::write(path, contents).expect("rewrite");
+    }
+
+    fn scanner_for(dir: PathBuf) -> PromptScanner {
+        PromptScanner::new(dir, String::new(), None)
+    }
+
+    #[test]
+    fn collect_pending_initial_walk_returns_all_transcripts() {
+        let (tmp, paths) = make_transcript_tree(&[("proj-a", "sid-a"), ("proj-b", "sid-b")]);
+        let s = scanner_for(tmp.path().to_path_buf());
+
+        // Force=true mirrors `start()`'s initial scan.
+        let pending = s
+            .collect_changed_transcripts(true)
+            .expect("initial walk must run");
+        assert_eq!(pending.len(), paths.len(), "every transcript pending");
+        for p in &paths {
+            assert!(pending.contains(p), "missing path {p:?}");
+        }
+        let cache_size = s.mtime_cache.lock().unwrap().len();
+        assert_eq!(cache_size, paths.len(), "cache populated after walk");
+    }
+
+    #[test]
+    fn collect_pending_fast_path_skips_when_nothing_changed() {
+        let (tmp, _) = make_transcript_tree(&[("proj-x", "sid-x")]);
+        let s = scanner_for(tmp.path().to_path_buf());
+
+        // Populate caches.
+        s.collect_changed_transcripts(true).expect("initial walk");
+
+        // Second poll: dir mtime hasn't moved, no notify event has
+        // been signalled — fast-path returns None so the periodic
+        // safety-net doesn't redo work the notify path would have
+        // already handled.
+        let pending = s.collect_changed_transcripts(false);
+        assert!(
+            pending.is_none(),
+            "fast-path must skip when neither the dir mtime nor a notify event \
+             indicates anything has changed; got {pending:?}"
+        );
+    }
+
+    #[test]
+    fn collect_pending_walks_when_notify_event_signalled() {
+        let (tmp, _) = make_transcript_tree(&[("proj-y", "sid-y")]);
+        let s = scanner_for(tmp.path().to_path_buf());
+
+        s.collect_changed_transcripts(true).expect("initial walk");
+
+        // Simulate the notify fast-path firing — bubble write inside
+        // an existing session doesn't bump the top-level dir mtime,
+        // so the only signal the periodic loop has is this flag.
+        *s.notify_event_pending.lock().unwrap() = true;
+
+        let pending = s
+            .collect_changed_transcripts(false)
+            .expect("notify event must force a walk");
+        // No mtimes changed → empty list (per-file fast-path), but the
+        // walk DID run (Some) and the event flag was consumed.
+        assert!(
+            pending.is_empty(),
+            "walk ran but no file mtimes moved → no pending work; got {pending:?}"
+        );
+        assert!(
+            !*s.notify_event_pending.lock().unwrap(),
+            "notify event flag must be consumed by the walk"
+        );
+    }
+
+    #[test]
+    fn collect_pending_returns_only_files_whose_mtime_moved() {
+        let (tmp, paths) = make_transcript_tree(&[("proj-1", "sid-1"), ("proj-2", "sid-2")]);
+        let s = scanner_for(tmp.path().to_path_buf());
+
+        // Initial walk populates caches.
+        s.collect_changed_transcripts(true).expect("initial walk");
+
+        // Touch one file so its mtime moves. The audit's "pickup
+        // latency" test: drop / modify a transcript and verify the
+        // next walk returns it, while leaving the other transcript
+        // out of the change list.
+        poke_mtime(&paths[1]);
+        *s.notify_event_pending.lock().unwrap() = true;
+
+        let pending = s
+            .collect_changed_transcripts(false)
+            .expect("walk triggered by notify");
+        assert_eq!(
+            pending.len(),
+            1,
+            "only the touched transcript should be pending; got {pending:?}"
+        );
+        assert_eq!(pending[0], paths[1]);
+    }
+
+    #[test]
+    fn collect_pending_force_runs_walk_even_without_signals() {
+        let (tmp, _) = make_transcript_tree(&[("proj-z", "sid-z")]);
+        let s = scanner_for(tmp.path().to_path_buf());
+
+        // Populate caches, then prove force=true bypasses the
+        // fast-path the next call would otherwise take. Matches
+        // the initial-scan invocation in `start()`.
+        s.collect_changed_transcripts(true).expect("initial walk");
+        let pending = s
+            .collect_changed_transcripts(true)
+            .expect("force=true must always walk");
+        assert!(pending.is_empty(), "no changes → empty list, but Some(_)");
+    }
+
+    /// Sanity check: a baseline-resolution mtime equality compare
+    /// is what gates the per-file skip. `SystemTime::eq` is exact;
+    /// document the contract so future readers don't accidentally
+    /// switch to a coarser comparison.
+    #[test]
+    fn systemtime_equality_is_exact() {
+        let now = SystemTime::now();
+        assert_eq!(now, now);
+        let later = now + std::time::Duration::from_nanos(1);
+        assert_ne!(now, later);
+    }
 
     fn ev(id: i64, project_id: &str, files: &[&str]) -> DiffEvent {
         DiffEvent {
