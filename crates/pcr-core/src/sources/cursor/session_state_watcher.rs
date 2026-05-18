@@ -61,7 +61,12 @@ impl SessionStateWatcher {
                 ..Default::default()
             });
             if let Some(prev) = prev {
-                let short = &row.composer_id[..row.composer_id.len().min(8)];
+                // Composer IDs are UUIDs in practice (ASCII), but we treat
+                // them as untrusted external text — byte-slice on a non-
+                // self-allocated string panics if a char boundary falls in
+                // the middle, matching the truncate-on-char-boundary fix
+                // applied elsewhere (`util::text::truncate`).
+                let short: String = row.composer_id.chars().take(8).collect();
                 if prev.unified_mode != snap.unified_mode && !snap.unified_mode.is_empty() {
                     display::print_verbose_event(
                         "session",
