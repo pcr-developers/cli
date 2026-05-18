@@ -20,8 +20,25 @@ struct FileStateInner {
 }
 
 impl FileState {
+    /// Build a per-source line-state tracker rooted at
+    /// `$HOME/.pcr-dev/<name>-state.json`. Panics with a clear
+    /// message if `$HOME` can't be resolved — without a stable
+    /// state file the watcher would silently drop its cursor on
+    /// reboot (the audit's correctness concern) and re-emit every
+    /// prompt on the next start. Failing fast at watcher
+    /// construction is strictly better than the previous silent
+    /// `/tmp` fallback. Source-watcher entry points
+    /// (`vscode::watcher::run`, `claudecode::watcher::run`) are
+    /// the only callers; all of them are themselves invoked from
+    /// `pcr start` which has already validated the directory via
+    /// `pid_file_path()?`.
     pub fn new(name: &str) -> Self {
-        let file_path = config::pcr_dir().join(format!("{name}-state.json"));
+        let file_path = config::pcr_dir()
+            .expect(
+                "pcr: cannot determine $HOME — refusing to put the watcher state file \
+                 under /tmp (would reset capture cursors on every reboot)",
+            )
+            .join(format!("{name}-state.json"));
         let state = Self {
             inner: Arc::new(Mutex::new(FileStateInner {
                 data: HashMap::new(),

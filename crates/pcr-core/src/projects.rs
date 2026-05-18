@@ -36,15 +36,24 @@ struct Registry {
     projects: Vec<Project>,
 }
 
-fn file_path() -> PathBuf {
-    config::pcr_dir().join("projects.json")
+fn file_path() -> anyhow::Result<PathBuf> {
+    Ok(config::pcr_dir()?.join("projects.json"))
 }
 
 /// Registered project list. Cached per-process; the cache is reused
 /// while `projects.json`'s mtime is unchanged so the high-frequency
 /// watchers don't re-parse it on every poll.
+///
+/// If `$HOME` can't be resolved we return an empty list — this is a
+/// hot path (each watcher poll calls it) and silently degrading to
+/// "no projects registered" matches the existing best-effort
+/// behaviour of read_from_disk on a missing file. The user-facing
+/// commands that actually need projects (`init`, `pcr start` setup,
+/// etc.) re-check via `file_path()?` and surface the error.
 pub fn load() -> Vec<Project> {
-    let path = file_path();
+    let Ok(path) = file_path() else {
+        return Vec::new();
+    };
     let mtime = mtime_of(&path);
     if let Some(cached) = lookup_cache(mtime) {
         return cached;
@@ -65,7 +74,7 @@ fn read_from_disk(path: &Path) -> Vec<Project> {
 }
 
 fn save(projects: &[Project]) -> anyhow::Result<()> {
-    let path = file_path();
+    let path = file_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

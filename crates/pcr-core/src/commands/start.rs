@@ -1,6 +1,6 @@
 //! `pcr start`. Mirrors `cli/cmd/start.go`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -13,11 +13,11 @@ use crate::projects;
 use crate::shutdown;
 use crate::sources;
 
-pub fn pid_file_path() -> PathBuf {
-    config::pcr_dir().join("watcher.pid")
+pub fn pid_file_path() -> anyhow::Result<PathBuf> {
+    Ok(config::pcr_dir()?.join("watcher.pid"))
 }
 
-pub fn read_existing_pid(pid_file: &PathBuf) -> Option<i32> {
+pub fn read_existing_pid(pid_file: &Path) -> Option<i32> {
     let data = std::fs::read_to_string(pid_file).ok()?;
     let pid: i32 = data.trim().parse().ok()?;
     #[cfg(unix)]
@@ -54,7 +54,16 @@ pub fn run(mode: OutputMode, args: StartArgs) -> ExitCode {
     // handler already routes to `request_shutdown`, so ignore Err.
     let _ = ctrlc::set_handler(shutdown::request_shutdown);
 
-    let pid_file = pid_file_path();
+    let pid_file = match pid_file_path() {
+        Ok(p) => p,
+        Err(e) => {
+            // Surface the $HOME-missing case immediately rather
+            // than letting downstream singletons (`store::open()`,
+            // etc.) panic with the same error mid-watcher-spawn.
+            display::print_error("start", &format!("{e}"));
+            return ExitCode::GenericError;
+        }
+    };
 
     if let Some(pid) = read_existing_pid(&pid_file) {
         if !agent::is_interactive_terminal() {
