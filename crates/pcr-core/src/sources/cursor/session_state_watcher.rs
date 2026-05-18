@@ -30,8 +30,15 @@ impl SessionStateWatcher {
 
     /// Run the 2-second polling loop. Call in a dedicated thread.
     pub fn run_blocking(mut self) {
-        loop {
-            std::thread::sleep(Duration::from_secs(2));
+        // `sleep_unless_shutdown` yields within ~200 ms of a Ctrl-C
+        // so the watcher thread exits before the main `pcr start`
+        // returns (and well before the OS tears the process down).
+        // Without this, the poll could be torn down mid-iteration
+        // and lose an in-flight `record_session_state_event` write.
+        while crate::shutdown::sleep_unless_shutdown(Duration::from_secs(2)) {
+            if crate::shutdown::is_shutting_down() {
+                break;
+            }
             self.poll();
         }
     }

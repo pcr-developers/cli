@@ -23,3 +23,7 @@ serde_json = { workspace = true }
 # Already a workspace dep — reused here so the migration smoke test can
 # build a v1-schema fixture DB and re-query it after migrations run.
 rusqlite = { workspace = true }
+# SIGINT delivery for the graceful-shutdown integration test (Unix-only,
+# guarded by `#![cfg(unix)]` in the test file).
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

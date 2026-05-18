@@ -60,9 +60,15 @@ impl PromptScanner {
         // Kick off fsnotify fast-path in a thread.
         let s2 = self.clone();
         thread::spawn(move || s2.watch_fsnotify());
-        // Periodic 20-second scan.
-        loop {
-            thread::sleep(Duration::from_secs(20));
+        // Periodic 20-second scan. `sleep_unless_shutdown` breaks the
+        // sleep into 200 ms slices so Ctrl-C lands within one slice
+        // instead of stalling up to 20 s. When it returns false the
+        // shutdown flag has flipped — exit cleanly so the parent
+        // `pcr start` can drop its PidFileGuard and return.
+        while crate::shutdown::sleep_unless_shutdown(Duration::from_secs(20)) {
+            if crate::shutdown::is_shutting_down() {
+                break;
+            }
             self.scan();
         }
     }

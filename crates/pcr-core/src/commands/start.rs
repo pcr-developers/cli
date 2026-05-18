@@ -1,8 +1,6 @@
 //! `pcr start`. Mirrors `cli/cmd/start.go`.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +10,7 @@ use crate::display;
 use crate::entry::StartArgs;
 use crate::exit::ExitCode;
 use crate::projects;
+use crate::shutdown;
 use crate::sources;
 
 pub fn pid_file_path() -> PathBuf {
@@ -44,6 +43,17 @@ pub fn read_existing_pid(pid_file: &PathBuf) -> Option<i32> {
 }
 
 pub fn run(mode: OutputMode, args: StartArgs) -> ExitCode {
+    // Install the Ctrl-C handler before doing any setup work (PID
+    // file write, watcher spawn, etc.). The default SIGINT handler
+    // would otherwise kill the process during that window — racing
+    // with PID file cleanup and exiting with `W_TERMSIG(SIGINT)`
+    // instead of the clean code 0 the integration test asserts on.
+    //
+    // `set_handler` returns Err if a handler is already installed
+    // (re-entry in tests via the same process); the existing
+    // handler already routes to `request_shutdown`, so ignore Err.
+    let _ = ctrlc::set_handler(shutdown::request_shutdown);
+
     let pid_file = pid_file_path();
 
     if let Some(pid) = read_existing_pid(&pid_file) {
@@ -208,12 +218,14 @@ fn spawn_all_sources() -> Vec<thread::JoinHandle<()>> {
 }
 
 fn wait_for_shutdown() {
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_handler = flag.clone();
-    let _ = ctrlc::set_handler(move || {
-        flag_handler.store(true, Ordering::SeqCst);
-    });
-    while !flag.load(Ordering::SeqCst) {
+    // The ctrlc handler is installed at the top of `run()` so the
+    // SIGINT-arrives-before-watchers-are-ready window doesn't kill
+    // the process with the default signal handler. Here we just
+    // park the main thread until the handler flips the flag (which
+    // every long-running scan loop in `crate::shutdown` is also
+    // polling). PID file cleanup runs via `PidFileGuard::drop` —
+    // `remove_file` is wrapped in `let _ =` so it's idempotent.
+    while !shutdown::is_shutting_down() {
         thread::sleep(Duration::from_millis(200));
     }
 }

@@ -35,6 +35,7 @@ pub mod exit;
 pub mod help;
 pub mod mcp;
 pub mod projects;
+pub mod shutdown;
 pub mod sources;
 pub mod store;
 pub mod supabase;

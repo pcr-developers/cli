@@ -129,8 +129,14 @@ impl DiffTracker {
         // Discard any diff events older than our start time — they came from
         // a previous run.
         let _ = store::prune_diff_events(self.started_at);
-        loop {
-            std::thread::sleep(self.poll_interval);
+        // Cooperative shutdown: see `crate::shutdown` — the tick stays
+        // 3 s (or whatever was configured) but the sleep is sliced so
+        // Ctrl-C lands within ~200 ms instead of waiting for the next
+        // tick boundary.
+        while crate::shutdown::sleep_unless_shutdown(self.poll_interval) {
+            if crate::shutdown::is_shutting_down() {
+                break;
+            }
             self.poll();
         }
     }
