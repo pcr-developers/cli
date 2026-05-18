@@ -654,7 +654,11 @@ fn diff_file_header(section: &str) -> &str {
 fn truncate_diff(diff: &str) -> String {
     const MAX: usize = 50_000;
     if diff.len() > MAX {
-        let mut out = diff[..MAX].to_string();
+        // Avoid panicking when MAX lands inside a multi-byte UTF-8
+        // codepoint (non-ASCII filenames, accented identifiers in a
+        // hunk, …). Walk back to the nearest char boundary first.
+        let cut = crate::sources::shared::git::floor_char_boundary(diff, MAX);
+        let mut out = diff[..cut].to_string();
         out.push_str("\n[truncated]");
         out
     } else {

@@ -44,23 +44,24 @@ pub fn get_diff_events_in_window(
 ) -> Result<Vec<DiffEvent>> {
     let conn = open();
     let to_s = to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let (sql, rows) = if let Some(from) = from {
+    let rows = if let Some(from) = from {
         let from_s = from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let sql = "SELECT id, project_id, project_name, files, occurred_at FROM diff_events WHERE occurred_at > ? AND occurred_at <= ? ORDER BY occurred_at ASC";
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, project_name, files, occurred_at FROM diff_events WHERE occurred_at > ? AND occurred_at <= ? ORDER BY occurred_at ASC",
+        )?;
+        let v: Vec<_> = stmt
             .query_map(params![from_s, to_s], map_diff_event)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        (sql, rows)
+        v
     } else {
-        let sql = "SELECT id, project_id, project_name, files, occurred_at FROM diff_events WHERE occurred_at <= ? ORDER BY occurred_at ASC";
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, project_name, files, occurred_at FROM diff_events WHERE occurred_at <= ? ORDER BY occurred_at ASC",
+        )?;
+        let v: Vec<_> = stmt
             .query_map(params![to_s], map_diff_event)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        (sql, rows)
+        v
     };
-    let _ = sql;
     Ok(rows)
 }
 
